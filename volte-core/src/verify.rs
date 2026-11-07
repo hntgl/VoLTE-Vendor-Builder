@@ -12,7 +12,7 @@ use std::path::Path;
 use crate::config;
 use crate::env::forward_slashes;
 use crate::error::Result;
-use crate::ext4::Ext4Ops;
+use crate::ext4_tools::Ext4Ops;
 use crate::logging::Logger;
 use crate::sha256;
 

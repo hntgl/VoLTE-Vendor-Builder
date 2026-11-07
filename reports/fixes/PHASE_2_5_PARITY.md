@@ -193,6 +193,13 @@ Salt khác nhau vì `avb_info_fast` không trích được salt từ footer (ch�
 sinh salt ngẫu nhiên mỗi lần chạy — khác biệt này là **dự kiến**, không phải sai lệch backend.
 Bằng chứng: `<device>/*.avbinfo.txt`, `verify/a3s_*/verify.txt`, `verify.txt`.
 
+**Xác nhận: FEC 2 → 0 là thiết kế có chủ đích, không phải lỗi mới.** Lệnh `avbtool
+add_hashtree_footer` do pipeline sinh luôn chứa `--do_not_generate_fec` (cùng `--fec_num_roots 2`)
+trong `avb::HashtreeRequest::cli_args` — bộ tham số đóng băng từ bản Python. Khi có
+`--do_not_generate_fec`, avbtool không sinh FEC và ghi `FEC num roots: 0` vào footer mới; FEC 2
+roots quan sát ở footer nguồn A3s là của ảnh stock, bị thay thế khi rebuild. Đã ghi chú tại
+`docs/PORT_STATUS.md` mục "Design notes and known limitations" để tránh bị báo nhầm là bug.
+
 ## 12. AVB — F11 (nhánh MTK, ảnh đóng gói đầy slot)
 
 - Source, `out_debugfs`, `out_rustfs`: **không có footer AVB**;
@@ -226,6 +233,12 @@ Block count, Free blocks, Free inodes.
 `Last write time` của ảnh debugfs = thời điểm build; của ảnh rustfs = giá trị cũ trong superblock
 (2021) — RustFs không cập nhật `s_mtime` sau khi ghi. Tổng free space/inode không đổi; chỉ cách
 phân bổ giữa các block group là khác.
+
+**Known limitation (không chặn tiến độ):** `rust-fs-ext4` không cập nhật `s_mtime` và bộ đếm
+`Lifetime writes` trong superblock sau khi ghi (F11: 978 MB vs 977 MB; A3s: cùng 999 MB). Pipeline
+**không** tự đồng bộ đầy đủ metadata hệ thống file; e2fsck vẫn trả rc=0 trên cả 4 ảnh. Đã ghi tại
+`docs/PORT_STATUS.md` mục "Design notes and known limitations" và `README.md` §External tools để
+không ai lầm tưởng superblock được cập nhật đầy đủ.
 
 Hash toàn ảnh (SHA-256):
 

@@ -10,7 +10,7 @@ pub mod chip_detect;
 pub mod config;
 pub mod env;
 pub mod error;
-pub mod ext4;
+pub mod ext4_tools;
 pub mod flags;
 pub mod init_rc;
 pub mod logging;

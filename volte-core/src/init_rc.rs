@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use crate::env::forward_slashes;
-use crate::ext4::Ext4Ops;
+use crate::ext4_tools::Ext4Ops;
 use crate::logging::Logger;
 use crate::profile;
 use crate::error::Result;

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::env::forward_slashes;
 use crate::error::Result;
-use crate::ext4::Ext4Ops;
+use crate::ext4_tools::Ext4Ops;
 use crate::logging::Logger;
 
 /// `HD_VOLTE_SHOW_PROPS` (`:99-175`).

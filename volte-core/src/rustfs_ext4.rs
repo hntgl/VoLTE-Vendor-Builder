@@ -1,6 +1,7 @@
 //! `rust-fs-ext4` backend, the default `Ext4Ops` engine since 2026-11-07.
 //!
-//! Interprets the same `debugfs` command strings `DebugfsBackend` receives, so
+//! Interprets the same EXT4 command strings the pipeline emits (the `debugfs`
+//! grammar of the Python reference), so
 //! the pipeline can be pointed at either engine without changing call sites.
 //! The parser covers exactly the verbs the pipeline emits: `cd`, `mkdir`,
 //! `rmdir`, `rm`, `write`, `set_inode_field`, `ea_set -f`, `dump` and
@@ -18,7 +19,7 @@ use fs_ext4::error::Error as FsError;
 use fs_ext4::fs::Filesystem;
 
 use crate::error::{Error, Result};
-use crate::ext4::Ext4Ops;
+use crate::ext4_tools::Ext4Ops;
 use crate::logging::Logger;
 
 /// `Ext4Ops` over the pure-Rust ext4 driver.
@@ -129,8 +130,8 @@ impl Session {
             .map_err(|e| e.to_string())
     }
 
-    /// Runs one `debugfs` command line. `Err` carries debugfs' per-command
-    /// failure text; the caller decides whether that aborts the batch.
+    /// Runs one EXT4 command line (the `debugfs` grammar). `Err` carries the
+    /// per-command failure text; the caller decides whether that aborts the batch.
     fn execute(
         &mut self,
         command: &str,
@@ -324,7 +325,7 @@ impl Ext4Ops for RustFsExt4Backend {
                 // Release the mount cleanly, then report the failing command:
                 // a batch must never claim success for work it did not do.
                 let _ = session.fs.finish();
-                return Err(Error::build(format!("debugfs: {command}: {message}")));
+                return Err(Error::build(format!("ext4: {command}: {message}")));
             }
         }
         session.fs.finish().map_err(map_fs)?;
@@ -346,7 +347,7 @@ impl Ext4Ops for RustFsExt4Backend {
                 continue;
             }
             if let Err(message) = session.execute(command, workdir) {
-                out.push_str(&format!("debugfs: {command}: {message}\n"));
+                out.push_str(&format!("ext4: {command}: {message}\n"));
             }
         }
         session.fs.finish().map_err(map_fs)?;

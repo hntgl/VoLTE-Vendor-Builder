@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use volte_core::avb::{Avb, HashtreeRequest, PythonAvbtool};
 use volte_core::config;
 use volte_core::env;
-use volte_core::ext4::E2fsck;
+use volte_core::ext4_tools::E2fsck;
 use volte_core::rustfs_ext4::RustFsExt4Backend;
 use volte_core::logging::{Logger, Sink};
 use volte_core::pipeline::{self, Deps, Options};

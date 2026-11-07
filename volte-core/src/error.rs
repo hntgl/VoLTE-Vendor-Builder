@@ -13,7 +13,7 @@ pub enum ErrorKind {
     Build,
     /// Filesystem or stream error.
     Io,
-    /// The image is not EXT4 (`debugfs: Bad magic number`).
+    /// The image is not EXT4 (`rust-fs-ext4: bad magic number`).
     BadMagic,
     /// A required external tool or payload file is missing.
     Missing,
@@ -100,6 +100,6 @@ mod tests {
 
     #[test]
     fn bad_magic_kind_is_distinct() {
-        assert_eq!(Error::bad_magic("debugfs: Bad magic number").kind(), ErrorKind::BadMagic);
+        assert_eq!(Error::bad_magic("rust-fs-ext4: bad magic number").kind(), ErrorKind::BadMagic);
     }
 }

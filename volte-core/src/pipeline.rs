@@ -13,7 +13,7 @@ use crate::avb;
 use crate::chip_detect;
 use crate::config;
 use crate::error::{Error, Result};
-use crate::ext4::{self, Ext4Ops, Fsck};
+use crate::ext4_tools::{self, Ext4Ops, Fsck};
 use crate::flags;
 use crate::init_rc;
 use crate::logging::{fmt_time, FileSink, Logger};
@@ -386,14 +386,14 @@ pub fn run(
     progress(38, "Patch overlay");
     let plan = payload::overlay_commands(opts.root, td, qc)?;
     let clean = filter_mkdir(plan.clean, &work, td, deps.ops)?;
-    log.log("debugfs 1.44.5 (15-Dec-2018)");
+    log.log("EXT4 engine: rust-fs-ext4 (in-process)");
     for c in &clean {
-        log.log(format!("debugfs: {c}"));
+        log.log(format!("ext4: {c}"));
     }
     // The clean batch removes paths that may legitimately be absent.
     match deps.ops.run_best_effort(&work, &clean, td, log) {
         Ok(out) => log_lines(log, &out),
-        Err(e) => log.log(format!("[WARN] debugfs clean: {}", trunc(e.message(), 200))),
+        Err(e) => log.log(format!("[WARN] ext4 clean: {}", trunc(e.message(), 200))),
     }
     let write = filter_mkdir(plan.write, &work, td, deps.ops)?;
     let mut joined = clean.clone();
@@ -406,7 +406,7 @@ pub fn run(
         Ok(out) => log_lines(log, &out),
         Err(e) => {
             return Err(Error::build(format!(
-                "debugfs overlay injection failed: {}",
+                "ext4 overlay injection failed: {}",
                 trunc(e.message(), 200)
             )))
         }
@@ -443,7 +443,7 @@ pub fn run(
     progress(64, "Props");
 
     log.log("[STEP] Enabling the VoLTE switch (overlay) + reading the original vendor flag...");
-    let orig_bit = ext4::read_vendor_flag_bit(&work, td, deps.ops);
+    let orig_bit = ext4_tools::read_vendor_flag_bit(&work, td, deps.ops);
     let nflag = match flags::patch_flags_keep_size(&work, &work, 0, log) {
         Ok(n) => n,
         Err(e) => {
@@ -590,7 +590,7 @@ pub fn run(
 mod tests {
     use super::*;
     use crate::avb::HashtreeRequest;
-    use crate::ext4::{DebugfsBackend, E2fsck};
+    use crate::ext4_tools::E2fsck;
     use crate::logging::Sink;
     use crate::rustfs_ext4::RustFsExt4Backend;
     use std::cell::RefCell;
@@ -610,7 +610,7 @@ mod tests {
             Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("tool"),
         };
         assert!(
-            dir.join("debugfs.exe").is_file(),
+            dir.join("mke2fs.exe").is_file(),
             "bundled e2fsprogs missing at {} (set VOLTE_TOOL_DIR)",
             dir.display()
         );
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn missing_source_is_a_build_error() {
         let dir = tmp("volte_pipeline_missing");
-        let mut ops = DebugfsBackend::new(&tool_dir());
+        let mut ops = RustFsExt4Backend::new();
         let mut fsck = PassingFsck { calls: 0 };
         let mut avb = NoFooterAvb { calls: 0 };
         let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
@@ -925,7 +925,7 @@ mod tests {
         seed_payloads(&dir);
         let logs = dir.join("Logs");
 
-        let mut ops = DebugfsBackend::new(&tool);
+        let mut ops = RustFsExt4Backend::new();
         let mut fsck = CountingFsck { inner: E2fsck::new(&tool), calls: 0 };
         let mut avb = NoFooterAvb { calls: 0 };
         let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };

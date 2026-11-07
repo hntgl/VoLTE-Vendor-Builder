@@ -6,8 +6,9 @@ Status of the 30 ported mapping IDs (`..\reports\PYTHON_TO_RUST_MAPPING.md` §1 
 Status values: `pending` (not written yet), `ported` (code + unit test), `verified` (group test
 green and Step C re-measurement done), `diverges` (intentional, documented difference).
 
-Last measured: 2026-11-07 (`cargo test --workspace`: 135 passed in `volte-core`, 10 in `volte-cli`,
-0 failed, 0 ignored). The Phase 4 Step C evidence in `..\reports\` records the earlier count:
+Last measured: 2026-11-07 (`cargo test --workspace`: 151 passed in `volte-core`, 10 in `volte-cli`,
+0 failed, 0 ignored) **with `tool\debugfs.exe` absent**. The Phase 4 Step C evidence in
+`..\reports\` records the earlier count:
 `_p4_c_test1/2.txt` (10 + 130 passed, 0 ignored), `_p4_c_check1/2.txt`, `_p4_c_build1/2.txt`,
 `_p4_c_clippy1/2.txt`, `_p4_c_parity1/2.txt`, `_p4_c_stubs1/2.txt`,
 `_p4_c_integrity1/2.txt`, `_p4_c_sha1/2.txt`, `_p4_c_sha_diff.txt`.
@@ -18,9 +19,9 @@ Last measured: 2026-11-07 (`cargo test --workspace`: 135 passed in `volte-core`,
 | 02 | `payload_dirs` / `payload_file` / `payload_required` / `first_payload` | `payload::{payload_dirs, payload_file, payload_required, first_payload}` | verified |
 | 03 | `sha256_file` | `sha256::file_hex_upper` | verified |
 | 04 | `BuildLog` / `_safe_print` / `_decode` | `logging::{Logger, FileSink, decode, fmt_time}` | diverges |
-| 05 | `run_debugfs` | `ext4::Ext4Ops::run` (`DebugfsBackend`) | verified |
-| 06 | `debugfs_exists` | `ext4::Ext4Ops::path_exists` (`DebugfsBackend`) | verified |
-| 07 | `run_e2fsck` | `ext4::Fsck::check` (`E2fsck`) | verified |
+| 05 | `run_debugfs` | `ext4_tools::Ext4Ops::run` (`RustFsExt4Backend`) | diverges (in-process engine, strict errors) |
+| 06 | `debugfs_exists` | `ext4_tools::Ext4Ops::path_exists` (`RustFsExt4Backend`) | verified |
+| 07 | `run_e2fsck` | `ext4_tools::Fsck::check` (`E2fsck`) | verified |
 | 08 | `is_sparse` | `sparse::is_sparse` | verified |
 | 09 | `unsparse` | `sparse::unsparse` | verified |
 | 10 | `_parse_avbf` | `avb::parse_footer` | verified |
@@ -29,7 +30,7 @@ Last measured: 2026-11-07 (`cargo test --workspace`: 135 passed in `volte-core`,
 | 13 | `force_slot_size` | `slot::force_slot_size` | verified |
 | 14 | `_prop_boundary` | `flags::prop_boundary` | verified |
 | 15 | `patch_flags_keep_size` | `flags::patch_flags_keep_size` | verified |
-| 16 | `read_vendor_flag_bit` | `ext4::read_vendor_flag_bit`, `flags::flag_bit_from_dumps` | verified |
+| 16 | `read_vendor_flag_bit` | `ext4_tools::read_vendor_flag_bit`, `flags::flag_bit_from_dumps` | verified |
 | 17 | `volte_flag_note` | `report::flag_note` | verified |
 | 18 | `detect_vendor_chip` (binary markers) | `chip_detect::detect_vendor_chip` | verified |
 | 19 | `detect_vendor_chip` (path keywords) | `chip_detect::detect_vendor_chip` | verified |
@@ -45,7 +46,7 @@ Last measured: 2026-11-07 (`cargo test --workspace`: 135 passed in `volte-core`,
 | 29 | `build` | `pipeline::run` | diverges |
 | 30 | `main` | `volte_cli::{parse, build, run}` | diverges |
 
-Test counts behind the table: 135 unit/integration tests in `volte-core` and 10 in `volte-cli`
+Test counts behind the table: 151 unit/integration tests in `volte-core` and 10 in `volte-cli`
 (`cargo test`, 0 ignored); every module listed above carries at least four `#[test]` functions,
 the smallest being `env` (4) and `slot` (5).
 
@@ -80,3 +81,18 @@ collision cannot occur. (c) Console and report text is English, per master promp
 **ID 30 — `main`.** `--gui`, or no image argument, exits with code 2 and
 `[ERROR] GUI is not part of V1.0 - pass a vendor.img path (see --help).` instead of starting
 Tkinter. The budget flags (`--qc`/`--mtk`/`--out`) and the QC-wins tie-break match Python.
+
+## Design notes and known limitations
+
+- **One EXT4 engine.** V1.0 uses only the in-process `rust-fs-ext4` engine
+  (`RustFsExt4Backend`). `DebugfsBackend`, `tool\debugfs.exe` and the parity harness were
+  removed after the Đợt 2.5 parity check (content/metadata/e2fsck/AVB/SELinux xattr identical
+  on OPPO A3s and F11). `ext4_tools` keeps only the `Ext4Ops`/`Fsck` traits and the external
+  `e2fsck` runner.
+- **FEC is intentionally disabled on rebuild.** `avb::HashtreeRequest::cli_args` always passes
+  `--do_not_generate_fec` (frozen from the Python reference), so a rebuilt footer records
+  `FEC num roots: 0` even if the stock footer had FEC roots. This is design, not a bug.
+- **Known limitation — superblock counters.** `rust-fs-ext4` does not refresh `s_mtime` or the
+  `Lifetime writes` counter after writing. `e2fsck` stays clean (rc=0) and file content,
+  metadata and SELinux labels match the debugfs oracle, but the pipeline does not claim to
+  update every superblock field.
