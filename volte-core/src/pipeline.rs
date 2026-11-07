@@ -17,6 +17,7 @@ use crate::ext4::{self, Ext4Ops, Fsck};
 use crate::flags;
 use crate::init_rc;
 use crate::logging::{fmt_time, FileSink, Logger};
+use crate::path_id;
 use crate::payload;
 use crate::profile;
 use crate::props;
@@ -135,7 +136,7 @@ fn resolve_output(src: &Path, out: &str, keep_out: bool) -> Result<(PathBuf, Pat
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "vendor".to_string());
     let mut path = folder.join(format!("{base}_VolLTE.img"));
-    if std::path::absolute(&path)? == src {
+    if path_id::same_file(&path, src) {
         path = folder.join(format!("{base}_VolLTE_out.img"));
     }
     Ok((folder, path))
@@ -178,6 +179,12 @@ fn copy_with_progress(
     dst: &Path,
     progress: &mut dyn FnMut(u8, &str),
 ) -> Result<()> {
+    if path_id::same_file(src, dst) {
+        return Err(Error::build(format!(
+            "Refusing to copy {} onto itself; the source was not modified.",
+            src.display()
+        )));
+    }
     let mut fi = std::fs::File::open(src)?;
     let mut fo = std::fs::File::create(dst)?;
     let total = std::fs::metadata(src)?.len().max(1);
@@ -240,6 +247,13 @@ pub fn run(
     log.add_sink(FileSink::create(&log_path)?);
 
     let (folder, out_path) = resolve_output(&src, opts.out_path, opts.keep_out)?;
+    if path_id::same_file(&src, &out_path) {
+        return Err(Error::build(format!(
+            "Refusing to build: the output path is the same file as the source image ({}). \
+             Choose another --out path; the source was not modified.",
+            out_path.display()
+        )));
+    }
     std::fs::create_dir_all(&folder)?;
     let orig_sz = std::fs::metadata(&src)?.len();
 
@@ -314,7 +328,7 @@ pub fn run(
 
     log.log("[STATUS] Copying source image...");
     progress(8, "Copy");
-    if out_path.is_file() && std::path::absolute(&out_path)? != src {
+    if out_path.is_file() && !path_id::same_file(&out_path, &src) {
         if let Err(e) = std::fs::remove_file(&out_path) {
             log.log(format!(
                 "[WARN] Destination file is open/locked: {}",
@@ -656,6 +670,25 @@ mod tests {
         }
     }
 
+    /// Never reached by the source-protection tests: the guard fires first.
+    struct NoopOps;
+
+    impl Ext4Ops for NoopOps {
+        fn run(
+            &mut self,
+            _image: &Path,
+            _commands: &[String],
+            _workdir: &Path,
+            _log: &mut Logger,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn path_exists(&mut self, _image: &Path, _vpath: &str, _workdir: &Path) -> Result<bool> {
+            Ok(false)
+        }
+    }
+
     struct PassingFsck {
         calls: usize,
     }
@@ -696,6 +729,150 @@ mod tests {
         let (_, same) = resolve_output(&src, "", false).unwrap();
         assert_ne!(same, src);
         assert!(same.to_string_lossy().ends_with("vendor_VolLTE.img"));
+    }
+
+    fn run_with_out(src: &Path, out: &str, root: &Path, logs: &Path) -> Result<PathBuf> {
+        let mut ops = NoopOps;
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let mut log = Logger::new();
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src,
+            out_path: out,
+            chip: "mtk",
+            keep_out: true,
+            root,
+            logs_dir: logs,
+        };
+        run(&opts, &mut deps, &mut log, &mut progress)
+    }
+
+    fn assert_source_intact(src: &Path, len: u64, hash: &str) {
+        assert!(src.is_file(), "the source must still exist");
+        assert_eq!(std::fs::metadata(src).unwrap().len(), len);
+        assert_eq!(crate::sha256::file_hex_upper(src).unwrap(), hash);
+    }
+
+    #[test]
+    fn output_equal_to_the_source_is_refused_and_the_source_is_untouched() {
+        let dir = tmp("volte_pipeline_out_equals_src");
+        let src = dir.join("vendor.img");
+        std::fs::write(&src, vec![b'A'; 4096]).unwrap();
+        let before = crate::sha256::file_hex_upper(&src).unwrap();
+        let out = src.to_string_lossy().into_owned();
+        let logs = dir.join("Logs");
+
+        let err = run_with_out(&src, &out, &dir, &logs).unwrap_err();
+        assert!(
+            err.message().contains("same file as the source image"),
+            "{}",
+            err.message()
+        );
+        assert_source_intact(&src, 4096, &before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_source_with_absolute_output_is_refused() {
+        let dir = tmp("volte_pipeline_relative_source");
+        let abs_src = std::env::current_dir().unwrap().join("Cargo.toml");
+        assert!(abs_src.is_file(), "the test must run in the crate root");
+        let before = crate::sha256::file_hex_upper(&abs_src).unwrap();
+        let len = std::fs::metadata(&abs_src).unwrap().len();
+        let out = abs_src.to_string_lossy().into_owned();
+        let logs = dir.join("Logs");
+
+        let err = run_with_out(Path::new("Cargo.toml"), &out, &dir, &logs).unwrap_err();
+        assert!(
+            err.message().contains("same file as the source image"),
+            "{}",
+            err.message()
+        );
+        assert_source_intact(&abs_src, len, &before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_only_output_alias_is_refused_and_the_source_is_untouched() {
+        let dir = tmp("volte_pipeline_case_alias");
+        let src = dir.join("vendor.img");
+        std::fs::write(&src, vec![b'C'; 4096]).unwrap();
+        let out = dir.join("VENDOR.IMG");
+        assert!(
+            out.is_file(),
+            "the test needs a case-insensitive filesystem"
+        );
+        let hash = crate::sha256::file_hex_upper(&src).unwrap();
+        let out_s = out.to_string_lossy().into_owned();
+        let logs = dir.join("Logs");
+
+        let err = run_with_out(&src, &out_s, &dir, &logs).unwrap_err();
+        assert!(
+            err.message().contains("same file as the source image"),
+            "{}",
+            err.message()
+        );
+        assert_source_intact(&src, 4096, &hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlinked_output_is_refused_when_the_platform_allows_it() {
+        let dir = tmp("volte_pipeline_symlink_out");
+        let src = dir.join("vendor.img");
+        std::fs::write(&src, vec![b'D'; 4096]).unwrap();
+        let link = dir.join("out.img");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&src, &link);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&src, &link);
+        if made.is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let hash = crate::sha256::file_hex_upper(&src).unwrap();
+        let out = link.to_string_lossy().into_owned();
+        let logs = dir.join("Logs");
+
+        let err = run_with_out(&src, &out, &dir, &logs).unwrap_err();
+        assert!(
+            err.message().contains("same file as the source image"),
+            "{}",
+            err.message()
+        );
+        assert_source_intact(&src, 4096, &hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hard_linked_output_is_refused_when_the_platform_allows_it() {
+        let dir = tmp("volte_pipeline_hardlink_out");
+        let src = dir.join("vendor.img");
+        std::fs::write(&src, vec![b'E'; 4096]).unwrap();
+        let link = dir.join("out.img");
+        if std::fs::hard_link(&src, &link).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let hash = crate::sha256::file_hex_upper(&src).unwrap();
+        let out = link.to_string_lossy().into_owned();
+        let logs = dir.join("Logs");
+
+        let err = run_with_out(&src, &out, &dir, &logs).unwrap_err();
+        assert!(
+            err.message().contains("same file as the source image"),
+            "{}",
+            err.message()
+        );
+        assert_source_intact(&src, 4096, &hash);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

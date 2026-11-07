@@ -14,6 +14,7 @@ pub mod ext4;
 pub mod flags;
 pub mod init_rc;
 pub mod logging;
+pub mod path_id;
 pub mod payload;
 pub mod pipeline;
 pub mod profile;

@@ -11,6 +11,7 @@ use std::path::Path;
 use crate::config::{CHUNK, OVERLAP};
 use crate::error::Result;
 use crate::logging::Logger;
+use crate::path_id;
 
 /// The 65 `=0 → =1` pairs (three of them inverted), byte-for-byte.
 pub const FLAG_PAIRS: [(&[u8], &[u8]); 65] = [
@@ -121,13 +122,6 @@ fn read_chunk(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(done)
 }
 
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (std::path::absolute(a), std::path::absolute(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
-    }
-}
-
 /// `patch_flags_keep_size` (`:689`): copy `src` to `dst` when they differ, then
 /// apply every flag pair inside `limit` bytes (0 = whole file). Windows advance
 /// by `CHUNK - OVERLAP` so a pair straddling a boundary is still seen.
@@ -137,7 +131,7 @@ pub fn patch_flags_keep_size(
     limit: u64,
     _log: &mut Logger,
 ) -> Result<u64> {
-    if !same_path(src, dst) {
+    if !path_id::same_file(src, dst) {
         std::fs::copy(src, dst)?;
     }
     let mut hits = 0u64;
@@ -370,6 +364,39 @@ mod tests {
         let empty = dir.join("empty.bin");
         std::fs::write(&empty, b"").unwrap();
         assert_eq!(patch_flags_keep_size(&empty, &empty, 0, &mut log).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn case_alias_patches_in_place_instead_of_copying() {
+        let dir = tmp("volte_flags_case_alias");
+        let p = dir.join("img.bin");
+        std::fs::write(&p, b"volte_support=0").unwrap();
+        let alias = dir.join("IMG.BIN");
+        assert!(
+            alias.is_file(),
+            "the test needs a case-insensitive filesystem"
+        );
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        assert_eq!(patch_flags_keep_size(&p, &alias, 0, &mut log).unwrap(), 1);
+        assert_eq!(std::fs::read(&p).unwrap(), b"volte_support=1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hard_link_alias_patches_in_place_when_the_platform_allows_it() {
+        let dir = tmp("volte_flags_hard_link");
+        let p = dir.join("img.bin");
+        std::fs::write(&p, b"volte_support=0").unwrap();
+        let alias = dir.join("alias.bin");
+        if std::fs::hard_link(&p, &alias).is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        assert_eq!(patch_flags_keep_size(&p, &alias, 0, &mut log).unwrap(), 1);
+        assert_eq!(std::fs::read(&p).unwrap(), b"volte_support=1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
