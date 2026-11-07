@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["volte-core", "volte-cli"]
+
+# rust-fs-ext4 0.8.0 declares rust-fs-core as a path dependency with a version;
+# a git source has no sibling checkout, so redirect that dependency to the
+# pinned git revision. Cargo only honors [patch] at the workspace root.
+[patch."https://github.com/antimatter-studios/rust-fs-ext4.git"]
+rust-fs-core = { git = "https://github.com/antimatter-studios/rust-fs-core.git", rev = "3c2340a047f5ddfac2837d0c61d327ff4f4a9247" }

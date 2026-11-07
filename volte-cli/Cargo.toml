@@ -1,0 +1,8 @@
+[package]
+name = "volte-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Thin command-line front end for volte-core."
+
+[dependencies]
+volte-core = { path = "../volte-core" }

@@ -1,0 +1,11 @@
+[package]
+name = "volte-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core logic for the VoLTE vendor image builder (no console output)."
+
+[dependencies]
+# Default Ext4Ops engine (decision 2026-11-07): pure-Rust ext4. Pinned by commit
+# so Cargo.lock records a source and a revision, unlike a path dependency.
+rust-fs-ext4 = { git = "https://github.com/antimatter-studios/rust-fs-ext4.git", rev = "1aaea0793baba99c69488c02c2b510adb14bb501" }
+rust-fs-core = { git = "https://github.com/antimatter-studios/rust-fs-core.git", rev = "3c2340a047f5ddfac2837d0c61d327ff4f4a9247" }
