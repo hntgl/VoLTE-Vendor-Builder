@@ -81,7 +81,10 @@ Chọn **xóa hẳn** `DebugfsBackend` (không giữ sau feature flag `legacy-de
   copy" cho đúng sau khi xóa.
 - `docs/PORT_STATUS.md`: ID 05/06/07/16 trỏ `ext4_tools`; số test 151 + 10; thêm mục
   **Design notes and known limitations** (một engine, FEC, superblock counters).
-- `CLAUDE.md`: thêm §5 "Project notes" (một engine, FEC, known limitation).
+- `CLAUDE.md`: **không thay đổi**. Bản thêm §5 "Project notes" trong `c21f98b` đã được hoàn nguyên
+  hoàn toàn ở commit `d444e43`; file hiện byte-identical với bản gốc `e25c79c`
+  (SHA-256 `694a2d72…`). Nội dung FEC/known limitation chỉ nằm ở `README.md` và
+  `docs/PORT_STATUS.md`, xem §9–§10.
 - `tests/README.md`: mô tả artefact là "EXT4 command files (debugfs grammar)".
 - `tool/README_RUNTIME.txt`: bỏ `debugfs` khỏi danh sách runtime cần khôi phục.
 
@@ -170,6 +173,7 @@ trong suốt cả build và test.
 
 - Phần xóa: `c21f98b` (18 file, +121/−480; xóa `tool/debugfs.exe`, xóa harness, rename
   `ext4.rs` → `ext4_tools.rs`).
+- Hoàn nguyên `CLAUDE.md`: `d444e43` (`Đợt 2.5: hoàn nguyên CLAUDE.md về bản gốc`, 1 file, −9).
 - Báo cáo này được commit riêng sau `c21f98b`; hash xem `git log --oneline -2`.
 - Không `--amend`, không force-push, không viết lại lịch sử.
 
@@ -178,3 +182,86 @@ trong suốt cả build và test.
 Đợt 2.5 hoàn tất: parity đã được xác nhận, `DebugfsBackend` + `tool\debugfs.exe` đã bị xóa, và
 `cargo build --workspace` / `cargo test --workspace` / `cargo clippy -D warnings` đều PASS trong
 môi trường **không có** `debugfs.exe`. **Dừng chờ xác nhận trước khi sang Đợt 3.**
+
+---
+
+## 17. Phụ lục A — CLI có từng có flag chọn engine EXT4?
+
+**Kết luận: KHÔNG.** `volte-cli` chưa từng có `--backend` (hay `--engine`, `--ext4`,
+`--debugfs`, `--rustfs`). Sau khi gỡ `DebugfsBackend` không có help text nào cần xóa.
+
+Bằng chứng:
+
+| Lệnh | Kết quả |
+|---|---|
+| `git log --all --oneline -S"backend" -- volte-cli/` | rỗng |
+| `git log --all --oneline -S"engine" -- volte-cli/` | rỗng |
+| `git log --all --oneline -S"debugfs" -- volte-cli/` | rỗng |
+| `git log --oneline --all -- volte-cli/` | đúng 2 commit: `e25c79c` (import), `c21f98b` (sửa 1 dòng import) |
+| `git diff e25c79c..HEAD -- volte-cli/src/main.rs` | chỉ 1 dòng: `use volte_core::ext4::E2fsck;` → `ext4_tools::E2fsck;` |
+| `git log --all -p -- volte-cli/src/main.rs \| grep '^\+\s*"--'` | chỉ `--qc`, `--mtk`, `--gui`, `--out` |
+
+Hiện trạng `volte-cli/src/main.rs`:
+
+- `Args` (dòng 38–44): `image`, `qc`, `mtk`, `out`, `gui`. Không có trường engine.
+- `USAGE` (dòng 23): `usage: volte-cli [-h] [--qc] [--mtk] [--out OUT] [--gui] [image]`.
+- `HELP` (dòng 25–36): chỉ mô tả `image`, `-h/--help`, `--qc`, `--mtk`, `--out`, `--gui`.
+- Backend được chọn cứng tại `volte-cli/src/main.rs:180`: `let mut ops = RustFsExt4Backend::new();`
+  — đúng thiết kế một engine, không phải một flag còn sót.
+
+## 18. Phụ lục B — Chạy lại harness repro sau khi đổi tiền tố `debugfs:` → `ext4:`
+
+**Harness gốc** (ngoài repo): `%TEMP%\volte_audit_repro\tests\repro.rs`,
+SHA-256 `c657abea4cc9b1aee63ef55f5696d7820d3245265c5ad0ca0ef85f03898100dc`, lưu nguyên bản tại
+`E:\Build_app\Volte\_work\repro_original_before_d3.rs` (cùng hash).
+
+**Sửa tối thiểu để biên dịch** (diff đầy đủ: `_work\repro_harness_adaptation.diff`) — 3 dòng, không
+nới lỏng assertion nào:
+
+```diff
+-use volte_core::ext4::{DebugfsBackend, Ext4Ops, Fsck};
++use volte_core::ext4_tools::{Ext4Ops, Fsck};
+-    assert!(out.contains("debugfs:"), "the per-command error is only text");
++    assert!(out.contains("ext4:"), "the per-command error is only text");
+-    let mut ops = DebugfsBackend::new(&tool_dir());
++    let mut ops = RustFsExt4Backend::new();
+```
+
+Hai dòng đầu là hệ quả trực tiếp của việc đổi module/tiền tố; dòng thứ ba chỉ thay backend đã bị xóa
+bằng backend mặc định thật (A04 vẫn tái hiện đúng lỗi, xem dưới).
+
+**Kết quả chạy** `cargo test --offline --test repro -- --test-threads=1`:
+
+| Lần chạy | Literal trong `repro.rs:320` | Kết quả | Vị trí panic |
+|---|---|---|---|
+| 1 — `_work\repro_run1_after_prefix.txt` | `"debugfs:"` (nguyên bản) | **7 passed / 4 failed** | a01:215, a01b:247, c01:317, c02:355 |
+| 2 — `_work\repro_run2_literal_ext4.txt` | `"ext4:"` | **7 passed / 4 failed** | a01:215, a01b:247, c01:317, c02:355 |
+
+Hai lần cho cùng danh sách test PASS/FAIL và cùng vị trí panic.
+
+**Không có assertion nào bị ảnh hưởng ngoài dự kiến:**
+
+- `grep -rn 'debugfs:'` trên `volte-core`, `volte-cli` và toàn bộ harness chỉ còn **một** dòng:
+  `repro.rs:320`. Không file production/test nào khác phụ thuộc chuỗi này.
+- Dòng 320 hiện **không bao giờ được thực thi**: C01 đã strict từ Đợt 2, nên `run(...)` trả `Err`
+  ngay tại `repro.rs:317` (`.unwrap()` panic) trước khi tới assert. Vì vậy đổi literal không thể
+  làm thay đổi kết quả — đúng như hai lần chạy ở trên.
+- Để chứng minh tiền tố mới thực sự xuất hiện trên đường còn trả text, thêm probe độc lập
+  `tests/prefix_probe.rs` (không sửa `repro.rs`), chạy
+  `cargo test --offline --test prefix_probe -- --test-threads=1 --nocapture`
+  (`_work\repro_probe_prefix.txt`, rc=0):
+  - `run_best_effort` → `"ext4: write …\n"`; assert `!contains("debugfs:")` PASS.
+  - `run` (strict) → `Err("ext4: write …")`; assert `starts_with("ext4:")` và
+    `!contains("debugfs:")` PASS.
+
+**Bốn test FAIL là hệ quả đã biết của các fix trước, không phải của việc đổi tiền tố:**
+
+| Test | Thông điệp panic | Nguyên nhân |
+|---|---|---|
+| `a01_out_…` | `"Copy vendor failed"` không còn | Đợt 1 từ chối out == src; `after=4096` (nguồn nguyên vẹn) |
+| `a01b_case_alias_…` | `source_still_exists=true` | Đợt 1 từ chối alias hoa/thường; nguồn không bị xóa |
+| `c01_rustfs_…` | `unwrap()` trên `Err("ext4: write …")` | Đợt 2 C01 strict: lỗi ghi giờ là `Err` |
+| `c02_space_…` | `spaced_workdir_changed=75` (kỳ vọng 0) | Đợt 2 C02: workdir có dấu cách vẫn ghi được |
+
+Các test còn tái hiện lỗi chưa sửa vẫn PASS: `b01` (B01), `d01` (D01), `a04` (A04), `g01`, `e01`,
+`f01`, `g02` — đúng trạng thái trước Đợt 3.
