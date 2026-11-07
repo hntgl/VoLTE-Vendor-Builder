@@ -657,6 +657,42 @@ mod tests {
     }
 
     #[test]
+    fn ea_set_accepts_a_host_path_with_spaces() {
+        let dir = tmp("volte_rustfs_ea_spaces");
+        let img = make_ext4(&dir, "ea.img");
+        let label: &[u8] = b"u:object_r:vendor_overlay_file:s0\0";
+        let work = dir.join("audit dir");
+        std::fs::create_dir_all(&work).unwrap();
+        let label_host = work.join("overlay label.bin");
+        std::fs::write(&label_host, label).unwrap();
+        let payload = work.join("payload file.apk");
+        std::fs::write(&payload, b"apk bytes").unwrap();
+
+        let commands: Vec<String> = vec![
+            format!(
+                "write {} payload.apk",
+                crate::env::forward_slashes(&payload)
+            ),
+            format!(
+                "ea_set -f {} payload.apk security.selinux",
+                crate::env::forward_slashes(&label_host)
+            ),
+        ];
+        let mut ops = RustFsExt4Backend::new();
+        ops.run(&img, &commands, &work, &mut quiet()).unwrap();
+
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open_path(&img).unwrap());
+        let fs = Filesystem::mount(dev).unwrap();
+        let ino = fs.lookup_path_bytes(b"/payload.apk").unwrap();
+        let raw = fs.read_inode_raw(ino).unwrap();
+        assert!(
+            raw.windows(label.len()).any(|w| w == label),
+            "the SELinux label must land from a spaced host path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_non_ext4_file_is_refused_with_bad_magic() {
         let dir = tmp("volte_rustfs_badmagic");
         let img = dir.join("zeros.img");
