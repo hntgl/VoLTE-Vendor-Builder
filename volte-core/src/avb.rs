@@ -5,17 +5,16 @@
 //! (`:1271`). `avbtool.py` is executed as a subprocess (decision 8.2/1); the
 //! frozen parameters are exactly the ones the Python call passes.
 
-use std::collections::hash_map::RandomState;
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::config::{AVB_MAGIC, BLOCK};
 use crate::error::{Error, Result};
-use crate::logging::{decode, Logger};
+use crate::ext4_tools::capture;
+use crate::logging::Logger;
 use crate::slot::force_slot_size;
 
 const DIGEST_LEN: u64 = 32;
@@ -23,6 +22,9 @@ const DIGEST_LEN: u64 = 32;
 const META_LEN: u64 = 64 * 1024 + 4 * 1024;
 const FOOTER_LEN: usize = 64;
 const SCAN_LEN: u64 = 32 * 1024 * 1024;
+/// `avbtool.py` rewrites a multi-GB image, so it gets a generous but finite
+/// deadline instead of blocking the build forever.
+const AVB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Parsed `AvbFooter` (`_parse_avbf`, `:529`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,27 +440,18 @@ pub fn fit_avb_part(img_sz: u64, hint: u64) -> u64 {
     (img_sz + 64 * 1048576).div_ceil(1048576) * 1048576
 }
 
-/// 32 random bytes as lower-case hex (`os.urandom(32).hex()`). The bytes come
-/// from the OS-seeded `RandomState` keys; this salt only needs to be fresh per
-/// build, not a cryptographic secret.
-pub fn random_salt_hex() -> String {
-    let state = RandomState::new();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+/// 32 bytes from the OS CSPRNG as lower-case hex (`os.urandom(32).hex()`).
+/// A failing entropy source aborts the build instead of falling back to a
+/// predictable salt.
+pub fn random_salt_hex() -> Result<String> {
     let mut out = [0u8; 32];
-    for (i, slot) in out.chunks_mut(8).enumerate() {
-        let mut h = state.build_hasher();
-        h.write_u128(now);
-        h.write_usize(i);
-        slot.copy_from_slice(&h.finish().to_be_bytes());
-    }
+    getrandom::fill(&mut out)
+        .map_err(|e| Error::build(format!("cannot read the OS random source: {e}")))?;
     let mut s = String::with_capacity(64);
     for b in out {
         s.push_str(&format!("{b:02x}"));
     }
-    s
+    Ok(s)
 }
 
 /// The frozen parameter set of the Python `add_hashtree_footer` call (`:1306`).
@@ -534,21 +527,15 @@ impl Avb for PythonAvbtool {
     fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
         let mut cmd = Command::new(&self.python);
         cmd.arg(&self.avbtool).args(req.cli_args());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        let out = cmd
-            .output()
-            .map_err(|e| Error::build(format!("cannot run avbtool.py: {e}")))?;
-        if !out.status.success() {
-            let text = decode(&out.stderr);
+        let out = capture(&mut cmd, AVB_TIMEOUT)
+            .map_err(|e| Error::build(format!("avbtool.py did not finish: {e}")))?;
+        if out.code != 0 {
+            let text = out.text();
             let text = text.trim();
             let text: String = text.chars().take(240).collect();
             return Err(Error::build(format!(
                 "avbtool.py failed ({}): {text}",
-                out.status.code().map_or("signal".to_string(), |c| c.to_string())
+                out.code
             )));
         }
         Ok(())
@@ -584,7 +571,7 @@ pub fn rebuild_hashtree(
     }
 
     let salt = if info.salt.is_empty() {
-        random_salt_hex()
+        random_salt_hex()?
     } else {
         info.salt.clone()
     };
@@ -965,11 +952,19 @@ mod tests {
 
     #[test]
     fn random_salt_is_64_lower_hex_chars_and_changes() {
-        let a = random_salt_hex();
-        let b = random_salt_hex();
+        let a = random_salt_hex().unwrap();
+        let b = random_salt_hex().unwrap();
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn twenty_five_salts_are_all_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..25 {
+            assert!(seen.insert(random_salt_hex().unwrap()), "salt repeated");
+        }
     }
 
     #[test]

@@ -38,6 +38,37 @@ fn path_eq(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// True when both directories live on the same volume, so their disk-space
+/// needs must be added together. Unknown identity is treated as "same" to keep
+/// the caller's probe conservative.
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        fn volume(p: &Path) -> Option<String> {
+            let canon = std::fs::canonicalize(p).ok()?;
+            let first = canon.components().next()?;
+            Some(first.as_os_str().to_string_lossy().into_owned())
+        }
+        match (volume(a), volume(b)) {
+            (Some(x), Some(y)) => x.eq_ignore_ascii_case(&y),
+            _ => true,
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev(),
+            _ => true,
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (a, b);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,6 +79,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn a_directory_and_its_child_share_a_volume() {
+        let dir = tmp("volte_path_id_volume");
+        let child = dir.join("sub");
+        std::fs::create_dir_all(&child).unwrap();
+        assert!(same_volume(&dir, &child));
+        assert!(same_volume(&dir, &dir.join("missing")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -11,12 +11,12 @@ parent folder shared with the Python reference and the audit reports.
 ```
 VoLTE-Vendor-Builder/
 ├── Cargo.toml            workspace (volte-core + volte-cli)
-├── volta-core/           pure logic, no console output
-├── volta-cli/            thin CLI: parse args -> call volte-core
+├── volte-core/           pure logic, no console output
+├── volte-cli/            thin CLI: parse args -> call volte-core
 ├── docs/PORT_STATUS.md   port status of every mapping ID
 ├── profiles/             per-chip documentation (Qualcomm / MediaTek)
 ├── fixtures/             generated test fixtures (no vendor data)
-├── tests/                cross-crate contract artefacts
+├── tests/                reserved for gate evidence (currently empty)
 ├── tool/                 bundled runtime: e2fsck.exe, mke2fs.exe,
 │                         avbtool.py, Python 3.10, MSYS/Cygwin DLLs, etc\mke2fs.conf
 └── payload/              OPPO_VoLTE_Overlay.apk, hd_oppo_{mtk,qc}_volte.rc,
@@ -32,11 +32,16 @@ original repository.
 ## Build and test
 
 ```bat
-cargo check
-cargo build --release
-cargo clippy -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --offline
+cargo test --workspace --offline
+cargo clippy --workspace --all-targets --offline -- -D warnings
+cargo tree -d
 ```
+
+The workspace builds offline against the committed `Cargo.lock`. Test counts are not kept in
+this file: run `cargo test --workspace --offline` and read the `test result:` line for each
+target.
 
 Target: `x86_64-pc-windows-msvc`, stable toolchain, no nightly, no `rust-toolchain.toml`.
 
@@ -51,11 +56,11 @@ copy target\release\volte-cli.exe .
 volte-cli.exe <vendor.img> [--mtk | --qc] [--out <path>]
 ```
 
-Exit code `0` on success, `2` on error, matching the Python tool. A failed mandatory step
-fails the build: when `e2fsck -fn` reports an error the CLI exits `2` without printing any
-flashable line, and an AVB backend error degrades to the documented `AVB_HASHTREE=SKIP` path,
-never to a PASS claim. Logs, the command list and the report go to `.\Logs\`, which is
-created on demand.
+Exit code `0` on success and for `--help`; `2` for a usage error, the GUI divergence and any
+pipeline error, matching the Python tool. A failed mandatory step fails the build: when
+`e2fsck -fn` reports an error the CLI exits `2` without printing any flashable line, and an
+AVB backend error degrades to the documented `AVB_HASHTREE=SKIP` path, never to a PASS claim.
+Logs, the command list and the report go to `.\Logs\`, which is created on demand.
 
 ## External tools
 
@@ -73,3 +78,12 @@ Design notes:
 - Known limitation: `rust-fs-ext4` does not update the superblock `s_mtime` and
   `Lifetime writes` counters after writing. `e2fsck` reports the filesystem clean; the
   pipeline does not claim to refresh all superblock metadata.
+- A sparse image is validated (version, header sizes, block size, chunk count, declared
+  size) before conversion; a malformed or oversized header is an error, not a truncated
+  output. Free space is checked against the raw size twice plus AVB headroom, and the
+  temporary copy is charged to the same probe when it shares the destination volume.
+- `build.prop` and the other property files are rewritten in place: untouched bytes, line
+  endings, duplicate keys and inode metadata survive, and the vendor-file SELinux label is
+  applied only to `/build.prop`.
+- `avbtool.py` runs under a 30-minute deadline and its output is captured; the AVB salt is
+  read from the OS CSPRNG.

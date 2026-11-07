@@ -62,23 +62,27 @@ fn quiet(cmd: &mut Command) {
     }
 }
 
+/// Output of a bounded child process, shared by `e2fsck` and `avbtool.py`.
 #[derive(Debug)]
-struct Captured {
-    code: i32,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct Captured {
+    pub(crate) code: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 impl Captured {
     /// Python: `(_decode(stdout) + "\n" + _decode(stderr)).strip()`.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         format!("{}\n{}", decode(&self.stdout), decode(&self.stderr))
             .trim()
             .to_owned()
     }
 }
 
-fn capture(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
+/// Runs a child process with piped output and a hard deadline. A tool that
+/// overruns is killed and reported as an error, so a hung `e2fsck` or
+/// `avbtool.py` can never stall a build forever.
+pub(crate) fn capture(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

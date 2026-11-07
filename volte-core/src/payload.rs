@@ -2,8 +2,10 @@
 //!
 //! Ports `payload_dirs` / `payload_file` / `payload_required` /
 //! `first_payload` (`hd_vendor_build.py:285-313`) and `overlay_cmds` (`:857`).
-//! Command lists are byte-identical to the Python tool because `debugfs`
-//! consumes them verbatim.
+//! The write list keeps the Python command order. The cleanup list is
+//! intentionally different: it removes each candidate by absolute path instead
+//! of `cd`-ing into a directory first, so a missing directory cannot leave the
+//! shell at `/` and turn the following `rm` into a no-op.
 
 use std::path::{Path, PathBuf};
 
@@ -85,22 +87,17 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
     std::fs::copy(payload_required(root, "config.bin")?, td.join("config.bin"))?;
 
     let clean: Vec<String> = [
-        "cd /overlay/HDVoLTE",
-        "rm OPPO_VoLTE_Overlay.apk",
-        "rm HD_OPPO_MTK_VoLTE_Overlay.apk",
-        "rm HD_OPPO_QC_VoLTE_Overlay.apk",
-        "cd /overlay",
-        "rm OPPO_VoLTE_Overlay.apk",
-        "rm HD_OPPO_MTK_VoLTE_Overlay.apk",
-        "rm HD_OPPO_QC_VoLTE_Overlay.apk",
-        "rmdir HDVoLTE",
-        "cd /etc/init",
-        "rm hd_oppo_mtk_volte.rc",
-        "rm hd_oppo_qc_volte.rc",
-        "cd /etc/init/hw",
-        "rm hd_oppo_qc_volte.rc",
-        "rm hd_oppo_mtk_volte.rc",
-        "cd /",
+        "rm /overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk",
+        "rm /overlay/HDVoLTE/HD_OPPO_MTK_VoLTE_Overlay.apk",
+        "rm /overlay/HDVoLTE/HD_OPPO_QC_VoLTE_Overlay.apk",
+        "rm /overlay/OPPO_VoLTE_Overlay.apk",
+        "rm /overlay/HD_OPPO_MTK_VoLTE_Overlay.apk",
+        "rm /overlay/HD_OPPO_QC_VoLTE_Overlay.apk",
+        "rmdir /overlay/HDVoLTE",
+        "rm /etc/init/hd_oppo_mtk_volte.rc",
+        "rm /etc/init/hd_oppo_qc_volte.rc",
+        "rm /etc/init/hw/hd_oppo_qc_volte.rc",
+        "rm /etc/init/hw/hd_oppo_mtk_volte.rc",
         "mkdir /overlay",
         "mkdir /etc",
         "mkdir /etc/init",
@@ -260,7 +257,7 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, false);
         let plan = overlay_commands(&root, &td, true).unwrap();
-        assert_eq!(plan.clean.len(), 20, "clean commands");
+        assert_eq!(plan.clean.len(), 15, "clean commands");
         assert_eq!(plan.write.len(), 38, "write commands");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -272,12 +269,35 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, true);
         let plan = overlay_commands(&root, &td, false).unwrap();
-        assert_eq!(plan.clean.len(), 20, "clean commands");
+        assert_eq!(plan.clean.len(), 15, "clean commands");
         assert_eq!(plan.write.len(), 44, "write commands");
         assert!(
             plan.write.iter().any(|c| c.contains("write") && c.ends_with("hd_oppo_qc_volte.rc")),
             "MTK must also write the QC RC"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_uses_absolute_paths_and_never_changes_directory() {
+        let root = tmp("volte_overlay_clean_abs");
+        let td = root.join("work");
+        std::fs::create_dir_all(&td).unwrap();
+        seed_payloads(&root, true, false);
+        let plan = overlay_commands(&root, &td, true).unwrap();
+        assert!(
+            !plan.clean.iter().any(|c| c.starts_with("cd ")),
+            "{:?}",
+            plan.clean
+        );
+        for cmd in &plan.clean {
+            let path = cmd
+                .strip_prefix("rm ")
+                .or_else(|| cmd.strip_prefix("rmdir "))
+                .or_else(|| cmd.strip_prefix("mkdir "))
+                .unwrap_or_else(|| panic!("unexpected clean command: {cmd}"));
+            assert!(path.starts_with('/'), "{cmd} must use an absolute path");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

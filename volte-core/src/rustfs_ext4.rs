@@ -66,6 +66,24 @@ fn write_host(workdir: &Path, name: &str, data: &[u8]) -> std::result::Result<()
     std::fs::write(&path, data).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// A dump allocates the inode's declared size. Bound that claim by the image
+/// file (a regular file cannot exceed its filesystem) and make the allocation
+/// fallible, so a corrupt inode is an error instead of an OOM kill.
+fn dump_buffer(declared: u64, image_len: u64) -> std::result::Result<Vec<u8>, String> {
+    if declared > image_len {
+        return Err(format!(
+            "file claims {declared} bytes, more than the {image_len}-byte image"
+        ));
+    }
+    let len = usize::try_from(declared)
+        .map_err(|_| format!("file size {declared} does not fit memory"))?;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| format!("cannot allocate {len} bytes for the dump"))?;
+    buf.resize(len, 0);
+    Ok(buf)
+}
+
 fn parse_u32(text: &str) -> std::result::Result<u32, String> {
     match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         Some(digits) => u32::from_str_radix(digits, 16),
@@ -111,6 +129,9 @@ fn split_last_token(args: &str) -> Option<(&str, &str)> {
 struct Session {
     fs: Filesystem,
     cwd: String,
+    /// Size of the backing image file. A regular file inside the image can
+    /// never be larger, so a corrupt inode cannot drive a huge allocation.
+    image_len: u64,
 }
 
 impl Session {
@@ -282,7 +303,8 @@ impl Session {
                 if !inode.is_file() {
                     return Err(format!("{path}: not a regular file"));
                 }
-                let mut buf = vec![0u8; inode.size as usize];
+                let mut buf = dump_buffer(inode.size, self.image_len)
+                    .map_err(|e| format!("{path}: {e}"))?;
                 let read = self
                     .fs
                     .read_ino(ino, 0, &mut buf)
@@ -297,12 +319,14 @@ impl Session {
 
 impl RustFsExt4Backend {
     fn open_session(image: &Path) -> Result<Session> {
+        let image_len = std::fs::metadata(image)?.len();
         let dev: Arc<dyn BlockDevice> =
             Arc::new(FileDevice::open_path_rw(image).map_err(map_fs)?);
         let fs = Filesystem::mount(dev).map_err(map_fs)?;
         Ok(Session {
             fs,
             cwd: "/".to_owned(),
+            image_len,
         })
     }
 }
@@ -419,6 +443,14 @@ mod tests {
     fn run(ops: &mut RustFsExt4Backend, img: &Path, dir: &Path, cmds: &[&str]) -> String {
         let commands: Vec<String> = cmds.iter().map(|c| (*c).to_owned()).collect();
         ops.run(img, &commands, dir, &mut quiet()).expect("batch")
+    }
+
+    #[test]
+    fn dump_buffer_bounds_the_claim_by_the_image_size() {
+        assert_eq!(dump_buffer(0, 4096).unwrap().len(), 0);
+        assert_eq!(dump_buffer(4096, 4096).unwrap().len(), 4096);
+        let err = dump_buffer(4097, 4096).unwrap_err();
+        assert!(err.contains("more than the 4096-byte image"), "{err}");
     }
 
     #[test]

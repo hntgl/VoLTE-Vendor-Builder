@@ -83,6 +83,22 @@ fn mb(bytes: u64) -> f64 {
     bytes as f64 / 1_048_576.0
 }
 
+/// Extra destination space reserved beyond the two image-sized files: AVB may
+/// pad to a MiB block and the slot lock rounds the file, and the vbmeta rewrite
+/// needs scratch that is not part of the image payload.
+const AVB_HEADROOM: u64 = 64 * 1024 * 1024;
+
+/// Peak bytes the build needs on each kind of volume.
+///
+/// Destination: the output image, plus the verified restore side file that A02
+/// writes when AVB cannot fit, plus [`AVB_HEADROOM`]. Temp: the unsparsed image
+/// when the source is sparse, plus the always-present pre-AVB backup.
+fn space_need(raw_sz: u64, sparse: bool) -> (u64, u64) {
+    let dest = raw_sz.saturating_mul(2).saturating_add(AVB_HEADROOM);
+    let temp = raw_sz.saturating_add(if sparse { raw_sz } else { 0 });
+    (dest, temp)
+}
+
 /// Python's `time.strftime("%Y%m%d_%H%M%S")` is local time; the port has no
 /// local-time API, so the name carries the UTC stamp. Only the file name can
 /// differ, by the UTC offset.
@@ -142,13 +158,16 @@ fn resolve_output(src: &Path, out: &str, keep_out: bool) -> Result<(PathBuf, Pat
     Ok((folder, path))
 }
 
-/// Best-effort `shutil.disk_usage(dir).free >= needed`.
+/// Best-effort free-space reservation.
 ///
-/// The standard library has no free-space API, so this reserves the size with
-/// `set_len`, which allocates real clusters on NTFS (measured: a 2 GiB
-/// `set_len` lowered `E:` free space by exactly 2 GiB), and releases it again.
-/// Only "disk full" (`ERROR_DISK_FULL` 112 / `ENOSPC` 28) is reported; every
-/// other probe failure is ignored, matching Python's broad `except`.
+/// The standard library has no free-space API and this crate forbids `unsafe`,
+/// so the probe extends a file with `set_len` and relies on the filesystem
+/// allocating the requested space. That holds on NTFS (measured: a 2 GiB
+/// `set_len` lowered `E:` free space by exactly 2 GiB); on filesystems with
+/// delayed allocation the probe is advisory only, which is why every write in
+/// the build still turns `ENOSPC` into a hard error. Only "disk full"
+/// (`ERROR_DISK_FULL` 112 / `ENOSPC` 28) is reported; every other probe failure
+/// is inconclusive and ignored.
 fn probe_space(dir: &Path, needed: u64) -> std::io::Result<()> {
     if needed == 0 {
         return Ok(());
@@ -324,23 +343,43 @@ pub fn run(
         )));
     }
     std::fs::create_dir_all(&folder)?;
-    let orig_sz = std::fs::metadata(&src)?.len();
+    let compressed_sz = std::fs::metadata(&src)?.len();
+    // The sparse header declares the real size; an invalid one is rejected here,
+    // before any output is created.
+    let sparse_sz = sparse::output_size(&src)?;
+    let src_is_sparse = sparse_sz.is_some();
+    let raw_sz = sparse_sz.unwrap_or(compressed_sz);
+    let temp_dir = std::env::temp_dir();
 
-    if orig_sz > 0 {
-        if let Err(e) = probe_space(&folder, orig_sz) {
+    if raw_sz > 0 {
+        let (dest_need, temp_need) = space_need(raw_sz, src_is_sparse);
+        let shared_volume = path_id::same_volume(&folder, &temp_dir);
+        let dest_probe = if shared_volume {
+            probe_space(&folder, dest_need.saturating_add(temp_need))
+        } else {
+            probe_space(&folder, dest_need)
+        };
+        if let Err(e) = dest_probe {
             if disk_full(&e) {
+                let need = if shared_volume {
+                    dest_need.saturating_add(temp_need)
+                } else {
+                    dest_need
+                };
                 return Err(Error::build(format!(
                     "NOT ENOUGH DISK SPACE! The destination drive cannot hold {:.1} MB.",
-                    mb(orig_sz)
+                    mb(need)
                 )));
             }
         }
-        if let Err(e) = probe_space(&std::env::temp_dir(), orig_sz) {
-            if disk_full(&e) {
-                log.log(format!(
-                    "[WARN] The temp drive has less than {:.1} MB free - clean it up before BUILD.",
-                    mb(orig_sz)
-                ));
+        if !shared_volume {
+            if let Err(e) = probe_space(&temp_dir, temp_need) {
+                if disk_full(&e) {
+                    log.log(format!(
+                        "[WARN] The temp drive has less than {:.1} MB free - clean it up before BUILD.",
+                        mb(temp_need)
+                    ));
+                }
             }
         }
     }
@@ -379,7 +418,7 @@ pub fn run(
     let work_dir = WorkDir::create()?;
     let td = work_dir.path();
 
-    let work_src = if sparse::is_sparse(&src) {
+    let work_src = if src_is_sparse {
         log.log("[STATUS] Android sparse image - unsparsing...");
         progress(5, "Unsparse");
         let raw = td.join("vendor_raw.img");
@@ -1061,6 +1100,25 @@ mod tests {
     }
 
     #[test]
+    fn space_need_counts_the_copy_the_restore_side_and_the_temp_backup() {
+        let raw = 100 * 1024 * 1024;
+        let (dest, temp) = space_need(raw, false);
+        assert_eq!(dest, raw * 2 + AVB_HEADROOM);
+        assert_eq!(temp, raw, "a raw source only needs the pre-AVB backup");
+
+        let (dest, temp) = space_need(raw, true);
+        assert_eq!(dest, raw * 2 + AVB_HEADROOM);
+        assert_eq!(temp, raw * 2, "the unsparsed image and the backup coexist");
+    }
+
+    #[test]
+    fn space_need_saturates_instead_of_overflowing() {
+        let (dest, temp) = space_need(u64::MAX, true);
+        assert_eq!(dest, u64::MAX);
+        assert_eq!(temp, u64::MAX);
+    }
+
+    #[test]
     fn missing_source_is_a_build_error() {
         let dir = tmp("volte_pipeline_missing");
         let mut ops = RustFsExt4Backend::new();
@@ -1142,7 +1200,7 @@ mod tests {
 
         let commands = std::fs::read_to_string(logs.join("commands_last.txt")).unwrap();
         assert!(commands.contains("\n\n"), "clean and write blocks are separated");
-        assert!(commands.starts_with("cd /overlay/HDVoLTE\n"));
+        assert!(commands.starts_with("rm /overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk\n"));
         assert!(commands.contains("\nmkdir /overlay/HDVoLTE\n"));
         let report = std::fs::read_to_string(logs.join("vendor_VolLTE_report.txt")).unwrap();
         assert_eq!(report.lines().count(), 6, "{report}");

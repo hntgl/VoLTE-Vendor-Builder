@@ -114,34 +114,69 @@ pub const IDENTITY_KEYS: [&str; 10] = [
     "ro.product.oppo.model",
 ];
 
-fn key_of(line: &str) -> String {
-    line.split_once('=')
-        .map(|(k, _)| k.trim().to_lowercase())
-        .unwrap_or_default()
+/// ASCII-lowercased key of a prop line, as bytes. Matching on bytes keeps
+/// lines that are not valid UTF-8 intact.
+fn key_bytes(line: &[u8]) -> Vec<u8> {
+    let Some(eq) = line.iter().position(|&b| b == b'=') else {
+        return Vec::new();
+    };
+    let key = trim_bytes(&line[..eq]);
+    key.iter().map(u8::to_ascii_lowercase).collect()
 }
 
-fn wanted(line: &str) -> Option<&'static str> {
+fn trim_bytes(line: &[u8]) -> &[u8] {
+    let start = line
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    let end = line
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    &line[start..end]
+}
+
+fn wanted(line: &[u8]) -> Option<&'static str> {
+    let key = key_bytes(line);
+    if key.is_empty() {
+        return None;
+    }
     HD_VOLTE_SHOW_PROPS
         .iter()
         .rev()
-        .find(|w| key_of(w) == key_of(line))
+        .find(|w| key_bytes(w.as_bytes()) == key)
         .copied()
 }
 
+/// Splits bytes into `(line, terminator)` pairs. CRLF is kept as its own
+/// terminator and a final line without `\n` has an empty terminator.
+fn split_lines(raw: &[u8]) -> Vec<(&[u8], &[u8])> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for (i, &b) in raw.iter().enumerate() {
+        if b == b'\n' {
+            let mut body = &raw[start..i];
+            let mut term: &[u8] = b"\n";
+            if body.ends_with(b"\r") {
+                body = &body[..body.len() - 1];
+                term = b"\r\n";
+            }
+            out.push((body, term));
+            start = i + 1;
+        }
+    }
+    if start < raw.len() {
+        out.push((&raw[start..], b""));
+    }
+    out
+}
+
+/// Replaces the file content in place. The backend's `write` keeps the inode,
+/// so its mode, owner and SELinux label survive; the Python reference deletes
+/// the file first and then forces root/0644, which this port intentionally
+/// does not do.
 fn write_back(image: &Path, td: &Path, vpath: &str, host: &Path, ops: &mut dyn Ext4Ops) -> Result<()> {
-    let (dir, name) = match vpath.rsplit_once('/') {
-        Some((d, n)) if !d.is_empty() => (d, n),
-        Some((_, n)) => ("/", n),
-        None => ("/", vpath),
-    };
-    let cmds = vec![
-        format!("rm {vpath}"),
-        format!("cd {dir}"),
-        format!("write {} {name}", forward_slashes(host)),
-        format!("set_inode_field {name} uid 0"),
-        format!("set_inode_field {name} gid 0"),
-        format!("set_inode_field {name} mode 0x81A4"),
-    ];
+    let cmds = vec![format!("write {} {vpath}", forward_slashes(host))];
     let mut quiet = Logger::new();
     ops.run(image, &cmds, td, &mut quiet).map(|_| ())
 }
@@ -149,6 +184,12 @@ fn write_back(image: &Path, td: &Path, vpath: &str, host: &Path, ops: &mut dyn E
 /// Upserts the 75 properties into every property file that exists and returns
 /// Python's `changed` count (added + fixed lines). Per-file failures are logged
 /// and skipped, never fatal.
+///
+/// The file is edited as bytes: untouched lines keep their exact bytes and
+/// terminators (CRLF included), only lines whose key matches are replaced, and
+/// duplicate keys are left in place. Unlike the Python reference, the image
+/// file is overwritten instead of deleted, so its mode, owner and label are
+/// preserved, and the vendor_file label is only applied to `/build.prop`.
 pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) -> Result<usize> {
     let mut changed = 0usize;
     for (vpath, host_name) in PROP_FILES {
@@ -170,34 +211,44 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
         let Ok(raw) = std::fs::read(&host) else {
             continue;
         };
-        let text = String::from_utf8_lossy(&raw);
 
-        let mut lines_out: Vec<&str> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
+        let mut out: Vec<u8> = Vec::with_capacity(raw.len() + 2048);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
         let mut dirty = 0usize;
-        for ln in text.lines() {
-            let s = ln.trim();
-            if s.is_empty() || s.starts_with('#') || !s.contains('=') {
-                lines_out.push(ln);
+        let mut term: &[u8] = b"\n";
+        let mut term_set = false;
+        for (body, line_end) in split_lines(&raw) {
+            if !term_set && !line_end.is_empty() {
+                term = line_end;
+                term_set = true;
+            }
+            let s = trim_bytes(body);
+            if s.is_empty() || s[0] == b'#' || !s.contains(&b'=') {
+                out.extend_from_slice(body);
+                out.extend_from_slice(line_end);
                 continue;
             }
-            let key = key_of(s);
-            if let Some(want) = wanted(s) {
-                if s != want {
-                    lines_out.push(want);
-                    dirty += 1;
-                } else {
-                    lines_out.push(ln);
+            match wanted(s) {
+                Some(want) => {
+                    if s != want.as_bytes() {
+                        out.extend_from_slice(want.as_bytes());
+                        dirty += 1;
+                    } else {
+                        out.extend_from_slice(body);
+                    }
+                    out.extend_from_slice(line_end);
+                    seen.push(key_bytes(s));
                 }
-                seen.push(key);
-                continue;
+                None => {
+                    out.extend_from_slice(body);
+                    out.extend_from_slice(line_end);
+                }
             }
-            lines_out.push(ln);
         }
 
         let mut add: Vec<&str> = Vec::new();
         for line in HD_VOLTE_SHOW_PROPS {
-            let key = key_of(line);
+            let key = key_bytes(line.as_bytes());
             if key.is_empty() || seen.contains(&key) {
                 continue;
             }
@@ -208,16 +259,22 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
             continue;
         }
 
-        let mut out = lines_out.join("\n");
-        if !out.ends_with('\n') {
-            out.push('\n');
+        if out.last() != Some(&b'\n') {
+            out.extend_from_slice(term);
         }
         if !add.is_empty() {
-            out.push_str("\n# HD VoLTE show switch\n");
-            out.push_str(&add.join("\n"));
-            out.push('\n');
+            out.extend_from_slice(term);
+            out.extend_from_slice(b"# HD VoLTE show switch");
+            out.extend_from_slice(term);
+            for (i, line) in add.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(term);
+                }
+                out.extend_from_slice(line.as_bytes());
+            }
+            out.extend_from_slice(term);
         }
-        std::fs::write(&host, out.as_bytes())?;
+        std::fs::write(&host, &out)?;
 
         match write_back(image, td, vpath, &host, ops) {
             Ok(()) => {
@@ -235,25 +292,20 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
             }
         }
 
-        // build.prop requires the vendor_file label.
-        let vf = td.join("vendor_file.bin");
-        if !vf.is_file() {
-            let _ = std::fs::write(&vf, b"u:object_r:vendor_file:s0\0");
-        }
-        let (dir, name) = match vpath.rsplit_once('/') {
-            Some((d, n)) if !d.is_empty() => (d, n),
-            Some((_, n)) => ("/", n),
-            None => ("/", vpath),
-        };
-        let cmds = vec![
-            format!("cd {dir}"),
-            format!(
-                "ea_set -f {} {name} security.selinux",
+        // Only build.prop is required to carry the vendor_file label; the other
+        // files keep whatever label their inode already had.
+        if vpath == "/build.prop" {
+            let vf = td.join("vendor_file.bin");
+            if !vf.is_file() {
+                let _ = std::fs::write(&vf, b"u:object_r:vendor_file:s0\0");
+            }
+            let cmds = vec![format!(
+                "ea_set -f {} {vpath} security.selinux",
                 forward_slashes(&vf)
-            ),
-        ];
-        let mut quiet = Logger::new();
-        let _ = ops.run_best_effort(image, &cmds, td, &mut quiet);
+            )];
+            let mut quiet = Logger::new();
+            let _ = ops.run_best_effort(image, &cmds, td, &mut quiet);
+        }
     }
     if changed == 0 {
         log.log("[WARN] Could not write the VoLTE show props (build.prop dump/write failed).");
@@ -386,7 +438,10 @@ mod tests {
     #[test]
     fn show_props_has_75_unique_keys_and_python_values() {
         assert_eq!(HD_VOLTE_SHOW_PROPS.len(), 75);
-        let keys: Vec<String> = HD_VOLTE_SHOW_PROPS.iter().map(|l| key_of(l)).collect();
+        let keys: Vec<String> = HD_VOLTE_SHOW_PROPS
+            .iter()
+            .map(|l| String::from_utf8(key_bytes(l.as_bytes())).unwrap())
+            .collect();
         let mut unique = keys.clone();
         unique.sort();
         unique.dedup();
@@ -537,6 +592,90 @@ mod tests {
         assert_eq!(why, format!("{}ế", "x".repeat(119)));
         assert_eq!(why.chars().count(), 120);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crlf_duplicates_and_invalid_bytes_survive_the_rewrite() {
+        let dir = tmp("volte_props_bytes");
+        let body = b"ro.xxxx=1\r\n# keep \xFF\xFE\r\npersist.mtk.volte_support=0\r\n\
+PERSIST.RADIO.VT_ENABLE=0\r\nlast.noeol=1";
+        let mut ops = FakeOps::default();
+        ops.dumps.insert("/build.prop".to_owned(), body.to_vec());
+        let mut log = quiet();
+        let changed = upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap();
+        assert_eq!(changed, 75);
+        let out = &ops.written[0].1;
+
+        assert!(
+            out.starts_with(b"ro.xxxx=1\r\n# keep \xFF\xFE\r\n"),
+            "untouched lines keep their exact bytes"
+        );
+        assert!(contains(out, b"persist.mtk.volte_support=1\r\n"), "{out:?}");
+        assert!(contains(out, b"persist.radio.VT_ENABLE=1\r\n"), "{out:?}");
+        assert!(!contains(out, b"persist.mtk.volte_support=0"));
+        assert!(
+            contains(out, b"last.noeol=1\r\n\r\n# HD VoLTE show switch\r\n"),
+            "the appended block follows the detected CRLF style"
+        );
+        assert!(!contains(out, b"\n\n# HD VoLTE show switch\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_keys_are_all_corrected_and_kept() {
+        let dir = tmp("volte_props_dupes");
+        let mut ops = FakeOps::default();
+        ops.dumps.insert(
+            "/build.prop".to_owned(),
+            b"persist.mtk.volte_support=0\npersist.mtk.volte_support=2\n".to_vec(),
+        );
+        let mut log = quiet();
+        let changed = upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap();
+        assert_eq!(changed, 76, "two fixed lines plus 74 new keys");
+        let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
+        assert_eq!(text.matches("persist.mtk.volte_support=1\n").count(), 2);
+    }
+
+    #[test]
+    fn the_rewrite_preserves_inode_metadata_instead_of_resetting_it() {
+        let dir = tmp("volte_props_metadata");
+        let mut ops = FakeOps::default();
+        ops.dumps.insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
+        let mut log = quiet();
+        upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap();
+        let flat: Vec<&String> = ops.commands.iter().flatten().collect();
+        assert!(
+            !flat.iter().any(|c| c.starts_with("rm ") || c.contains("set_inode_field")),
+            "{flat:?}"
+        );
+        assert!(
+            flat.iter().any(|c| c.starts_with("write ") && c.ends_with(" /build.prop")),
+            "the file is rewritten in place by absolute path: {flat:?}"
+        );
+        assert!(
+            flat.iter().any(|c| c.starts_with("ea_set -f ") && c.ends_with(" /build.prop security.selinux")),
+            "{flat:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_build_prop_gets_the_vendor_file_label() {
+        let dir = tmp("volte_props_label_scope");
+        let mut ops = FakeOps::default();
+        ops.dumps.insert("/default.prop".to_owned(), b"ro.yyyy=1\n".to_vec());
+        let mut log = quiet();
+        assert_eq!(upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(), 75);
+        let flat: Vec<&String> = ops.commands.iter().flatten().collect();
+        assert!(
+            !flat.iter().any(|c| c.starts_with("ea_set ")),
+            "{flat:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
     }
 
     fn identify_fixture() -> (PathBuf, FakeOps) {

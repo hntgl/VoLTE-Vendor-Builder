@@ -3,6 +3,11 @@
 //! Port of `is_sparse` and `unsparse` (`hd_vendor_build.py:452-523`). Header and
 //! chunk sizes follow the on-disk format: a 28-byte file header, a 12-byte
 //! chunk header, and the declared extra header bytes are skipped when larger.
+//!
+//! Unlike Python, this parser validates the header before touching `dst`:
+//! version, header sizes, block size, declared image size and per-chunk sizes
+//! are checked, and every size computation is overflow-checked. A malformed
+//! image is rejected instead of producing a truncated or oversized output.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -13,6 +18,10 @@ use crate::error::{Error, Result};
 
 const FILE_HEADER_LEN: u64 = 28;
 const CHUNK_HEADER_LEN: u64 = 12;
+const SPARSE_MAJOR: u16 = 1;
+/// Upper bound for one raw image. Vendor partitions are far below this; the
+/// limit only rejects headers that declare an absurd output size.
+const MAX_IMAGE_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 const RAW: u16 = 0xCAC1;
 const FILL: u16 = 0xCAC2;
 const DONT_CARE: u16 = 0xCAC3;
@@ -43,92 +52,220 @@ fn read_exact(f: &mut impl Read, buf: &mut [u8], what: &str) -> Result<()> {
         .map_err(|_| Error::build(format!("sparse image is truncated ({what})")))
 }
 
+struct Header {
+    file_hdr_sz: u64,
+    chunk_hdr_sz: u64,
+    blk_sz: u64,
+    total_blks: u64,
+    total_chunks: u32,
+    expected: u64,
+}
+
+/// Validates the 28-byte file header.
+fn parse_header(head: &[u8; FILE_HEADER_LEN as usize]) -> Result<Header> {
+    let major = u16::from_le_bytes([head[4], head[5]]);
+    let file_hdr_sz = u16::from_le_bytes([head[8], head[9]]) as u64;
+    let chunk_hdr_sz = u16::from_le_bytes([head[10], head[11]]) as u64;
+    let blk_sz = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as u64;
+    let total_blks = u32::from_le_bytes([head[16], head[17], head[18], head[19]]) as u64;
+    let total_chunks = u32::from_le_bytes([head[20], head[21], head[22], head[23]]);
+
+    if major != SPARSE_MAJOR {
+        return Err(Error::build(format!(
+            "unsupported sparse version {major}.{} (expected major {SPARSE_MAJOR})",
+            u16::from_le_bytes([head[6], head[7]])
+        )));
+    }
+    if file_hdr_sz < FILE_HEADER_LEN {
+        return Err(Error::build(format!(
+            "sparse file header is {file_hdr_sz} bytes, smaller than {FILE_HEADER_LEN}"
+        )));
+    }
+    if chunk_hdr_sz < CHUNK_HEADER_LEN {
+        return Err(Error::build(format!(
+            "sparse chunk header is {chunk_hdr_sz} bytes, smaller than {CHUNK_HEADER_LEN}"
+        )));
+    }
+    if blk_sz == 0 || !blk_sz.is_multiple_of(4) {
+        return Err(Error::build(format!(
+            "sparse block size {blk_sz} is not a positive multiple of 4"
+        )));
+    }
+    if total_blks == 0 {
+        return Err(Error::build("sparse header declares no blocks"));
+    }
+    let expected = total_blks
+        .checked_mul(blk_sz)
+        .ok_or_else(|| Error::build("sparse header declares an overflowing image size"))?;
+    if expected > MAX_IMAGE_SIZE {
+        return Err(Error::build(format!(
+            "sparse header declares {expected} bytes, above the {MAX_IMAGE_SIZE}-byte limit"
+        )));
+    }
+    // Every chunk except a CRC covers at least one block, and a file needs at
+    // most one CRC per chunk. More than twice the block count cannot be real.
+    let max_chunks = total_blks.saturating_mul(2).saturating_add(1);
+    if total_chunks as u64 > max_chunks {
+        return Err(Error::build(format!(
+            "sparse header declares {total_chunks} chunks for {total_blks} blocks"
+        )));
+    }
+    Ok(Header {
+        file_hdr_sz,
+        chunk_hdr_sz,
+        blk_sz,
+        total_blks,
+        total_chunks,
+        expected,
+    })
+}
+
+/// Raw size declared by a sparse header, or `None` when the file is not sparse
+/// (or shorter than a header). Used to size disk-space probes; the same
+/// validation as [`unsparse`] applies, so a malformed header fails early.
+pub fn output_size(src: &Path) -> Result<Option<u64>> {
+    let mut f = File::open(src)?;
+    let mut head = [0u8; FILE_HEADER_LEN as usize];
+    if f.read(&mut head)? < head.len() {
+        return Ok(None);
+    }
+    if u32::from_le_bytes([head[0], head[1], head[2], head[3]]) != SPARSE_MAGIC {
+        return Ok(None);
+    }
+    Ok(Some(parse_header(&head)?.expected))
+}
+
+/// Rejects a chunk whose declared payload size disagrees with its block count.
+fn check_chunk_size(ctype: u16, csize: u64, blk_sz: u64, tsize: u64) -> Result<u64> {
+    if ctype == CRC32 {
+        if csize != 0 || tsize != 4 {
+            return Err(Error::build(format!(
+                "sparse CRC chunk declares {csize} blocks and {tsize} bytes (expected 0 and 4)"
+            )));
+        }
+        return Ok(0);
+    }
+    let data_len = csize
+        .checked_mul(blk_sz)
+        .ok_or_else(|| Error::build("sparse chunk size overflows"))?;
+    if csize == 0 {
+        return Err(Error::build(format!(
+            "sparse chunk 0x{ctype:X} declares no blocks"
+        )));
+    }
+    if tsize != data_len {
+        return Err(Error::build(format!(
+            "sparse chunk 0x{ctype:X} declares {tsize} bytes for {csize} blocks x {blk_sz}"
+        )));
+    }
+    Ok(data_len)
+}
+
 /// Port of `unsparse`. Returns `Unsparse::NotSparse` for a non-sparse or
 /// shorter-than-header file (Python returns `False` without touching `dst`).
+/// A malformed image leaves no partial output behind.
 pub fn unsparse(src: &Path, dst: &Path) -> Result<Unsparse> {
-    let file = File::open(src)?;
-    let mut f = BufReader::new(file);
+    let mut f = BufReader::new(File::open(src)?);
 
     let mut head = [0u8; FILE_HEADER_LEN as usize];
     if f.read(&mut head)? < head.len() {
         return Ok(Unsparse::NotSparse);
     }
     let magic = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
-    let file_hdr_sz = u16::from_le_bytes([head[8], head[9]]) as u64;
-    let chunk_hdr_sz = u16::from_le_bytes([head[10], head[11]]) as u64;
-    let blk_sz = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as u64;
-    let total_blks = u32::from_le_bytes([head[16], head[17], head[18], head[19]]) as u64;
-    let total_chunks = u32::from_le_bytes([head[20], head[21], head[22], head[23]]);
     if magic != SPARSE_MAGIC {
         return Ok(Unsparse::NotSparse);
     }
-    if file_hdr_sz > FILE_HEADER_LEN {
-        f.seek(SeekFrom::Current((file_hdr_sz - FILE_HEADER_LEN) as i64))?;
+    let hdr = parse_header(&head)?;
+    if hdr.file_hdr_sz > FILE_HEADER_LEN {
+        f.seek(SeekFrom::Current((hdr.file_hdr_sz - FILE_HEADER_LEN) as i64))?;
     }
 
-    let out_file = File::create(dst)?;
-    let mut out = BufWriter::new(out_file);
+    let out = BufWriter::new(File::create(dst)?);
+    let written = match write_image(&mut f, dst, out, &hdr) {
+        Ok(written) => written,
+        Err(e) => {
+            let _ = std::fs::remove_file(dst);
+            return Err(e);
+        }
+    };
+    Ok(Unsparse::Converted { written })
+}
+
+fn write_image(
+    f: &mut (impl Read + Seek),
+    dst: &Path,
+    mut out: BufWriter<File>,
+    hdr: &Header,
+) -> Result<u64> {
     let mut written: u64 = 0;
 
-    for _ in 0..total_chunks {
+    for _ in 0..hdr.total_chunks {
         let mut ch = [0u8; CHUNK_HEADER_LEN as usize];
-        read_exact(&mut f, &mut ch, "chunk header")?;
+        read_exact(f, &mut ch, "chunk header")?;
         let ctype = u16::from_le_bytes([ch[0], ch[1]]);
         let csize = u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]) as u64;
-        if chunk_hdr_sz > CHUNK_HEADER_LEN {
-            f.seek(SeekFrom::Current((chunk_hdr_sz - CHUNK_HEADER_LEN) as i64))?;
+        let tsize = u32::from_le_bytes([ch[8], ch[9], ch[10], ch[11]]) as u64;
+        if hdr.chunk_hdr_sz > CHUNK_HEADER_LEN {
+            f.seek(SeekFrom::Current((hdr.chunk_hdr_sz - CHUNK_HEADER_LEN) as i64))?;
+        }
+
+        let data_len = match ctype {
+            RAW | FILL | DONT_CARE | CRC32 => check_chunk_size(ctype, csize, hdr.blk_sz, tsize)?,
+            other => return Err(Error::build(format!("bad sparse chunk type: 0x{other:X}"))),
+        };
+        let next = written
+            .checked_add(data_len)
+            .ok_or_else(|| Error::build("sparse chunk sizes overflow"))?;
+        if next > hdr.expected {
+            return Err(Error::build(format!(
+                "sparse chunks cover at least {next} bytes but the header declares {}",
+                hdr.expected
+            )));
         }
 
         match ctype {
             RAW => {
-                let mut left = csize * blk_sz;
+                let mut left = data_len;
                 let mut buf = vec![0u8; 8 * 1024 * 1024];
                 while left > 0 {
-                    let n = (left as usize).min(buf.len());
-                    read_exact(&mut f, &mut buf[..n], "raw chunk")?;
+                    let n = left.min(buf.len() as u64) as usize;
+                    read_exact(f, &mut buf[..n], "raw chunk")?;
                     out.write_all(&buf[..n])?;
                     left -= n as u64;
-                    written += n as u64;
                 }
             }
             FILL => {
                 let mut pat = [0u8; 4];
-                read_exact(&mut f, &mut pat, "fill chunk")?;
+                read_exact(f, &mut pat, "fill chunk")?;
                 let step = 1024 * 1024usize;
                 let mut chunk = vec![0u8; step];
                 for i in (0..step).step_by(4) {
                     chunk[i..i + 4].copy_from_slice(&pat);
                 }
-                let mut left = csize * blk_sz;
+                let mut left = data_len;
                 while left > 0 {
-                    let k = (left as usize).min(step);
+                    let k = left.min(step as u64) as usize;
                     out.write_all(&chunk[..k])?;
                     left -= k as u64;
-                    written += k as u64;
                 }
             }
             DONT_CARE => {
-                let n = csize * blk_sz;
-                out.seek(SeekFrom::Current(n as i64))?;
-                written += n;
+                out.seek(SeekFrom::Current(data_len as i64))?;
             }
             CRC32 => {
                 let mut crc = [0u8; 4];
-                read_exact(&mut f, &mut crc, "crc chunk")?;
+                read_exact(f, &mut crc, "crc chunk")?;
             }
-            other => {
-                return Err(Error::build(format!("bad sparse chunk type: 0x{other:X}")));
-            }
+            other => return Err(Error::build(format!("bad sparse chunk type: 0x{other:X}"))),
         }
+        written = next;
     }
 
-    let expected = total_blks
-        .checked_mul(blk_sz)
-        .ok_or_else(|| Error::build("sparse header declares an overflowing image size"))?;
-    if written != expected {
+    if written != hdr.expected {
         return Err(Error::build(format!(
-            "sparse chunks cover {written} bytes but the header declares {expected} \
-             ({total_blks} blocks x {blk_sz})"
+            "sparse chunks cover {written} bytes but the header declares {} \
+             ({} blocks x {})",
+            hdr.expected, hdr.total_blks, hdr.blk_sz
         )));
     }
     out.flush()?;
@@ -136,11 +273,12 @@ pub fn unsparse(src: &Path, dst: &Path) -> Result<Unsparse> {
     file.set_len(written)?;
     let actual = file.metadata()?.len();
     if actual != written {
+        let _ = std::fs::remove_file(dst);
         return Err(Error::build(format!(
             "sparse output is {actual} bytes after conversion, expected {written}"
         )));
     }
-    Ok(Unsparse::Converted { written })
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -422,6 +560,155 @@ mod tests {
         assert_eq!(unsparse(&src, &dst).unwrap(), Unsparse::Converted { written: BLK as u64 });
         let raw = std::fs::read(&dst).unwrap();
         assert!(raw.iter().all(|&b| b == 9));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn header_error(name: &str, patch: impl FnOnce(&mut Vec<u8>), needle: &str) {
+        let dir = tmp(name);
+        let src = dir.join("bad.sparse");
+        let dst = dir.join("out.raw");
+        let mut sp = build_sparse(&[Chunk::DontCare(1)]);
+        patch(&mut sp);
+        std::fs::write(&src, &sp).unwrap();
+        let err = unsparse(&src, &dst).unwrap_err();
+        assert!(err.message().contains(needle), "{}", err);
+        assert!(!dst.exists(), "a bad header must not create the output");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsupported_major_version_is_rejected() {
+        header_error(
+            "volte_sparse_version",
+            |sp| sp[4..6].copy_from_slice(&2u16.to_le_bytes()),
+            "unsupported sparse version 2.0",
+        );
+    }
+
+    #[test]
+    fn a_short_file_header_is_rejected() {
+        header_error(
+            "volte_sparse_short_file_hdr",
+            |sp| sp[8..10].copy_from_slice(&20u16.to_le_bytes()),
+            "smaller than 28",
+        );
+    }
+
+    #[test]
+    fn a_short_chunk_header_is_rejected() {
+        header_error(
+            "volte_sparse_short_chunk_hdr",
+            |sp| sp[10..12].copy_from_slice(&8u16.to_le_bytes()),
+            "smaller than 12",
+        );
+    }
+
+    #[test]
+    fn a_zero_block_size_is_rejected() {
+        header_error(
+            "volte_sparse_zero_blk",
+            |sp| sp[12..16].copy_from_slice(&0u32.to_le_bytes()),
+            "not a positive multiple of 4",
+        );
+    }
+
+    #[test]
+    fn a_block_size_not_multiple_of_four_is_rejected() {
+        header_error(
+            "volte_sparse_odd_blk",
+            |sp| sp[12..16].copy_from_slice(&4093u32.to_le_bytes()),
+            "not a positive multiple of 4",
+        );
+    }
+
+    #[test]
+    fn an_image_declaring_no_blocks_is_rejected() {
+        header_error(
+            "volte_sparse_no_blocks",
+            |sp| sp[16..20].copy_from_slice(&0u32.to_le_bytes()),
+            "declares no blocks",
+        );
+    }
+
+    #[test]
+    fn an_absurd_declared_size_is_rejected() {
+        header_error(
+            "volte_sparse_absurd_size",
+            |sp| sp[16..20].copy_from_slice(&u32::MAX.to_le_bytes()),
+            "above the",
+        );
+    }
+
+    #[test]
+    fn a_chunk_count_that_cannot_fit_the_file_is_rejected() {
+        header_error(
+            "volte_sparse_chunk_count",
+            |sp| sp[20..24].copy_from_slice(&u32::MAX.to_le_bytes()),
+            "declares 4294967295 chunks",
+        );
+    }
+
+    #[test]
+    fn a_chunk_payload_size_that_disagrees_with_its_blocks_is_rejected() {
+        header_error(
+            "volte_sparse_tsize_mismatch",
+            |sp| {
+                let tsize_at = 28 + 8;
+                sp[tsize_at..tsize_at + 4].copy_from_slice(&123u32.to_le_bytes());
+            },
+            "declares 123 bytes",
+        );
+    }
+
+    #[test]
+    fn a_crc_chunk_that_declares_blocks_is_rejected() {
+        let dir = tmp("volte_sparse_crc_blocks");
+        let src = dir.join("bad.sparse");
+        let dst = dir.join("out.raw");
+        let mut sp = build_sparse(&[Chunk::DontCare(1), Chunk::Crc(0xDECAFBAD)]);
+        // The CRC chunk follows the 12-byte header of the DONT_CARE chunk.
+        let crc_at = 28 + 12;
+        sp[crc_at + 4..crc_at + 8].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&src, &sp).unwrap();
+        let err = unsparse(&src, &dst).unwrap_err();
+        assert!(err.message().contains("CRC chunk"), "{}", err);
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chunks_that_cover_more_than_the_header_declares_are_rejected_early() {
+        let dir = tmp("volte_sparse_over_cover");
+        let src = dir.join("bad.sparse");
+        let dst = dir.join("out.raw");
+        let mut sp = build_sparse(&[
+            Chunk::Raw(vec![1u8; BLK as usize]),
+            Chunk::Raw(vec![2u8; BLK as usize]),
+        ]);
+        sp[16..20].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&src, &sp).unwrap();
+        let err = unsparse(&src, &dst).unwrap_err();
+        assert!(err.message().contains("cover at least"), "{}", err);
+        assert!(!dst.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_size_reads_the_declared_raw_size() {
+        let dir = tmp("volte_sparse_output_size");
+        let sp = dir.join("image.sparse");
+        let raw = dir.join("image.raw");
+        std::fs::write(&sp, build_sparse(&[Chunk::DontCare(2), Chunk::Raw(vec![0; BLK as usize])])).unwrap();
+        std::fs::write(&raw, vec![0u8; 64]).unwrap();
+
+        assert_eq!(output_size(&sp).unwrap(), Some(3 * BLK as u64));
+        assert_eq!(output_size(&raw).unwrap(), None);
+
+        let mut bad = build_sparse(&[Chunk::DontCare(1)]);
+        bad[4..6].copy_from_slice(&7u16.to_le_bytes());
+        let bad_path = dir.join("bad.sparse");
+        std::fs::write(&bad_path, &bad).unwrap();
+        assert!(output_size(&bad_path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
