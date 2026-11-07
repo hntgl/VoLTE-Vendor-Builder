@@ -27,12 +27,29 @@ pub fn candidate_vpaths(needles: &[&str]) -> Vec<&'static str> {
     vpaths
 }
 
-fn split_vpath(vpath: &str) -> (String, String) {
-    match vpath.rsplit_once('/') {
-        Some((dir, name)) if !dir.is_empty() => (dir.to_owned(), name.to_owned()),
-        Some((_, name)) => ("/etc/init/hw".to_owned(), name.to_owned()),
-        None => ("/etc/init/hw".to_owned(), vpath.to_owned()),
+/// Splits a virtual path into the directory to `cd` into and the file name.
+/// `/name` belongs to the root and `a/b/c` to `a/b`; an empty path or a
+/// trailing slash has no writable target and returns `None`. There is no
+/// silent `/etc/init/hw` fallback: the write must land where the dump came
+/// from.
+fn split_vpath(vpath: &str) -> Option<(String, String)> {
+    if vpath.is_empty() || vpath.ends_with('/') {
+        return None;
     }
+    if let Some(rest) = vpath.strip_prefix('/') {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(match rest.rsplit_once('/') {
+            Some((dir, name)) if !dir.is_empty() => (format!("/{dir}"), name.to_owned()),
+            Some((_, name)) => ("/".to_owned(), name.to_owned()),
+            None => ("/".to_owned(), rest.to_owned()),
+        });
+    }
+    Some(match vpath.rsplit_once('/') {
+        Some((dir, name)) if !dir.is_empty() => (dir.to_owned(), name.to_owned()),
+        _ => (".".to_owned(), vpath.to_owned()),
+    })
 }
 
 /// Returns `true` when an init file was dumped and now imports every needle,
@@ -96,7 +113,8 @@ pub fn link(
     }
     std::fs::write(&host, text.as_bytes())?;
 
-    let (dest_dir, dest_name) = split_vpath(&found);
+    let (dest_dir, dest_name) = split_vpath(&found)
+        .ok_or_else(|| crate::error::Error::build(format!("invalid init path: {found}")))?;
     let mut cmds = vec![
         "mkdir /etc".to_owned(),
         "mkdir /etc/init".to_owned(),
@@ -149,6 +167,7 @@ mod tests {
         existing: Vec<String>,
         fail_dump: bool,
         written: Vec<(String, Vec<u8>)>,
+        commands: Vec<String>,
     }
 
     impl FakeOps {
@@ -161,6 +180,7 @@ mod tests {
                 existing: vec!["/etc".to_owned(), "/etc/init".to_owned()],
                 fail_dump: false,
                 written: Vec::new(),
+                commands: Vec::new(),
             }
         }
     }
@@ -174,6 +194,7 @@ mod tests {
             _log: &mut Logger,
         ) -> Result<String> {
             for c in commands {
+                self.commands.push(c.clone());
                 if let Some(rest) = c.strip_prefix("dump ") {
                     if self.fail_dump {
                         return Err(crate::error::Error::build("dump failed"));
@@ -303,6 +324,69 @@ mod tests {
         assert!(!cmds.iter().any(|c| c.starts_with("mkdir ")), "{cmds:?}");
         assert_eq!(cmds[0], "rm /etc/init/hw/init.target.rc");
         assert!(cmds.iter().any(|c| c.starts_with("ea_set -f ")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_vpath_keeps_the_directory_the_file_came_from() {
+        assert_eq!(
+            split_vpath("/init.target.rc"),
+            Some(("/".to_owned(), "init.target.rc".to_owned()))
+        );
+        assert_eq!(
+            split_vpath("/etc/init/hw/init.target.rc"),
+            Some(("/etc/init/hw".to_owned(), "init.target.rc".to_owned()))
+        );
+        assert_eq!(
+            split_vpath("etc/init/init.vendor.rc"),
+            Some(("etc/init".to_owned(), "init.vendor.rc".to_owned()))
+        );
+        assert_eq!(
+            split_vpath("init.rc"),
+            Some((".".to_owned(), "init.rc".to_owned()))
+        );
+        assert_eq!(split_vpath(""), None);
+        assert_eq!(split_vpath("/"), None);
+        assert_eq!(split_vpath("/etc/"), None, "a trailing slash names no file");
+    }
+
+    #[test]
+    fn a_root_init_file_is_written_back_to_the_root() {
+        let dir = tmp("volte_initrc_root");
+        let mut ops = FakeOps::new(&[("/init.target.rc", b"on boot\n    exec x\n")]);
+        let lines = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct Collect(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+        impl crate::logging::Sink for Collect {
+            fn emit(&mut self, line: &str) {
+                self.0.borrow_mut().push(line.to_owned());
+            }
+        }
+        let mut log = Logger::new().with_sink(Collect(lines.clone()));
+        assert!(link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert_eq!(ops.written.len(), 1);
+        assert_eq!(ops.written[0].0, "init.target.rc");
+        assert!(ops.commands.iter().any(|c| c == "rm /init.target.rc"));
+        assert!(ops.commands.iter().any(|c| c == "cd /"), "{:?}", ops.commands);
+        assert!(
+            !ops.commands.iter().any(|c| c == "cd /etc/init/hw"),
+            "the root file must not be redirected: {:?}",
+            ops.commands
+        );
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("Linked the init script into /init.target.rc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nested_init_file_is_written_back_to_its_own_directory() {
+        let dir = tmp("volte_initrc_nested");
+        let snap = "/etc/init/hw/init.target.rc";
+        let mut ops = FakeOps::new(&[(snap, b"on boot\n    exec x\n")]);
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        assert!(link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert_eq!(ops.written[0].0, "init.target.rc");
+        assert!(ops.commands.iter().any(|c| c == "cd /etc/init/hw"));
+        assert!(!ops.commands.iter().any(|c| c == "cd /"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

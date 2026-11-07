@@ -208,6 +208,75 @@ fn copy_with_progress(
     Ok(())
 }
 
+/// Copies `work` to `backup` and refuses to continue unless the copy has the
+/// same size and SHA-256 as the live image (A02).
+fn take_pre_avb_backup(work: &Path, backup: &Path) -> Result<(u64, String)> {
+    let size = std::fs::metadata(work)?.len();
+    let sha = crate::sha256::file_hex_upper(work)?;
+    if backup.exists() {
+        std::fs::remove_file(backup).map_err(|e| {
+            Error::build(format!(
+                "pre-AVB backup: cannot replace {}: {e}",
+                backup.display()
+            ))
+        })?;
+    }
+    let copied = std::fs::copy(work, backup).map_err(|e| {
+        Error::build(format!(
+            "pre-AVB backup failed ({}): {e} - refusing to run AVB without a verified restore point",
+            backup.display()
+        ))
+    })?;
+    if copied != size {
+        return Err(Error::build(format!(
+            "pre-AVB backup copied {copied} of {size} bytes - refusing to run AVB"
+        )));
+    }
+    let backup_sha = crate::sha256::file_hex_upper(backup)?;
+    if backup_sha != sha {
+        return Err(Error::build(format!(
+            "pre-AVB backup hash differs from the image ({backup_sha} != {sha}) - refusing to run AVB"
+        )));
+    }
+    Ok((size, sha))
+}
+
+/// Restores the pre-AVB snapshot through a side file that is hashed before an
+/// atomic rename, so a failed restore never leaves a half-written image (A02).
+fn restore_pre_avb(work: &Path, backup: &Path, size: u64, sha: &str) -> Result<()> {
+    let backup_size = std::fs::metadata(backup).map(|m| m.len()).unwrap_or(0);
+    if backup_size != size || crate::sha256::file_hex_upper(backup)? != sha {
+        return Err(Error::build(format!(
+            "pre-AVB backup {} no longer matches the copied image - cannot restore safely",
+            backup.display()
+        )));
+    }
+    let mut side = work.as_os_str().to_owned();
+    side.push(".restore.tmp");
+    let side = PathBuf::from(side);
+    if side.exists() {
+        std::fs::remove_file(&side)?;
+    }
+    let copied = std::fs::copy(backup, &side)?;
+    if copied != size || crate::sha256::file_hex_upper(&side)? != sha {
+        let _ = std::fs::remove_file(&side);
+        return Err(Error::build(
+            "restored side file does not match the pre-AVB backup - the image was left untouched",
+        ));
+    }
+    std::fs::rename(&side, work).map_err(|e| {
+        let _ = std::fs::remove_file(&side);
+        Error::build(format!("atomic restore over {} failed: {e}", work.display()))
+    })?;
+    let after = std::fs::metadata(work).map(|m| m.len()).unwrap_or(0);
+    if after != size || crate::sha256::file_hex_upper(work)? != sha {
+        return Err(Error::build(
+            "the restored image does not match the pre-AVB backup",
+        ));
+    }
+    Ok(())
+}
+
 /// Drops the `mkdir` commands whose directory already exists (`:1565-1581`);
 /// a probe error, including a non-EXT4 image, is fatal like in Python.
 fn filter_mkdir(
@@ -481,14 +550,14 @@ pub fn run(
         .as_ref()
         .map(|v| v.rc_sha256.clone())
         .unwrap_or_else(|| "UNVERIFIED".to_string());
-    let apk_ok = verified
+    let payload_ok = verified
         .as_ref()
-        .map(|v| v.apk == Verdict::Verified)
+        .map(|v| v.apk == Verdict::Verified && v.rc == Verdict::Verified)
         .unwrap_or(false);
-    if apk_ok {
+    if payload_ok {
         log.log("[STEP] Overlay APK + RC are inside the image (VoLTE switch).");
     } else {
-        log.log("[WARN] Overlay APK not seen - still exporting the file.");
+        log.log("[WARN] Overlay payload is not fully verified - still exporting the file.");
     }
 
     log.log("e2fsck -fn");
@@ -511,7 +580,8 @@ pub fn run(
 
     let slot_size = orig_sz;
     let pre_avb = td.join("vendor_pre_avb.img");
-    let pre_avb_ok = std::fs::copy(&work, &pre_avb).is_ok();
+    let (pre_avb_size, pre_avb_sha) = take_pre_avb_backup(&work, &pre_avb)?;
+    log.log("[STATUS] Pre-AVB snapshot verified (size + SHA-256).");
     progress(82, "AVB");
     log.log("[STATUS] Generating hashtree and FEC for the image...");
     let avb_ok = match avb::rebuild_hashtree(&work, &avb_info, orig_sz, deps.avb, log) {
@@ -529,14 +599,8 @@ pub fn run(
     let skip_avb;
     if !boot_safe {
         log.log("[STEP] Dropping AVB + EDL size - no footer truncation when the hashtree grows.");
-        if pre_avb_ok {
-            if let Err(e) = std::fs::copy(&pre_avb, &work) {
-                log.log(format!(
-                    "[WARN] Restore pre-AVB: {}",
-                    trunc(&e.to_string(), 120)
-                ));
-            }
-        }
+        restore_pre_avb(&work, &pre_avb, pre_avb_size, &pre_avb_sha)?;
+        log.log("[OK] Restored the pre-AVB image (size + SHA-256 verified).");
         slot::force_slot_size(&work, slot_size, true, "BOOT-SAFE", log)?;
         skip_avb = true;
     } else {
@@ -784,6 +848,83 @@ mod tests {
         assert!(src.is_file(), "the source must still exist");
         assert_eq!(std::fs::metadata(src).unwrap().len(), len);
         assert_eq!(crate::sha256::file_hex_upper(src).unwrap(), hash);
+    }
+
+    fn restore_side(work: &Path) -> PathBuf {
+        let mut side = work.as_os_str().to_owned();
+        side.push(".restore.tmp");
+        PathBuf::from(side)
+    }
+
+    #[test]
+    fn a_pre_avb_backup_is_verified_by_size_and_hash() {
+        let dir = tmp("volte_pipeline_pre_avb_ok");
+        let work = dir.join("vendor_VolLTE.img");
+        let backup = dir.join("vendor_pre_avb.img");
+        std::fs::write(&work, vec![b'A'; 8192]).unwrap();
+        let (size, sha) = take_pre_avb_backup(&work, &backup).unwrap();
+        assert_eq!(size, 8192);
+        assert_eq!(sha, crate::sha256::file_hex_upper(&work).unwrap());
+        assert_eq!(std::fs::read(&backup).unwrap(), std::fs::read(&work).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_replaces_the_image_with_the_verified_snapshot() {
+        let dir = tmp("volte_pipeline_restore_ok");
+        let work = dir.join("vendor_VolLTE.img");
+        let backup = dir.join("vendor_pre_avb.img");
+        std::fs::write(&backup, vec![b'A'; 4096]).unwrap();
+        let sha = crate::sha256::file_hex_upper(&backup).unwrap();
+        std::fs::write(&work, vec![b'B'; 4096]).unwrap();
+        restore_pre_avb(&work, &backup, 4096, &sha).unwrap();
+        assert_eq!(std::fs::read(&work).unwrap(), vec![b'A'; 4096]);
+        assert!(!restore_side(&work).exists(), "the side file is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_backup_makes_restore_fatal_and_leaves_the_image_untouched() {
+        let dir = tmp("volte_pipeline_restore_short");
+        let work = dir.join("vendor_VolLTE.img");
+        let backup = dir.join("vendor_pre_avb.img");
+        std::fs::write(&work, vec![b'B'; 4096]).unwrap();
+        std::fs::write(&backup, vec![b'A'; 1024]).unwrap();
+        let sha = crate::sha256::file_hex_upper(&backup).unwrap();
+        let err = restore_pre_avb(&work, &backup, 4096, &sha).unwrap_err();
+        assert!(err.message().contains("no longer matches"), "{err}");
+        assert_eq!(std::fs::read(&work).unwrap(), vec![b'B'; 4096]);
+        assert!(!restore_side(&work).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backup_with_the_wrong_hash_makes_restore_fatal() {
+        let dir = tmp("volte_pipeline_restore_hash");
+        let work = dir.join("vendor_VolLTE.img");
+        let backup = dir.join("vendor_pre_avb.img");
+        std::fs::write(&work, vec![b'B'; 4096]).unwrap();
+        std::fs::write(&backup, vec![b'A'; 4096]).unwrap();
+        let err = restore_pre_avb(&work, &backup, 4096, &"00".repeat(32)).unwrap_err();
+        assert!(err.message().contains("no longer matches"), "{err}");
+        assert_eq!(std::fs::read(&work).unwrap(), vec![b'B'; 4096]);
+        assert!(!restore_side(&work).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_atomic_replace_is_fatal_and_removes_the_side_file() {
+        let dir = tmp("volte_pipeline_restore_rename");
+        let work = dir.join("vendor_VolLTE.img");
+        std::fs::create_dir(&work).unwrap();
+        let backup = dir.join("vendor_pre_avb.img");
+        std::fs::write(&backup, vec![b'A'; 4096]).unwrap();
+        let sha = crate::sha256::file_hex_upper(&backup).unwrap();
+        let err = restore_pre_avb(&work, &backup, 4096, &sha).unwrap_err();
+        assert!(err.message().contains("atomic restore"), "{err}");
+        assert!(work.is_dir(), "the destination is untouched");
+        assert!(!restore_side(&work).exists(), "the side file is removed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

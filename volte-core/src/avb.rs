@@ -6,9 +6,9 @@
 //! frozen parameters are exactly the ones the Python call passes.
 
 use std::collections::hash_map::RandomState;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasher, Hasher};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -130,22 +130,247 @@ fn fill_from_vbmeta(path: &Path, footer: &AvbFooter) -> Result<AvbInfo> {
     info.vbmeta_offset = footer.vbmeta_offset;
     info.vbmeta_size = footer.vbmeta_size;
 
-    let mut f = std::fs::File::open(path)?;
+    if footer.vbmeta_size == 0 || footer.vbmeta_size > MAX_VBMETA {
+        return Err(Error::build(format!(
+            "AVB footer declares a {} byte vbmeta (allowed 1..={MAX_VBMETA})",
+            footer.vbmeta_size
+        )));
+    }
+    let mut f = File::open(path)?;
     f.seek(SeekFrom::Start(footer.vbmeta_offset))?;
-    let take = footer.vbmeta_size.min(65_536) as usize;
-    let mut vb = vec![0u8; take];
-    let n = f.read(&mut vb)?;
-    vb.truncate(n);
-    for alg in ["sha256", "sha512", "sha1"] {
-        if find_last(&vb, alg.as_bytes()).is_some() {
-            info.hash_algorithm = alg.to_string();
-            break;
-        }
+    let mut vb = vec![0u8; footer.vbmeta_size as usize];
+    f.read_exact(&mut vb)?;
+
+    let meta = parse_vbmeta(&vb).map_err(|e| {
+        Error::build(format!(
+            "AVB vbmeta at offset {}: {e}",
+            footer.vbmeta_offset
+        ))
+    })?;
+    if let Some(name) = meta.partition_name {
+        info.partition_name = name;
     }
-    if find_last(&vb, b"vendor").is_some() {
-        info.partition_name = "vendor".to_string();
+    if let Some(alg) = meta.hash_algorithm {
+        info.hash_algorithm = alg;
     }
+    if let Some(salt) = meta.salt {
+        info.salt = salt;
+    }
+    if let Some(roots) = meta.fec_roots {
+        info.fec_roots = roots;
+    }
+    info.props = meta.props;
     Ok(info)
+}
+
+/// The largest vbmeta `avbtool.py` writes (`MAX_VBMETA_SIZE`).
+const MAX_VBMETA: u64 = 64 * 1024;
+/// `AvbVBMetaImageHeader.SIZE`.
+const VBMETA_HEADER_LEN: usize = 256;
+/// `AvbHashtreeDescriptor.SIZE`.
+const HASHTREE_DESCRIPTOR_LEN: usize = 180;
+/// `AvbPropertyDescriptor.SIZE`.
+const PROPERTY_DESCRIPTOR_LEN: usize = 32;
+
+/// Fields the rebuild needs from the vbmeta descriptors. `None` means the
+/// image has no descriptor that carries the field, not that the field was
+/// guessed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct VbmetaMeta {
+    partition_name: Option<String>,
+    hash_algorithm: Option<String>,
+    salt: Option<String>,
+    fec_roots: Option<u32>,
+    props: Vec<(String, String)>,
+}
+
+fn be_u32(bytes: &[u8]) -> u32 {
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn be_u64(bytes: &[u8]) -> u64 {
+    let mut q = [0u8; 8];
+    q.copy_from_slice(&bytes[..8]);
+    u64::from_be_bytes(q)
+}
+
+fn round8(n: usize) -> usize {
+    n.div_ceil(8) * 8
+}
+
+fn fixed_string(field: &[u8], what: &str) -> std::result::Result<String, String> {
+    let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
+    std::str::from_utf8(&field[..end])
+        .map(str::to_owned)
+        .map_err(|_| format!("{what} is not UTF-8"))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Parses `AvbVBMetaImageHeader` plus its descriptor block. Tags are read from
+/// the descriptor header, never searched for as text; unknown tags are skipped
+/// the way `avbtool.py` skips them. Any length that does not match the
+/// descriptor's own size formula is an error, so a truncated image can never
+/// be read as metadata.
+fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
+    if vb.len() < VBMETA_HEADER_LEN {
+        return Err(format!(
+            "{} bytes is shorter than the {VBMETA_HEADER_LEN}-byte header",
+            vb.len()
+        ));
+    }
+    if &vb[..4] != b"AVB0" {
+        return Err("bad vbmeta magic (expected AVB0)".to_owned());
+    }
+    let auth = be_u64(&vb[12..20]);
+    let aux = be_u64(&vb[20..28]);
+    let desc_offset = be_u64(&vb[96..104]);
+    let desc_size = be_u64(&vb[104..112]);
+    let aux_end = (VBMETA_HEADER_LEN as u64)
+        .checked_add(auth)
+        .and_then(|n| n.checked_add(aux))
+        .ok_or("auth/aux block sizes overflow")?;
+    if aux_end > vb.len() as u64 {
+        return Err(format!(
+            "auth+aux blocks end at {aux_end}, outside the {}-byte vbmeta",
+            vb.len()
+        ));
+    }
+    let start = VBMETA_HEADER_LEN as u64 + auth + desc_offset;
+    let end = start.checked_add(desc_size).ok_or("descriptor size overflows")?;
+    if end > aux_end {
+        return Err(format!(
+            "descriptors end at {end}, past the auxiliary block end {aux_end}"
+        ));
+    }
+
+    let mut meta = VbmetaMeta::default();
+    let mut pos = start as usize;
+    let end = end as usize;
+    while pos < end {
+        if pos + 16 > end {
+            return Err(format!("truncated descriptor header at offset {pos}"));
+        }
+        let tag = be_u64(&vb[pos..pos + 8]);
+        let nbf = be_u64(&vb[pos + 8..pos + 16]);
+        if !nbf.is_multiple_of(8) {
+            return Err(format!("descriptor at {pos} has unaligned size {nbf}"));
+        }
+        let total = 16usize
+            .checked_add(nbf as usize)
+            .ok_or("descriptor size overflows")?;
+        let last = pos
+            .checked_add(total)
+            .ok_or("descriptor end overflows")?;
+        if last > end {
+            return Err(format!(
+                "descriptor at {pos} ends at {last}, past the descriptor block end {end}"
+            ));
+        }
+        let body = &vb[pos..last];
+        match tag {
+            0 => {
+                if let Some((key, value)) = parse_property(body, pos)? {
+                    meta.props.push((key, value));
+                }
+            }
+            1 => parse_hashtree(body, pos, &mut meta)?,
+            _ => {}
+        }
+        pos = last;
+    }
+    Ok(meta)
+}
+
+fn parse_hashtree(
+    body: &[u8],
+    pos: usize,
+    meta: &mut VbmetaMeta,
+) -> std::result::Result<(), String> {
+    if body.len() < HASHTREE_DESCRIPTOR_LEN {
+        return Err(format!(
+            "hashtree descriptor at {pos} is shorter than {HASHTREE_DESCRIPTOR_LEN} bytes"
+        ));
+    }
+    let nbf = be_u64(&body[8..16]) as usize;
+    let fec_roots = be_u32(&body[52..56]);
+    let algorithm = fixed_string(&body[72..104], "hash algorithm")?;
+    let name_len = be_u32(&body[104..108]) as usize;
+    let salt_len = be_u32(&body[108..112]) as usize;
+    let digest_len = be_u32(&body[112..116]) as usize;
+    let dynamic = HASHTREE_DESCRIPTOR_LEN
+        .checked_add(name_len)
+        .and_then(|n| n.checked_add(salt_len))
+        .and_then(|n| n.checked_add(digest_len))
+        .ok_or("hashtree descriptor lengths overflow")?;
+    if dynamic > body.len() {
+        return Err(format!(
+            "hashtree descriptor at {pos} declares {dynamic} bytes but carries {}",
+            body.len()
+        ));
+    }
+    let expected = round8(dynamic.saturating_sub(16));
+    if nbf != expected {
+        return Err(format!(
+            "hashtree descriptor at {pos} declares {nbf} following bytes, expected {expected}"
+        ));
+    }
+    let name_at = HASHTREE_DESCRIPTOR_LEN;
+    let salt_at = name_at + name_len;
+    let salt = &body[salt_at..salt_at + salt_len];
+
+    if meta.partition_name.is_none() {
+        let name = std::str::from_utf8(&body[name_at..name_at + name_len])
+            .map_err(|_| format!("partition name at {pos} is not UTF-8"))?;
+        meta.partition_name = Some(name.to_owned());
+        meta.hash_algorithm = if algorithm.is_empty() {
+            None
+        } else {
+            Some(algorithm)
+        };
+        meta.salt = Some(hex_lower(salt));
+        meta.fec_roots = Some(fec_roots);
+    }
+    Ok(())
+}
+
+fn parse_property(
+    body: &[u8],
+    pos: usize,
+) -> std::result::Result<Option<(String, String)>, String> {
+    if body.len() < PROPERTY_DESCRIPTOR_LEN {
+        return Err(format!(
+            "property descriptor at {pos} is shorter than {PROPERTY_DESCRIPTOR_LEN} bytes"
+        ));
+    }
+    let nbf = be_u64(&body[8..16]) as usize;
+    let key_len = be_u64(&body[16..24]) as usize;
+    let value_len = be_u64(&body[24..32]) as usize;
+    let expected = round8(PROPERTY_DESCRIPTOR_LEN - 16 + key_len + 1 + value_len + 1);
+    if nbf != expected {
+        return Err(format!(
+            "property descriptor at {pos} declares {nbf} following bytes, expected {expected}"
+        ));
+    }
+    let key_at = PROPERTY_DESCRIPTOR_LEN;
+    let value_at = key_at + key_len + 1;
+    let value_end = value_at + value_len;
+    if value_end + 1 > body.len() {
+        return Err(format!("property descriptor at {pos} overruns its bytes"));
+    }
+    let key = std::str::from_utf8(&body[key_at..key_at + key_len])
+        .map_err(|_| format!("property key at {pos} is not UTF-8"))?
+        .to_owned();
+    let value = std::str::from_utf8(&body[value_at..value_end])
+        .map_err(|_| format!("property {key} at {pos} has a non-UTF-8 value"))?
+        .to_owned();
+    Ok(Some((key, value)))
 }
 
 /// `avb_info_fast`: last 64 bytes first, then a backward scan of the final
@@ -332,12 +557,13 @@ impl Avb for PythonAvbtool {
 
 /// `rebuild_hashtree` (`:1271`).
 ///
-/// `Ok(Some(info))` means a footer was rebuilt, verified against the pre-call
-/// vbmeta region, and the image was padded to the locked slot when needed;
-/// `Ok(None)` means the hashtree did not fit and the original footer/EXT4 tail
-/// must be kept — Python returns `False` in that case and the pipeline restores
-/// its pre-AVB snapshot. `Err` means the backend failed or left the old footer
-/// untouched; it is never reported as success.
+/// The old 64-byte footer is zeroed before the backend runs, so a footer that
+/// exists afterwards can only have been written by this call. `Ok(Some(info))`
+/// means that happened and the image was padded to the locked slot when needed;
+/// `Ok(None)` means the hashtree grew past the slot and the pipeline restores
+/// its pre-AVB snapshot. `Err` means the backend failed or left no valid footer;
+/// the saved footer is put back first, and a failure is never reported as
+/// success.
 pub fn rebuild_hashtree(
     image: &Path,
     info: &AvbInfo,
@@ -380,6 +606,7 @@ pub fn rebuild_hashtree(
     };
 
     log.log("[STATUS] Erasing old AVB footer...");
+    let erased = erase_footer(image, info)?;
     log.log("[STATUS] Rebuilding AVB hashtree...");
     if lock > 0 {
         log.log(format!(
@@ -393,64 +620,103 @@ pub fn rebuild_hashtree(
         "[AVB] add_hashtree partition_size={} (attempt 1)",
         req.partition_size
     ));
-    let old_vbmeta = if info.has_footer && info.vbmeta_size > 0 {
-        Some(vbmeta_digest(image, info.vbmeta_offset, info.vbmeta_size)?)
-    } else {
-        None
-    };
-    backend.add_hashtree_footer(&req)?;
-
-    let after = avb_info_fast(image)?;
-    if after.has_footer {
-        if let Some(before) = old_vbmeta {
-            let unchanged = after.vbmeta_offset == info.vbmeta_offset
-                && after.vbmeta_size == info.vbmeta_size
-                && vbmeta_digest(image, after.vbmeta_offset, after.vbmeta_size)? == before;
-            if unchanged {
-                return Err(Error::build(
-                    "AVB backend returned Ok but the vbmeta region is unchanged - \
-                     the old footer was kept, so the rebuild is not verified",
-                ));
-            }
-        }
-        let cur = std::fs::metadata(image)?.len();
-        if lock > 0 && cur > lock {
-            log.log(format!(
-                "[WARN] Hashtree grew to {cur} > slot {lock} - not truncating (would bootloop)."
-            ));
-            return Ok(None);
-        }
-        if lock > 0 && cur < lock {
-            force_slot_size(image, lock, false, "AVB-PAD", log)?;
-        }
-        log.log("[OK] Old AVB footer replaced.");
-        log.log("[AVB] Rebuild hashtree completed.");
-        for line in crate::report::avb_lines(&after) {
-            log.log(line);
-        }
-        return Ok(Some(after));
+    if let Err(e) = backend.add_hashtree_footer(&req) {
+        restore_or_report(image, &erased, e)?;
+        unreachable!("restore_or_report always returns");
     }
-    log.log("[WARN] Hashtree does not fit the slot - keeping the original EXT4 overlay.");
-    log.log("[WARN] Could not create a real AVB footer - keeping the original footer (avoid bootloop).");
-    Ok(None)
+
+    let after = match avb_info_fast(image) {
+        Ok(after) => after,
+        Err(e) => {
+            if let Some((at, saved)) = &erased {
+                let _ = restore_footer(image, *at, saved);
+            }
+            return Err(e);
+        }
+    };
+    if !after.has_footer {
+        if let Some((at, saved)) = &erased {
+            restore_footer(image, *at, saved).map_err(|r| {
+                Error::build(format!(
+                    "the AVB backend wrote no footer and the old footer could not be \
+                     restored: {}",
+                    r.message()
+                ))
+            })?;
+        }
+        return Err(Error::build(
+            "AVB backend returned Ok but no AVB footer exists after the rebuild",
+        ));
+    }
+    let cur = std::fs::metadata(image)?.len();
+    if lock > 0 && cur > lock {
+        log.log(format!(
+            "[WARN] Hashtree grew to {cur} > slot {lock} - not truncating (would bootloop)."
+        ));
+        return Ok(None);
+    }
+    if lock > 0 && cur < lock {
+        force_slot_size(image, lock, false, "AVB-PAD", log)?;
+    }
+    log.log("[OK] Old AVB footer replaced.");
+    log.log("[AVB] Rebuild hashtree completed.");
+    for line in crate::report::avb_lines(&after) {
+        log.log(line);
+    }
+    Ok(Some(after))
 }
 
-/// SHA-256 of a vbmeta region, used to prove a rebuild actually replaced the
-/// old footer. A re-written footer with a fresh salt always changes these bytes;
-/// an untouched region means the backend did not rebuild anything.
-fn vbmeta_digest(image: &Path, offset: u64, size: u64) -> Result<String> {
-    let mut f = File::open(image)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut hasher = crate::sha256::Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut left = size;
-    while left > 0 {
-        let n = (left as usize).min(buf.len());
-        f.read_exact(&mut buf[..n])?;
-        hasher.update(&buf[..n]);
-        left -= n as u64;
+/// Zeroes the old footer, returning the bytes and offset needed to put it back.
+/// A footer is only erased when it re-parses at the expected position; an image
+/// whose tail does not match its own footer is not rebuilt over.
+fn erase_footer(image: &Path, info: &AvbInfo) -> Result<Option<(u64, [u8; FOOTER_LEN])>> {
+    if !info.has_footer {
+        return Ok(None);
     }
-    Ok(crate::sha256::hex_upper(&hasher.finish()))
+    if info.partition_size < FOOTER_LEN as u64 {
+        return Err(Error::build("AVB footer offset lies outside the image"));
+    }
+    let at = info.partition_size - FOOTER_LEN as u64;
+    let mut f = OpenOptions::new().read(true).write(true).open(image)?;
+    f.seek(SeekFrom::Start(at))?;
+    let mut saved = [0u8; FOOTER_LEN];
+    f.read_exact(&mut saved)?;
+    if parse_footer(&saved, info.partition_size).is_none() {
+        return Err(Error::build(format!(
+            "no AVB footer at offset {at} - refusing to rebuild over an unverified footer"
+        )));
+    }
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(&[0u8; FOOTER_LEN])?;
+    f.sync_all()?;
+    Ok(Some((at, saved)))
+}
+
+fn restore_footer(image: &Path, at: u64, saved: &[u8; FOOTER_LEN]) -> Result<()> {
+    let mut f = OpenOptions::new().write(true).open(image)?;
+    f.seek(SeekFrom::Start(at))?;
+    f.write_all(saved)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Puts the erased footer back and returns the backend error. When the restore
+/// itself fails the combined message is still an `Err`, never a warning.
+fn restore_or_report(
+    image: &Path,
+    erased: &Option<(u64, [u8; FOOTER_LEN])>,
+    error: Error,
+) -> Result<()> {
+    if let Some((at, saved)) = erased {
+        if let Err(restore) = restore_footer(image, *at, saved) {
+            return Err(Error::build(format!(
+                "{} (and the old AVB footer could not be restored: {})",
+                error.message(),
+                restore.message()
+            )));
+        }
+    }
+    Err(error)
 }
 
 #[cfg(test)]
@@ -460,6 +726,15 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::rc::Rc;
+
+    /// 704-byte vbmeta written by the bundled `tool/avbtool.py` 1.3.0.
+    /// `fixtures/avb/README.md` records how it was produced and what
+    /// `avbtool.py info_image` reports for it.
+    const GOLDEN_VBMETA: &[u8] = include_bytes!("../../fixtures/avb/vbmeta_vendor_golden.bin");
+    const GOLDEN_VBMETA_SHA256: &str =
+        "1C5338CD481F787AE627389681932A40BD38CF6F6CC284577819AD2197F1E81C";
+    const GOLDEN_SALT: &str =
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     struct SharedSink(Rc<RefCell<Vec<String>>>);
 
@@ -496,10 +771,15 @@ mod tests {
         let path = dir.join("vendor.img");
         let size: u64 = 2 * 1024 * 1024;
         let mut data = vec![0u8; size as usize];
-        data[1024 * 1024..1024 * 1024 + 13].copy_from_slice(b"sha512\0vendor");
+        data[1024 * 1024..1024 * 1024 + GOLDEN_VBMETA.len()].copy_from_slice(GOLDEN_VBMETA);
         let footer_at = size - 64 - padding;
-        data[footer_at as usize..footer_at as usize + 64]
-            .copy_from_slice(&footer_bytes(1, 0, 1024 * 1024, 1024 * 1024, 4096));
+        data[footer_at as usize..footer_at as usize + 64].copy_from_slice(&footer_bytes(
+            1,
+            0,
+            1024 * 1024,
+            1024 * 1024,
+            GOLDEN_VBMETA.len() as u64,
+        ));
         std::fs::write(&path, &data).unwrap();
         path
     }
@@ -538,18 +818,75 @@ mod tests {
     }
 
     #[test]
-    fn info_reads_footer_at_end_and_detects_sha512() {
+    fn the_golden_fixture_matches_its_reference_digest() {
+        assert_eq!(GOLDEN_VBMETA.len(), 704);
+        assert_eq!(
+            crate::sha256::hex_upper(&crate::sha256::digest(GOLDEN_VBMETA)),
+            GOLDEN_VBMETA_SHA256
+        );
+    }
+
+    #[test]
+    fn info_reads_the_golden_vbmeta_fields() {
         let dir = tmp("volte_avb_info_end");
         let p = image_with_footer(&dir, 0);
         let info = avb_info_fast(&p).unwrap();
         assert!(info.has_footer);
-        assert_eq!(info.hash_algorithm, "sha512");
+        assert_eq!(
+            info.props,
+            vec![
+                ("com.android.build.vendor".to_owned(), "v2".to_owned()),
+                (
+                    "com.android.build.vendor.extra".to_owned(),
+                    "hello".to_owned()
+                ),
+            ]
+        );
         assert_eq!(info.partition_name, "vendor");
+        assert_eq!(info.hash_algorithm, "sha256");
+        assert_eq!(info.salt, GOLDEN_SALT);
+        assert_eq!(info.fec_roots, 0);
         assert_eq!(info.image_size, 2 * 1024 * 1024);
         assert_eq!(info.partition_size, 2 * 1024 * 1024);
         assert_eq!(info.original_image_size, 1024 * 1024);
-        assert_eq!(info.salt, "");
-        assert!(info.props.is_empty());
+        assert_eq!(info.vbmeta_offset, 1024 * 1024);
+        assert_eq!(info.vbmeta_size, 704);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_truncated_or_malformed_vbmeta_is_an_error() {
+        let dir = tmp("volte_avb_bad_vbmeta");
+        let footer_at = 2 * 1024 * 1024 - 64;
+        let set_vsz = |vsz: u64| {
+            let p = image_with_footer(&dir, 0);
+            let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.seek(SeekFrom::Start(footer_at + 28)).unwrap();
+            f.write_all(&vsz.to_be_bytes()).unwrap();
+            p
+        };
+
+        let p = image_with_footer(&dir, 0);
+        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+        f.write_all(b"XXXX").unwrap();
+        drop(f);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("bad vbmeta magic"), "{err}");
+
+        for vsz in [0u64, 64 * 1024 + 1] {
+            let err = avb_info_fast(&set_vsz(vsz)).unwrap_err();
+            assert!(err.message().contains("byte vbmeta"), "{err}");
+        }
+
+        let err = avb_info_fast(&set_vsz(100)).unwrap_err();
+        assert!(
+            err.message().contains("shorter than the 256-byte header"),
+            "{err}"
+        );
+
+        let err = avb_info_fast(&set_vsz(300)).unwrap_err();
+        assert!(err.message().contains("outside the 300-byte vbmeta"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -654,13 +991,31 @@ mod tests {
 
     struct FooterWriter {
         grow: u64,
+        salt: Option<[u8; 32]>,
+    }
+
+    /// Offset of the hashtree salt inside the golden vbmeta, derived from the
+    /// descriptor header rather than hard-coded.
+    fn golden_salt_offset() -> usize {
+        let auth = be_u64(&GOLDEN_VBMETA[12..20]) as usize;
+        let desc_offset = be_u64(&GOLDEN_VBMETA[96..104]) as usize;
+        let start = VBMETA_HEADER_LEN + auth + desc_offset;
+        let name_len = be_u32(&GOLDEN_VBMETA[start + 104..start + 108]) as usize;
+        start + HASHTREE_DESCRIPTOR_LEN + name_len
     }
 
     impl Avb for FooterWriter {
         fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
             let size = req.partition_size;
+            let mut vb = GOLDEN_VBMETA.to_vec();
+            if let Some(salt) = self.salt {
+                let at = golden_salt_offset();
+                vb[at..at + 32].copy_from_slice(&salt);
+            }
             let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&req.image)?;
-            let footer = footer_bytes(1, 0, 1024 * 1024, 1024 * 1024, 4096);
+            f.seek(SeekFrom::Start(1024 * 1024))?;
+            f.write_all(&vb)?;
+            let footer = footer_bytes(1, 0, 1024 * 1024, 1024 * 1024, vb.len() as u64);
             if self.grow == 0 {
                 f.seek(SeekFrom::Start(size - 64))?;
                 f.write_all(&footer)?;
@@ -698,6 +1053,7 @@ mod tests {
     fn a_failing_backend_over_an_old_footer_is_never_reported_as_success() {
         let dir = tmp("volte_avb_rebuild_fail_old_footer");
         let p = image_with_footer(&dir, 0);
+        let before = std::fs::read(&p).unwrap();
         let info = avb_info_fast(&p).unwrap();
         assert!(info.has_footer);
         let (mut log, lines) = catching_logger();
@@ -706,46 +1062,60 @@ mod tests {
         assert!(!text.contains("Rebuild hashtree completed."), "{text}");
         assert!(!text.contains("[OK] Old AVB footer"), "{text}");
         assert!(!text.contains("[OK] AVB"), "{text}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "the erased footer is restored byte for byte"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    struct RewriteFooter {
-        change_vbmeta: bool,
-    }
-
-    impl Avb for RewriteFooter {
-        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
-            let size = req.partition_size;
-            let mut f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&req.image)?;
-            if self.change_vbmeta {
-                f.seek(SeekFrom::Start(1024 * 1024 + 8))?;
-                f.write_all(b"new")?;
-            }
-            f.seek(SeekFrom::Start(size - 64))?;
-            f.write_all(&footer_bytes(1, 0, 1024 * 1024, 1024 * 1024, 4096))?;
-            f.set_len(size)?;
+    struct SilentBackend;
+    impl Avb for SilentBackend {
+        fn add_hashtree_footer(&mut self, _req: &HashtreeRequest) -> Result<()> {
             Ok(())
         }
     }
 
     #[test]
-    fn a_backend_that_returns_ok_without_rebuilding_is_an_error() {
-        let dir = tmp("volte_avb_rebuild_unchanged");
+    fn a_backend_that_returns_ok_without_writing_a_footer_is_an_error() {
+        let dir = tmp("volte_avb_rebuild_silent");
+        let p = image_with_footer(&dir, 0);
+        let before = std::fs::read(&p).unwrap();
+        let info = avb_info_fast(&p).unwrap();
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let err = rebuild_hashtree(&p, &info, 0, &mut SilentBackend, &mut log).unwrap_err();
+        assert!(err.message().contains("no AVB footer exists"), "{err}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "the old footer is put back after the silent success"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_footer_that_does_not_reparse_is_not_erased() {
+        let dir = tmp("volte_avb_footer_moved");
         let p = image_with_footer(&dir, 0);
         let info = avb_info_fast(&p).unwrap();
+        let footer_at = std::fs::metadata(&p).unwrap().len() - 64;
+        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        f.seek(SeekFrom::Start(footer_at)).unwrap();
+        f.write_all(&[0u8; 4]).unwrap();
+        drop(f);
+        let before = std::fs::read(&p).unwrap();
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         let err = rebuild_hashtree(
             &p,
             &info,
             0,
-            &mut RewriteFooter { change_vbmeta: false },
+            &mut FooterWriter { grow: 0, salt: None },
             &mut log,
         )
         .unwrap_err();
-        assert!(err.message().contains("unchanged"), "{err}");
+        assert!(err.message().contains("refusing to rebuild"), "{err}");
+        assert_eq!(std::fs::read(&p).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -754,20 +1124,62 @@ mod tests {
         let dir = tmp("volte_avb_rebuild_verified");
         let p = image_with_footer(&dir, 0);
         let info = avb_info_fast(&p).unwrap();
+        let fresh_salt = *b"0123456789abcdef0123456789abcdef";
         let (mut log, lines) = catching_logger();
         let out = rebuild_hashtree(
             &p,
             &info,
             0,
-            &mut RewriteFooter { change_vbmeta: true },
+            &mut FooterWriter {
+                grow: 0,
+                salt: Some(fresh_salt),
+            },
             &mut log,
         )
         .unwrap()
         .expect("footer rebuilt");
         assert!(out.has_footer);
+        assert_eq!(out.salt, hex_lower(&fresh_salt), "the new footer is re-read");
+        assert_eq!(out.partition_name, "vendor");
+        assert_eq!(out.props, info.props);
         let text = lines.borrow().join("\n");
         assert!(text.contains("[OK] Old AVB footer replaced."), "{text}");
         assert!(text.contains("[AVB] Rebuild hashtree completed."), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct RecordingBackend {
+        seen: Rc<RefCell<Option<HashtreeRequest>>>,
+        inner: FooterWriter,
+    }
+
+    impl Avb for RecordingBackend {
+        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+            *self.seen.borrow_mut() = Some(req.clone());
+            self.inner.add_hashtree_footer(req)
+        }
+    }
+
+    #[test]
+    fn the_rebuild_request_carries_the_parsed_metadata() {
+        let dir = tmp("volte_avb_rebuild_request");
+        let p = image_with_footer(&dir, 0);
+        let info = avb_info_fast(&p).unwrap();
+        let seen = Rc::new(RefCell::new(None));
+        let mut backend = RecordingBackend {
+            seen: seen.clone(),
+            inner: FooterWriter { grow: 0, salt: None },
+        };
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        rebuild_hashtree(&p, &info, 0, &mut backend, &mut log)
+            .unwrap()
+            .expect("footer rebuilt");
+        let req = seen.borrow().clone().expect("backend called");
+        assert_eq!(req.partition_size, 2 * 1024 * 1024, "the locked slot");
+        assert_eq!(req.partition_name, "vendor");
+        assert_eq!(req.hash_algorithm, "sha256");
+        assert_eq!(req.salt, GOLDEN_SALT);
+        assert_eq!(req.props, info.props);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -778,8 +1190,17 @@ mod tests {
         let info = avb_info_fast(&p).unwrap();
         assert_eq!(info.partition_size, 2 * 1024 * 1024);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        let out = rebuild_hashtree(&p, &info, 0, &mut FooterWriter { grow: 0 }, &mut log)
-            .unwrap()
+        let out = rebuild_hashtree(
+            &p,
+            &info,
+            0,
+            &mut FooterWriter {
+                grow: 0,
+                salt: None,
+            },
+            &mut log,
+        )
+        .unwrap()
             .expect("footer rebuilt");
         assert!(out.has_footer);
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
@@ -792,7 +1213,17 @@ mod tests {
         let p = plain_image(&dir, 2 * 1024 * 1024);
         let info = avb_info_fast(&p).unwrap();
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        let out = rebuild_hashtree(&p, &info, 0, &mut FooterWriter { grow: 4096 }, &mut log).unwrap();
+        let out = rebuild_hashtree(
+            &p,
+            &info,
+            0,
+            &mut FooterWriter {
+                grow: 4096,
+                salt: None,
+            },
+            &mut log,
+        )
+        .unwrap();
         assert!(out.is_none());
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024 + 4096);
         let _ = std::fs::remove_dir_all(&dir);

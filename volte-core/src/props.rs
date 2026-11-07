@@ -229,7 +229,8 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
                 ));
             }
             Err(e) => {
-                log.log(format!("[WARN] Write {vpath}: {}", &e.message()[..e.message().len().min(120)]));
+                let why: String = e.message().chars().take(120).collect();
+                log.log(format!("[WARN] Write {vpath}: {why}"));
                 continue;
             }
         }
@@ -328,6 +329,7 @@ mod tests {
         written: Vec<(String, Vec<u8>)>,
         fail_dump: bool,
         fail_write: bool,
+        write_error: Option<String>,
     }
 
     impl Ext4Ops for FakeOps {
@@ -360,8 +362,13 @@ mod tests {
                         .push((name.to_owned(), std::fs::read(host).unwrap_or_default()));
                 }
             }
-            if is_write && self.fail_write {
-                return Err(Error::build("write failed"));
+            if is_write {
+                if let Some(msg) = &self.write_error {
+                    return Err(Error::build(msg.clone()));
+                }
+                if self.fail_write {
+                    return Err(Error::build("write failed"));
+                }
             }
             self.commands.push(commands.to_vec());
             Ok(String::new())
@@ -501,6 +508,34 @@ mod tests {
             !ops.commands.iter().flatten().any(|c| c.starts_with("ea_set -f ")),
             "no label is applied after a failed write"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_multibyte_error_message_is_truncated_by_char_without_panicking() {
+        let dir = tmp("volte_props_utf8_error");
+        let mut ops = FakeOps {
+            write_error: Some(format!("{}ế{}", "x".repeat(119), "y".repeat(10))),
+            ..Default::default()
+        };
+        ops.dumps
+            .insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
+        let lines = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(Collect(lines.clone()));
+        let changed = upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap();
+        assert_eq!(changed, 0);
+        let captured = lines.borrow().clone();
+        assert!(
+            captured
+                .last()
+                .is_some_and(|l| l.contains("Could not write the VoLTE show props")),
+            "{captured:?}"
+        );
+        let why = captured[0]
+            .strip_prefix("[WARN] Write /build.prop: ")
+            .expect("the warning keeps its prefix");
+        assert_eq!(why, format!("{}ế", "x".repeat(119)));
+        assert_eq!(why.chars().count(), 120);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
