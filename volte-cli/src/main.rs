@@ -14,9 +14,9 @@ use volte_core::avb::{Avb, HashtreeRequest, PythonAvbtool};
 use volte_core::config;
 use volte_core::env;
 use volte_core::ext4_tools::E2fsck;
-use volte_core::rustfs_ext4::RustFsExt4Backend;
 use volte_core::logging::{Logger, Sink};
 use volte_core::pipeline::{self, Deps, Options};
+use volte_core::rustfs_ext4::RustFsExt4Backend;
 
 const USAGE: &str = "usage: volte-cli [-h] [--qc] [--mtk] [--out OUT] [--gui] [image]";
 
@@ -146,7 +146,11 @@ struct LazyAvb {
 
 impl LazyAvb {
     fn new(python: PathBuf, avbtool: PathBuf) -> Self {
-        LazyAvb { python, avbtool, inner: None }
+        LazyAvb {
+            python,
+            avbtool,
+            inner: None,
+        }
     }
 }
 
@@ -180,7 +184,11 @@ fn build(a: &Args) -> i32 {
     let mut ops = RustFsExt4Backend::new();
     let mut fsck = E2fsck::new(&tool);
     let mut avb = LazyAvb::new(python, tool.join("avbtool.py"));
-    let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
+    let mut deps = Deps {
+        ops: &mut ops,
+        fsck: &mut fsck,
+        avb: &mut avb,
+    };
     let mut log = Logger::new().with_sink(Console);
     let mut progress = |_n: u8, _label: &str| {};
     let opts = Options {
@@ -301,7 +309,10 @@ mod tests {
 
     #[test]
     fn missing_out_value_is_a_usage_error() {
-        assert_eq!(usage(&["v.img", "--out"]), "argument --out: expected one argument");
+        assert_eq!(
+            usage(&["v.img", "--out"]),
+            "argument --out: expected one argument"
+        );
         assert_eq!(
             usage(&["v.img", "--out", "--qc"]),
             "argument --out: expected one argument"
@@ -310,7 +321,10 @@ mod tests {
 
     #[test]
     fn a_second_positional_is_a_usage_error() {
-        assert_eq!(usage(&["one.img", "two.img"]), "unrecognized arguments: two.img");
+        assert_eq!(
+            usage(&["one.img", "two.img"]),
+            "unrecognized arguments: two.img"
+        );
     }
 
     #[test]
@@ -328,7 +342,10 @@ mod tests {
         let a = build_args(&["--gui"]);
         assert!(opens_gui(&a));
         let with_image = build_args(&["vendor.img", "--gui"]);
-        assert!(opens_gui(&with_image), "Python ignores the image when --gui is set");
+        assert!(
+            opens_gui(&with_image),
+            "Python ignores the image when --gui is set"
+        );
     }
 
     #[test]

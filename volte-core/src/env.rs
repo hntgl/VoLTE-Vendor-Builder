@@ -74,7 +74,10 @@ mod tests {
 
     #[test]
     fn forward_slashes_replaces_backslashes() {
-        assert_eq!(forward_slashes(Path::new(r"E:\Build_app\x\payload.apk")), "E:/Build_app/x/payload.apk");
+        assert_eq!(
+            forward_slashes(Path::new(r"E:\Build_app\x\payload.apk")),
+            "E:/Build_app/x/payload.apk"
+        );
     }
 
     #[test]

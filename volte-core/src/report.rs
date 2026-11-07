@@ -46,9 +46,11 @@ pub fn flag_note(nflag: i64) -> (u8, String, String) {
     let n = if nflag >= 1 { 1u8 } else { 0u8 };
     let hit = format!("VoLTE flag: {n}");
     let tip = if n >= 1 {
-        "Flag =1 because the original vendor already had =1, or 0->1 was patched in the image.".to_string()
+        "Flag =1 because the original vendor already had =1, or 0->1 was patched in the image."
+            .to_string()
     } else {
-        "Flag =0 - the original vendor has no volte_support=1 and no 0->1 patch was applied.".to_string()
+        "Flag =0 - the original vendor has no volte_support=1 and no 0->1 patch was applied."
+            .to_string()
     };
     (n, hit, tip)
 }
@@ -108,13 +110,9 @@ pub fn summary_lines(s: &Summary) -> Vec<String> {
                 .to_string(),
         );
     } else if s.e2fsck == FsckStatus::Pass {
-        lines.push(
-            "[NOTE] STANDARD AVB hashtree PASS + matching size - safe to boot.".to_string(),
-        );
+        lines.push("[NOTE] STANDARD AVB hashtree PASS + matching size - safe to boot.".to_string());
     } else {
-        lines.push(
-            "[ERROR] AVB hashtree PASS but e2fsck did not pass - do not flash.".to_string(),
-        );
+        lines.push("[ERROR] AVB hashtree PASS but e2fsck did not pass - do not flash.".to_string());
     }
     lines.push(format!("{}{}", config::TOKEN_FLAGS, s.flags));
     lines.push(config::TOKEN_AVB_ALGORITHM_NONE.to_string());
@@ -287,7 +285,12 @@ mod tests {
     #[test]
     fn report_body_is_the_six_line_python_file() {
         assert_eq!(
-            report_body("/out/vendor_VolLTE.img", 2 * 1024 * 1024, FsckStatus::Fail, "SKIP"),
+            report_body(
+                "/out/vendor_VolLTE.img",
+                2 * 1024 * 1024,
+                FsckStatus::Fail,
+                "SKIP"
+            ),
             "File=/out/vendor_VolLTE.img\nSize=2097152\ne2fsck=FAIL\n\
              AVB_HASHTREE=SKIP\nAVB_ALGORITHM=NONE\nFLASH=NO\n"
         );

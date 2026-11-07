@@ -175,7 +175,13 @@ fn split_lines(raw: &[u8]) -> Vec<(&[u8], &[u8])> {
 /// so its mode, owner and SELinux label survive; the Python reference deletes
 /// the file first and then forces root/0644, which this port intentionally
 /// does not do.
-fn write_back(image: &Path, td: &Path, vpath: &str, host: &Path, ops: &mut dyn Ext4Ops) -> Result<()> {
+fn write_back(
+    image: &Path,
+    td: &Path,
+    vpath: &str,
+    host: &Path,
+    ops: &mut dyn Ext4Ops,
+) -> Result<()> {
     let cmds = vec![format!("write {} {vpath}", forward_slashes(host))];
     let mut quiet = Logger::new();
     ops.run(image, &cmds, td, &mut quiet).map(|_| ())
@@ -316,7 +322,10 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
 /// Dumps `/build.prop` and `/default.prop`, logs at most six allow-listed
 /// identity lines and returns the raw text (used by chip refinement).
 pub fn identify(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) -> String {
-    let dumps = [("/build.prop", "hd_id_build.prop"), ("/default.prop", "hd_id_default.prop")];
+    let dumps = [
+        ("/build.prop", "hd_id_build.prop"),
+        ("/default.prop", "hd_id_default.prop"),
+    ];
     let cmds: Vec<String> = dumps
         .iter()
         .map(|(src, name)| format!("dump -p {src} {}", forward_slashes(&td.join(name))))
@@ -394,7 +403,9 @@ mod tests {
         ) -> Result<String> {
             let mut is_write = false;
             for c in commands {
-                let dump = c.strip_prefix("dump -p ").or_else(|| c.strip_prefix("dump "));
+                let dump = c
+                    .strip_prefix("dump -p ")
+                    .or_else(|| c.strip_prefix("dump "));
                 if let Some(rest) = dump {
                     if self.fail_dump {
                         return Err(Error::build("dump failed"));
@@ -469,7 +480,11 @@ mod tests {
         for line in HD_VOLTE_SHOW_PROPS {
             assert_eq!(text.matches(line).count(), 1, "{line}");
         }
-        assert!(ops.commands.iter().flatten().any(|c| c.starts_with("ea_set -f ")));
+        assert!(ops
+            .commands
+            .iter()
+            .flatten()
+            .any(|c| c.starts_with("ea_set -f ")));
         let label = std::fs::read(dir.join("vendor_file.bin")).unwrap();
         assert_eq!(label, b"u:object_r:vendor_file:s0\0");
         let _ = std::fs::remove_dir_all(&dir);
@@ -498,10 +513,15 @@ mod tests {
     fn keys_match_case_insensitively_but_values_stay_verbatim() {
         let dir = tmp("volte_props_case");
         let mut ops = FakeOps::default();
-        ops.dumps
-            .insert("/build.prop".to_owned(), b"PERSIST.RADIO.VT_ENABLE=0\n".to_vec());
+        ops.dumps.insert(
+            "/build.prop".to_owned(),
+            b"PERSIST.RADIO.VT_ENABLE=0\n".to_vec(),
+        );
         let mut log = quiet();
-        assert_eq!(upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(), 75);
+        assert_eq!(
+            upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(),
+            75
+        );
         let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
         assert!(text.contains("persist.radio.VT_ENABLE=1"));
         assert_eq!(text.matches("persist.radio.VT_ENABLE=1").count(), 1);
@@ -512,17 +532,28 @@ mod tests {
     fn a_second_run_changes_nothing() {
         let dir = tmp("volte_props_idempotent");
         let mut ops = FakeOps::default();
-        ops.dumps.insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
+        ops.dumps
+            .insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
         let mut log = quiet();
-        assert_eq!(upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(), 75);
+        assert_eq!(
+            upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(),
+            75
+        );
         let first = ops.written.clone();
         let mut ops2 = FakeOps::default();
         ops2.dumps
             .insert("/build.prop".to_owned(), first[0].1.clone());
         let calls_before = ops2.commands.len();
-        assert_eq!(upsert(Path::new("img"), &dir, &mut ops2, &mut log).unwrap(), 0);
+        assert_eq!(
+            upsert(Path::new("img"), &dir, &mut ops2, &mut log).unwrap(),
+            0
+        );
         assert!(ops2.written.is_empty(), "nothing to rewrite");
-        assert_eq!(ops2.commands.len(), calls_before + 6, "one dump per property file");
+        assert_eq!(
+            ops2.commands.len(),
+            calls_before + 6,
+            "one dump per property file"
+        );
         assert!(ops2
             .commands
             .iter()
@@ -535,16 +566,23 @@ mod tests {
     fn missing_and_short_files_are_skipped() {
         let dir = tmp("volte_props_skip");
         let mut ops = FakeOps::default();
-        ops.dumps.insert("/default.prop".to_owned(), b"short\n".to_vec());
+        ops.dumps
+            .insert("/default.prop".to_owned(), b"short\n".to_vec());
         let mut log = Logger::new();
-        assert_eq!(upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(), 0);
+        assert_eq!(
+            upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(),
+            0
+        );
         assert!(ops.written.is_empty());
         let dir2 = tmp("volte_props_skip2");
         let mut ops2 = FakeOps {
             fail_dump: true,
             ..Default::default()
         };
-        assert_eq!(upsert(Path::new("img"), &dir2, &mut ops2, &mut log).unwrap(), 0);
+        assert_eq!(
+            upsert(Path::new("img"), &dir2, &mut ops2, &mut log).unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }
@@ -553,14 +591,22 @@ mod tests {
     fn a_write_failure_is_logged_and_does_not_stop_the_other_files() {
         let dir = tmp("volte_props_write_fail");
         let mut ops = FakeOps::default();
-        ops.dumps.insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
-        ops.dumps.insert("/default.prop".to_owned(), b"ro.yyyy=1\n".to_vec());
+        ops.dumps
+            .insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
+        ops.dumps
+            .insert("/default.prop".to_owned(), b"ro.yyyy=1\n".to_vec());
         ops.fail_write = true;
         let mut log = quiet();
-        assert_eq!(upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(), 0);
+        assert_eq!(
+            upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(),
+            0
+        );
         assert_eq!(ops.written.len(), 2, "both files were attempted");
         assert!(
-            !ops.commands.iter().flatten().any(|c| c.starts_with("ea_set -f ")),
+            !ops.commands
+                .iter()
+                .flatten()
+                .any(|c| c.starts_with("ea_set -f ")),
             "no label is applied after a failed write"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -640,20 +686,26 @@ PERSIST.RADIO.VT_ENABLE=0\r\nlast.noeol=1";
     fn the_rewrite_preserves_inode_metadata_instead_of_resetting_it() {
         let dir = tmp("volte_props_metadata");
         let mut ops = FakeOps::default();
-        ops.dumps.insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
+        ops.dumps
+            .insert("/build.prop".to_owned(), b"ro.xxxx=1\n".to_vec());
         let mut log = quiet();
         upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap();
         let flat: Vec<&String> = ops.commands.iter().flatten().collect();
         assert!(
-            !flat.iter().any(|c| c.starts_with("rm ") || c.contains("set_inode_field")),
+            !flat
+                .iter()
+                .any(|c| c.starts_with("rm ") || c.contains("set_inode_field")),
             "{flat:?}"
         );
         assert!(
-            flat.iter().any(|c| c.starts_with("write ") && c.ends_with(" /build.prop")),
+            flat.iter()
+                .any(|c| c.starts_with("write ") && c.ends_with(" /build.prop")),
             "the file is rewritten in place by absolute path: {flat:?}"
         );
         assert!(
-            flat.iter().any(|c| c.starts_with("ea_set -f ") && c.ends_with(" /build.prop security.selinux")),
+            flat.iter().any(
+                |c| c.starts_with("ea_set -f ") && c.ends_with(" /build.prop security.selinux")
+            ),
             "{flat:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -663,14 +715,15 @@ PERSIST.RADIO.VT_ENABLE=0\r\nlast.noeol=1";
     fn only_build_prop_gets_the_vendor_file_label() {
         let dir = tmp("volte_props_label_scope");
         let mut ops = FakeOps::default();
-        ops.dumps.insert("/default.prop".to_owned(), b"ro.yyyy=1\n".to_vec());
+        ops.dumps
+            .insert("/default.prop".to_owned(), b"ro.yyyy=1\n".to_vec());
         let mut log = quiet();
-        assert_eq!(upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(), 75);
-        let flat: Vec<&String> = ops.commands.iter().flatten().collect();
-        assert!(
-            !flat.iter().any(|c| c.starts_with("ea_set ")),
-            "{flat:?}"
+        assert_eq!(
+            upsert(Path::new("img"), &dir, &mut ops, &mut log).unwrap(),
+            75
         );
+        let flat: Vec<&String> = ops.commands.iter().flatten().collect();
+        assert!(!flat.iter().any(|c| c.starts_with("ea_set ")), "{flat:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -703,7 +756,10 @@ ro.product.oppo.model=v\n";
         let lines = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut log = Logger::new().with_sink(Collect(lines.clone()));
         let text = identify(Path::new("img"), &dir, &mut ops, &mut log);
-        assert!(text.contains("ro.serialno=SECRET123"), "raw text is returned");
+        assert!(
+            text.contains("ro.serialno=SECRET123"),
+            "raw text is returned"
+        );
         let captured = lines.borrow().clone();
         assert_eq!(captured.len(), 1);
         let line = &captured[0];
@@ -719,7 +775,8 @@ ro.product.oppo.model=v\n";
     fn identify_rejects_a_short_blob() {
         let dir = tmp("volte_props_identify_short");
         let mut ops = FakeOps::default();
-        ops.dumps.insert("/build.prop".to_owned(), b"x=1\n".to_vec());
+        ops.dumps
+            .insert("/build.prop".to_owned(), b"x=1\n".to_vec());
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         assert_eq!(identify(Path::new("img"), &dir, &mut ops, &mut log), "");
         let _ = std::fs::remove_dir_all(&dir);

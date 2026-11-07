@@ -153,11 +153,7 @@ impl Session {
 
     /// Runs one EXT4 command line (the `debugfs` grammar). `Err` carries the
     /// per-command failure text; the caller decides whether that aborts the batch.
-    fn execute(
-        &mut self,
-        command: &str,
-        workdir: &Path,
-    ) -> std::result::Result<(), String> {
+    fn execute(&mut self, command: &str, workdir: &Path) -> std::result::Result<(), String> {
         let (verb, args) = split_verb(command);
         match verb {
             "cd" => {
@@ -303,8 +299,8 @@ impl Session {
                 if !inode.is_file() {
                     return Err(format!("{path}: not a regular file"));
                 }
-                let mut buf = dump_buffer(inode.size, self.image_len)
-                    .map_err(|e| format!("{path}: {e}"))?;
+                let mut buf =
+                    dump_buffer(inode.size, self.image_len).map_err(|e| format!("{path}: {e}"))?;
                 let read = self
                     .fs
                     .read_ino(ino, 0, &mut buf)
@@ -320,8 +316,7 @@ impl Session {
 impl RustFsExt4Backend {
     fn open_session(image: &Path) -> Result<Session> {
         let image_len = std::fs::metadata(image)?.len();
-        let dev: Arc<dyn BlockDevice> =
-            Arc::new(FileDevice::open_path_rw(image).map_err(map_fs)?);
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open_path_rw(image).map_err(map_fs)?);
         let fs = Filesystem::mount(dev).map_err(map_fs)?;
         Ok(Session {
             fs,
@@ -379,8 +374,7 @@ impl Ext4Ops for RustFsExt4Backend {
     }
 
     fn path_exists(&mut self, image: &Path, vpath: &str, _workdir: &Path) -> Result<bool> {
-        let dev: Arc<dyn BlockDevice> =
-            Arc::new(FileDevice::open_path(image).map_err(map_fs)?);
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open_path(image).map_err(map_fs)?);
         let fs = Filesystem::mount(dev).map_err(map_fs)?;
         match fs.lookup_path_bytes(vpath.as_bytes()) {
             Ok(_) => Ok(true),
@@ -406,7 +400,9 @@ mod tests {
     fn tool_dir() -> PathBuf {
         let dir = match std::env::var("VOLTE_TOOL_DIR") {
             Ok(v) => PathBuf::from(v),
-            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("tool"),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tool"),
         };
         assert!(
             dir.join("mke2fs.exe").is_file(),
@@ -477,9 +473,7 @@ mod tests {
             std::fs::read(dir.join("back.bin")).unwrap(),
             b"hello rust ext4\n"
         );
-        assert!(ops
-            .path_exists(&img, "/etc/payload.bin", &dir)
-            .unwrap());
+        assert!(ops.path_exists(&img, "/etc/payload.bin", &dir).unwrap());
         assert!(!ops.path_exists(&img, "/etc/missing", &dir).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -508,8 +502,7 @@ mod tests {
                 "set_inode_field . gid 2000",
             ],
         );
-        let dev: Arc<dyn BlockDevice> =
-            Arc::new(FileDevice::open_path(&img).unwrap());
+        let dev: Arc<dyn BlockDevice> = Arc::new(FileDevice::open_path(&img).unwrap());
         let fs = Filesystem::mount(dev).unwrap();
         let ino = fs.lookup_path_bytes(b"/overlay/payload.apk").unwrap();
         let inode = fs.stat_ino(ino).unwrap();

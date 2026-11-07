@@ -315,12 +315,24 @@ mod tests {
     fn refine_reads_the_vendor_keys_case_insensitively() {
         assert_eq!(refine_chip_from_props("mtk", "ro.hardware=qcom\n"), "qc");
         assert_eq!(refine_chip_from_props("qc", "ro.hardware=qcom"), "qc");
-        assert_eq!(refine_chip_from_props("qc", "RO.BOARD.PLATFORM=SM6125"), "qc");
+        assert_eq!(
+            refine_chip_from_props("qc", "RO.BOARD.PLATFORM=SM6125"),
+            "qc"
+        );
         assert_eq!(refine_chip_from_props("qc", "ro.vendor.qti.ims=1"), "qc");
         assert_eq!(refine_chip_from_props("qc", "ro.hardware=mt6765"), "mtk");
-        assert_eq!(refine_chip_from_props("qc", "ro.mediatek.platform=MT6765"), "mtk");
-        assert_eq!(refine_chip_from_props("qc", "ro.vendor.mediatek.x=1"), "mtk");
-        assert_eq!(refine_chip_from_props("mtk", "ro.product.model=CPH1803"), "mtk");
+        assert_eq!(
+            refine_chip_from_props("qc", "ro.mediatek.platform=MT6765"),
+            "mtk"
+        );
+        assert_eq!(
+            refine_chip_from_props("qc", "ro.vendor.mediatek.x=1"),
+            "mtk"
+        );
+        assert_eq!(
+            refine_chip_from_props("mtk", "ro.product.model=CPH1803"),
+            "mtk"
+        );
         assert_eq!(refine_chip_from_props("qc", ""), "qc");
         assert_eq!(
             refine_chip_from_props("mtk", "ro.hardware=mt6\nro.vendor.qti=1"),

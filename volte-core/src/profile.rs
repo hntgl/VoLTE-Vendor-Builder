@@ -142,9 +142,18 @@ mod tests {
     #[test]
     fn import_lines_are_the_python_constants() {
         assert_eq!(IMPORT_LINE, "import /vendor/etc/init/hd_oppo_qc_volte.rc");
-        assert_eq!(IMPORT_LINE_HW, "import /vendor/etc/init/hw/hd_oppo_qc_volte.rc");
-        assert_eq!(IMPORT_LINE_MTK, "import /vendor/etc/init/hd_oppo_mtk_volte.rc");
-        assert_eq!(IMPORT_LINE_MTK_HW, "import /vendor/etc/init/hw/hd_oppo_mtk_volte.rc");
+        assert_eq!(
+            IMPORT_LINE_HW,
+            "import /vendor/etc/init/hw/hd_oppo_qc_volte.rc"
+        );
+        assert_eq!(
+            IMPORT_LINE_MTK,
+            "import /vendor/etc/init/hd_oppo_mtk_volte.rc"
+        );
+        assert_eq!(
+            IMPORT_LINE_MTK_HW,
+            "import /vendor/etc/init/hw/hd_oppo_mtk_volte.rc"
+        );
     }
 
     #[test]

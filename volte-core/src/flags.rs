@@ -25,50 +25,146 @@ pub const FLAG_PAIRS: [(&[u8], &[u8]); 65] = [
     (b"wfc_avail_ovr=0", b"wfc_avail_ovr=1"),
     (b"calls.on.ims=0", b"calls.on.ims=1"),
     (b"mtk_dynamic_ims_switch=1", b"mtk_dynamic_ims_switch=0"),
-    (b"persist.dbg.volte_avail_ovr=0", b"persist.dbg.volte_avail_ovr=1"),
-    (b"persist.dbg.ims_volte_enable=0", b"persist.dbg.ims_volte_enable=1"),
+    (
+        b"persist.dbg.volte_avail_ovr=0",
+        b"persist.dbg.volte_avail_ovr=1",
+    ),
+    (
+        b"persist.dbg.ims_volte_enable=0",
+        b"persist.dbg.ims_volte_enable=1",
+    ),
     (b"persist.dbg.vt_avail_ovr=0", b"persist.dbg.vt_avail_ovr=1"),
-    (b"persist.dbg.wfc_avail_ovr=0", b"persist.dbg.wfc_avail_ovr=1"),
-    (b"persist.dbg.allow_ims_off=1", b"persist.dbg.allow_ims_off=0"),
-    (b"persist.mtk.volte_support=0", b"persist.mtk.volte_support=1"),
+    (
+        b"persist.dbg.wfc_avail_ovr=0",
+        b"persist.dbg.wfc_avail_ovr=1",
+    ),
+    (
+        b"persist.dbg.allow_ims_off=1",
+        b"persist.dbg.allow_ims_off=0",
+    ),
+    (
+        b"persist.mtk.volte_support=0",
+        b"persist.mtk.volte_support=1",
+    ),
     (b"persist.mtk.ims_support=0", b"persist.mtk.ims_support=1"),
-    (b"persist.vendor.mtk.volte_support=0", b"persist.vendor.mtk.volte_support=1"),
-    (b"persist.vendor.mtk.ims_support=0", b"persist.vendor.mtk.ims_support=1"),
-    (b"persist.vendor.radio.volte_avail_ovr=0", b"persist.vendor.radio.volte_avail_ovr=1"),
-    (b"persist.vendor.radio.vt_avail_ovr=0", b"persist.vendor.radio.vt_avail_ovr=1"),
-    (b"persist.vendor.radio.calls.on.ims=0", b"persist.vendor.radio.calls.on.ims=1"),
-    (b"persist.vendor.ims.enable=0", b"persist.vendor.ims.enable=1"),
-    (b"persist.radio.volte_state=0", b"persist.radio.volte_state=1"),
-    (b"persist.radio.calls.on.ims=0", b"persist.radio.calls.on.ims=1"),
-    (b"persist.radio.volte.enable=0", b"persist.radio.volte.enable=1"),
-    (b"persist.vendor.radio.volte.enable=0", b"persist.vendor.radio.volte.enable=1"),
-    (b"persist.sys.oplus.radio.volte_icon=0", b"persist.sys.oplus.radio.volte_icon=1"),
-    (b"persist.sys.oplus.radio.show_volte=0", b"persist.sys.oplus.radio.show_volte=1"),
-    (b"persist.oplus.radio.volte_icon=0", b"persist.oplus.radio.volte_icon=1"),
+    (
+        b"persist.vendor.mtk.volte_support=0",
+        b"persist.vendor.mtk.volte_support=1",
+    ),
+    (
+        b"persist.vendor.mtk.ims_support=0",
+        b"persist.vendor.mtk.ims_support=1",
+    ),
+    (
+        b"persist.vendor.radio.volte_avail_ovr=0",
+        b"persist.vendor.radio.volte_avail_ovr=1",
+    ),
+    (
+        b"persist.vendor.radio.vt_avail_ovr=0",
+        b"persist.vendor.radio.vt_avail_ovr=1",
+    ),
+    (
+        b"persist.vendor.radio.calls.on.ims=0",
+        b"persist.vendor.radio.calls.on.ims=1",
+    ),
+    (
+        b"persist.vendor.ims.enable=0",
+        b"persist.vendor.ims.enable=1",
+    ),
+    (
+        b"persist.radio.volte_state=0",
+        b"persist.radio.volte_state=1",
+    ),
+    (
+        b"persist.radio.calls.on.ims=0",
+        b"persist.radio.calls.on.ims=1",
+    ),
+    (
+        b"persist.radio.volte.enable=0",
+        b"persist.radio.volte.enable=1",
+    ),
+    (
+        b"persist.vendor.radio.volte.enable=0",
+        b"persist.vendor.radio.volte.enable=1",
+    ),
+    (
+        b"persist.sys.oplus.radio.volte_icon=0",
+        b"persist.sys.oplus.radio.volte_icon=1",
+    ),
+    (
+        b"persist.sys.oplus.radio.show_volte=0",
+        b"persist.sys.oplus.radio.show_volte=1",
+    ),
+    (
+        b"persist.oplus.radio.volte_icon=0",
+        b"persist.oplus.radio.volte_icon=1",
+    ),
     (b"persist.radio.volte.icon=0", b"persist.radio.volte.icon=1"),
-    (b"persist.sys.oplus.radio.volte_switch=0", b"persist.sys.oplus.radio.volte_switch=1"),
-    (b"persist.sys.oppo.radio.show_volte=0", b"persist.sys.oppo.radio.show_volte=1"),
-    (b"persist.sys.oppo.radio.volte_icon=0", b"persist.sys.oppo.radio.volte_icon=1"),
-    (b"persist.sys.oppo.radio.volte_switch=0", b"persist.sys.oppo.radio.volte_switch=1"),
-    (b"persist.sys.oppo.show_volte=0", b"persist.sys.oppo.show_volte=1"),
-    (b"persist.radio.oppo.show_volte=0", b"persist.radio.oppo.show_volte=1"),
+    (
+        b"persist.sys.oplus.radio.volte_switch=0",
+        b"persist.sys.oplus.radio.volte_switch=1",
+    ),
+    (
+        b"persist.sys.oppo.radio.show_volte=0",
+        b"persist.sys.oppo.radio.show_volte=1",
+    ),
+    (
+        b"persist.sys.oppo.radio.volte_icon=0",
+        b"persist.sys.oppo.radio.volte_icon=1",
+    ),
+    (
+        b"persist.sys.oppo.radio.volte_switch=0",
+        b"persist.sys.oppo.radio.volte_switch=1",
+    ),
+    (
+        b"persist.sys.oppo.show_volte=0",
+        b"persist.sys.oppo.show_volte=1",
+    ),
+    (
+        b"persist.radio.oppo.show_volte=0",
+        b"persist.radio.oppo.show_volte=1",
+    ),
     (b"ro.oppo.radio.show_volte=0", b"ro.oppo.radio.show_volte=1"),
-    (b"persist.vendor.mtk_dynamic_ims_switch=1", b"persist.vendor.mtk_dynamic_ims_switch=0"),
+    (
+        b"persist.vendor.mtk_dynamic_ims_switch=1",
+        b"persist.vendor.mtk_dynamic_ims_switch=0",
+    ),
     (b"show_volte_icon=0", b"show_volte_icon=1"),
-    (b"mtk_ct_volte_support\",\"0\"", b"mtk_ct_volte_support\",\"1\""),
-    (b"mtk_ct_vilte_support\",\"0\"", b"mtk_ct_vilte_support\",\"1\""),
+    (
+        b"mtk_ct_volte_support\",\"0\"",
+        b"mtk_ct_volte_support\",\"1\"",
+    ),
+    (
+        b"mtk_ct_vilte_support\",\"0\"",
+        b"mtk_ct_vilte_support\",\"1\"",
+    ),
     (b"vilte_support\",\"0\"", b"vilte_support\",\"1\""),
     (b"volte_support\",\"0\"", b"volte_support\",\"1\""),
     (b"ro.mtk_volte_support=0", b"ro.mtk_volte_support=1"),
     (b"ro.mtk_ims_support=0", b"ro.mtk_ims_support=1"),
     (b"ro.mtk_vilte_support=0", b"ro.mtk_vilte_support=1"),
-    (b"ro.oplus.radio.support_volte=0", b"ro.oplus.radio.support_volte=1"),
-    (b"ro.oplus.radio.show_volte_switch=0", b"ro.oplus.radio.show_volte_switch=1"),
+    (
+        b"ro.oplus.radio.support_volte=0",
+        b"ro.oplus.radio.support_volte=1",
+    ),
+    (
+        b"ro.oplus.radio.show_volte_switch=0",
+        b"ro.oplus.radio.show_volte_switch=1",
+    ),
     (b"mtk_volte_support=0", b"mtk_volte_support=1"),
     (b"mtk_ims_support=0", b"mtk_ims_support=1"),
-    (b"persist.vendor.volte_support=0", b"persist.vendor.volte_support=1"),
-    (b"persist.vendor.ims_support=0", b"persist.vendor.ims_support=1"),
-    (b"persist.vendor.mtk.volte.enable=0", b"persist.vendor.mtk.volte.enable=1"),
+    (
+        b"persist.vendor.volte_support=0",
+        b"persist.vendor.volte_support=1",
+    ),
+    (
+        b"persist.vendor.ims_support=0",
+        b"persist.vendor.ims_support=1",
+    ),
+    (
+        b"persist.vendor.mtk.volte.enable=0",
+        b"persist.vendor.mtk.volte.enable=1",
+    ),
     (b"volte_support=false", b"volte_support=true "),
     (b"ims_support=false", b"ims_support=true "),
     (b"show_volte=0", b"show_volte=1"),
@@ -125,12 +221,7 @@ fn read_chunk(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
 /// `patch_flags_keep_size` (`:689`): copy `src` to `dst` when they differ, then
 /// apply every flag pair inside `limit` bytes (0 = whole file). Windows advance
 /// by `CHUNK - OVERLAP` so a pair straddling a boundary is still seen.
-pub fn patch_flags_keep_size(
-    src: &Path,
-    dst: &Path,
-    limit: u64,
-    _log: &mut Logger,
-) -> Result<u64> {
+pub fn patch_flags_keep_size(src: &Path, dst: &Path, limit: u64, _log: &mut Logger) -> Result<u64> {
     if !path_id::same_file(src, dst) {
         std::fs::copy(src, dst)?;
     }
@@ -239,7 +330,10 @@ mod tests {
             assert_eq!(a.len(), b.len(), "pair {:?} changes size", a);
             assert_ne!(a, b);
         }
-        assert!(FLAG_PAIRS.contains(&(&b"mtk_dynamic_ims_switch=1"[..], &b"mtk_dynamic_ims_switch=0"[..])));
+        assert!(FLAG_PAIRS.contains(&(
+            &b"mtk_dynamic_ims_switch=1"[..],
+            &b"mtk_dynamic_ims_switch=0"[..]
+        )));
         assert_eq!(b"volte_support=true ".len(), b"volte_support=false".len());
         let unique: std::collections::HashSet<&[u8]> = FLAG_PAIRS.iter().map(|(a, _)| *a).collect();
         assert_eq!(unique.len(), 65, "duplicate left-hand side");
@@ -271,7 +365,10 @@ mod tests {
             std::fs::read(&dst).unwrap(),
             b"xvolte_support=0\nvolte_support=1\n"
         );
-        assert_eq!(std::fs::read(&src).unwrap(), b"xvolte_support=0\nvolte_support=0\n");
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            b"xvolte_support=0\nvolte_support=0\n"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -293,8 +390,16 @@ mod tests {
         let out = std::fs::read(&dst).unwrap();
         assert_eq!(out.len(), data.len());
         for (a, b) in FLAG_PAIRS.iter() {
-            assert!(find_from(&out, a, 0).is_none(), "left side survived: {:?}", a);
-            assert!(find_from(&out, b, 0).is_some(), "right side missing: {:?}", b);
+            assert!(
+                find_from(&out, a, 0).is_none(),
+                "left side survived: {:?}",
+                a
+            );
+            assert!(
+                find_from(&out, b, 0).is_some(),
+                "right side missing: {:?}",
+                b
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -363,7 +468,10 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), b"volte_support=1");
         let empty = dir.join("empty.bin");
         std::fs::write(&empty, b"").unwrap();
-        assert_eq!(patch_flags_keep_size(&empty, &empty, 0, &mut log).unwrap(), 0);
+        assert_eq!(
+            patch_flags_keep_size(&empty, &empty, 0, &mut log).unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -411,9 +519,17 @@ mod tests {
         assert_eq!(flag_bit_from_dumps(&dir), 1);
         std::fs::write(dir.join("hd_flg_def.prop"), b"abcd").unwrap();
         std::fs::write(dir.join("hd_flg_build.prop"), b"\nvolte_support=1").unwrap();
-        assert_eq!(flag_bit_from_dumps(&dir), 1, "4-byte file is skipped, other one is read");
+        assert_eq!(
+            flag_bit_from_dumps(&dir),
+            1,
+            "4-byte file is skipped, other one is read"
+        );
         std::fs::write(dir.join("hd_flg_build.prop"), b"1").unwrap();
-        assert_eq!(flag_bit_from_dumps(&dir), 0, "both files <= 4 bytes -> empty blob");
+        assert_eq!(
+            flag_bit_from_dumps(&dir),
+            0,
+            "both files <= 4 bytes -> empty blob"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

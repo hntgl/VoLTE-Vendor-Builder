@@ -162,7 +162,10 @@ pub fn verify_payload(
             format!("/overlay/HDVoLTE/{apk_name}"),
             format!("/overlay/{apk_name}"),
         ],
-        [td.join("verify_overlay.apk"), td.join("verify_overlay_root.apk")],
+        [
+            td.join("verify_overlay.apk"),
+            td.join("verify_overlay_root.apk"),
+        ],
         apk_source.as_deref(),
         ops,
     );
@@ -342,14 +345,25 @@ mod tests {
         assert_eq!(got.rc, Verdict::Verified);
         assert_eq!(got.apk_sha256, sha(APK));
         assert_eq!(got.rc_sha256, sha(RC));
-        assert!(got.apk_copies.iter().all(|c| c.state == CopyState::Verified));
+        assert!(got
+            .apk_copies
+            .iter()
+            .all(|c| c.state == CopyState::Verified));
         assert!(got.rc_copies.iter().all(|c| c.state == CopyState::Verified));
-        assert_eq!(ops.calls.len(), 4, "one dump per copy, no candidate retries");
+        assert_eq!(
+            ops.calls.len(),
+            4,
+            "one dump per copy, no candidate retries"
+        );
         let hosts: Vec<&str> = ops.calls.iter().map(|(_, h)| h.as_str()).collect();
         let mut unique = hosts.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 4, "each copy has its own host file: {hosts:?}");
+        assert_eq!(
+            unique.len(),
+            4,
+            "each copy has its own host file: {hosts:?}"
+        );
 
         let lines = lines.borrow().clone();
         assert_eq!(lines[0], format!("APK_SHA256={}", sha(APK)));

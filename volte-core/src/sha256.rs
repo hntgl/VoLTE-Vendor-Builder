@@ -37,7 +37,12 @@ impl Default for Sha256 {
 
 impl Sha256 {
     pub fn new() -> Self {
-        Sha256 { h: H0, buf: [0u8; 64], buf_len: 0, total: 0 }
+        Sha256 {
+            h: H0,
+            buf: [0u8; 64],
+            buf_len: 0,
+            total: 0,
+        }
     }
 
     pub fn update(&mut self, mut data: &[u8]) {
@@ -67,7 +72,11 @@ impl Sha256 {
 
     pub fn finish(mut self) -> [u8; 32] {
         let bits = self.total.wrapping_mul(8);
-        let pad_len = if self.buf_len < 56 { 56 - self.buf_len } else { 120 - self.buf_len };
+        let pad_len = if self.buf_len < 56 {
+            56 - self.buf_len
+        } else {
+            120 - self.buf_len
+        };
         let mut pad = [0u8; 64];
         pad[0] = 0x80;
         self.update(&pad[..pad_len]);
@@ -211,7 +220,9 @@ mod tests {
 
     #[test]
     fn padding_boundaries_round_trip_through_streaming() {
-        for len in [0usize, 1, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 1000] {
+        for len in [
+            0usize, 1, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 1000,
+        ] {
             let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let one_shot = digest(&data);
             let mut streamed = Sha256::new();

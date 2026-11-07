@@ -56,10 +56,8 @@ impl WorkDir {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "hd_hue_chuan_{}_{nanos}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("hd_hue_chuan_{}_{nanos}", std::process::id()));
         std::fs::create_dir_all(&path)?;
         Ok(WorkDir(path))
     }
@@ -193,11 +191,7 @@ fn log_lines(log: &mut Logger, text: &str) {
     }
 }
 
-fn copy_with_progress(
-    src: &Path,
-    dst: &Path,
-    progress: &mut dyn FnMut(u8, &str),
-) -> Result<()> {
+fn copy_with_progress(src: &Path, dst: &Path, progress: &mut dyn FnMut(u8, &str)) -> Result<()> {
     if path_id::same_file(src, dst) {
         return Err(Error::build(format!(
             "Refusing to copy {} onto itself; the source was not modified.",
@@ -285,7 +279,10 @@ fn restore_pre_avb(work: &Path, backup: &Path, size: u64, sha: &str) -> Result<(
     }
     std::fs::rename(&side, work).map_err(|e| {
         let _ = std::fs::remove_file(&side);
-        Error::build(format!("atomic restore over {} failed: {e}", work.display()))
+        Error::build(format!(
+            "atomic restore over {} failed: {e}",
+            work.display()
+        ))
     })?;
     let after = std::fs::metadata(work).map(|m| m.len()).unwrap_or(0);
     if after != size || crate::sha256::file_hex_upper(work)? != sha {
@@ -425,9 +422,7 @@ pub fn run(
         match sparse::unsparse(&src, &raw)? {
             sparse::Unsparse::Converted { .. } => raw,
             sparse::Unsparse::NotSparse => {
-                return Err(Error::build(
-                    "Unsparse failed - cannot inject VoLTE.",
-                ))
+                return Err(Error::build("Unsparse failed - cannot inject VoLTE."))
             }
         }
     } else {
@@ -449,9 +444,7 @@ pub fn run(
         .map(|m| m.is_file() && m.len() >= 1024)
         .unwrap_or(false);
     if !copied {
-        return Err(Error::build(
-            "Copy vendor failed (disk/file is open).",
-        ));
+        return Err(Error::build("Copy vendor failed (disk/file is open)."));
     }
     let work = out_path.clone();
 
@@ -713,7 +706,9 @@ mod tests {
     fn tool_dir() -> PathBuf {
         let dir = match std::env::var("VOLTE_TOOL_DIR") {
             Ok(v) => PathBuf::from(v),
-            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("tool"),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tool"),
         };
         assert!(
             dir.join("mke2fs.exe").is_file(),
@@ -753,8 +748,16 @@ mod tests {
         std::fs::write(dir.join(config::APK_NAME), vec![b'A'; 1200]).unwrap();
         std::fs::write(dir.join(config::RC_NAME_MTK), b"on boot\n    setprop x 1\n").unwrap();
         std::fs::write(dir.join(config::RC_NAME_QC), b"on boot\n    setprop y 1\n").unwrap();
-        std::fs::write(dir.join("overlay.bin"), b"u:object_r:vendor_overlay_file:s0\0").unwrap();
-        std::fs::write(dir.join("config.bin"), b"u:object_r:vendor_configs_file:s0\0").unwrap();
+        std::fs::write(
+            dir.join("overlay.bin"),
+            b"u:object_r:vendor_overlay_file:s0\0",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config.bin"),
+            b"u:object_r:vendor_configs_file:s0\0",
+        )
+        .unwrap();
         std::fs::write(dir.join(config::FEATURES_XML), b"<permissions/>").unwrap();
     }
 
@@ -773,7 +776,10 @@ mod tests {
     impl avb::Avb for NoFooterAvb {
         fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
             self.calls += 1;
-            assert!(req.image.is_file(), "the AVB step must run on the output copy");
+            assert!(
+                req.image.is_file(),
+                "the AVB step must run on the output copy"
+            );
             Ok(())
         }
     }
@@ -848,7 +854,10 @@ mod tests {
         let src = std::path::absolute("D:/rom/vendor.img").unwrap();
         let (folder, out) = resolve_output(&src, "", false).unwrap();
         assert_eq!(folder, std::path::absolute("D:/rom").unwrap());
-        assert_eq!(out, std::path::absolute("D:/rom/vendor_VolLTE.img").unwrap());
+        assert_eq!(
+            out,
+            std::path::absolute("D:/rom/vendor_VolLTE.img").unwrap()
+        );
     }
 
     #[test]
@@ -904,7 +913,10 @@ mod tests {
         let (size, sha) = take_pre_avb_backup(&work, &backup).unwrap();
         assert_eq!(size, 8192);
         assert_eq!(sha, crate::sha256::file_hex_upper(&work).unwrap());
-        assert_eq!(std::fs::read(&backup).unwrap(), std::fs::read(&work).unwrap());
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            std::fs::read(&work).unwrap()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1087,7 +1099,10 @@ mod tests {
         let stamp = log_stamp();
         assert_eq!(stamp.len(), 15, "{stamp}");
         assert_eq!(&stamp[8..9], "_");
-        assert!(stamp.chars().filter(|c| *c != '_').all(|c| c.is_ascii_digit()));
+        assert!(stamp
+            .chars()
+            .filter(|c| *c != '_')
+            .all(|c| c.is_ascii_digit()));
     }
 
     #[test]
@@ -1124,7 +1139,11 @@ mod tests {
         let mut ops = RustFsExt4Backend::new();
         let mut fsck = PassingFsck { calls: 0 };
         let mut avb = NoFooterAvb { calls: 0 };
-        let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
         let mut log = Logger::new();
         let mut progress = |_n: u8, _l: &str| {};
         let opts = Options {
@@ -1136,7 +1155,11 @@ mod tests {
             logs_dir: &dir.join("Logs"),
         };
         let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
-        assert!(err.message().starts_with("File not found:"), "{}", err.message());
+        assert!(
+            err.message().starts_with("File not found:"),
+            "{}",
+            err.message()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1150,9 +1173,16 @@ mod tests {
         let logs = dir.join("Logs");
 
         let mut ops = RustFsExt4Backend::new();
-        let mut fsck = CountingFsck { inner: E2fsck::new(&tool), calls: 0 };
+        let mut fsck = CountingFsck {
+            inner: E2fsck::new(&tool),
+            calls: 0,
+        };
         let mut avb = NoFooterAvb { calls: 0 };
-        let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
         let lines = Rc::new(RefCell::new(Vec::new()));
         let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
         let mut marks: Vec<(u8, String)> = Vec::new();
@@ -1172,7 +1202,11 @@ mod tests {
             std::fs::metadata(&out).unwrap().len(),
             std::fs::metadata(&src).unwrap().len()
         );
-        assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha, "source untouched");
+        assert_eq!(
+            crate::sha256::file_hex_upper(&src).unwrap(),
+            src_sha,
+            "source untouched"
+        );
         assert_eq!(fsck.calls, 1);
         assert_eq!(avb.calls, 1);
 
@@ -1195,11 +1229,17 @@ mod tests {
 
         let marks: Vec<u8> = marks.iter().map(|(n, _)| *n).collect();
         for expected in [3u8, 8, 30, 32, 38, 58, 64, 72, 78, 82, 96] {
-            assert!(marks.contains(&expected), "progress {expected} missing: {marks:?}");
+            assert!(
+                marks.contains(&expected),
+                "progress {expected} missing: {marks:?}"
+            );
         }
 
         let commands = std::fs::read_to_string(logs.join("commands_last.txt")).unwrap();
-        assert!(commands.contains("\n\n"), "clean and write blocks are separated");
+        assert!(
+            commands.contains("\n\n"),
+            "clean and write blocks are separated"
+        );
         assert!(commands.starts_with("rm /overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk\n"));
         assert!(commands.contains("\nmkdir /overlay/HDVoLTE\n"));
         let report = std::fs::read_to_string(logs.join("vendor_VolLTE_report.txt")).unwrap();
@@ -1289,7 +1329,11 @@ mod tests {
         let mut ops = RustFsExt4Backend::new();
         let mut fsck = AlwaysFailFsck { calls: 0 };
         let mut avb = NoFooterAvb { calls: 0 };
-        let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
         let lines = Rc::new(RefCell::new(Vec::new()));
         let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
         let mut progress = |_n: u8, _l: &str| {};
@@ -1305,7 +1349,10 @@ mod tests {
         let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
         assert!(err.message().contains("e2fsck failed"), "{err}");
         assert_eq!(fsck.calls, 1);
-        assert_eq!(avb.calls, 0, "the AVB step must not run after a failed fsck");
+        assert_eq!(
+            avb.calls, 0,
+            "the AVB step must not run after a failed fsck"
+        );
         assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
 
         let text = lines.borrow().join("\n");
@@ -1329,7 +1376,11 @@ mod tests {
         let mut ops = RustFsExt4Backend::new();
         let mut fsck = PassingFsck { calls: 0 };
         let mut avb = FailingAvb { calls: 0 };
-        let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
         let lines = Rc::new(RefCell::new(Vec::new()));
         let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
         let mut progress = |_n: u8, _l: &str| {};
@@ -1355,7 +1406,10 @@ mod tests {
         assert!(text.contains("AVB_HASHTREE=SKIP"), "{text}");
         assert!(!text.contains("AVB_HASHTREE=PASS"), "{text}");
         assert!(!text.contains("Rebuild hashtree completed."), "{text}");
-        assert!(!text.contains("[OK] AVB hashtree + EDL size match"), "{text}");
+        assert!(
+            !text.contains("[OK] AVB hashtree + EDL size match"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

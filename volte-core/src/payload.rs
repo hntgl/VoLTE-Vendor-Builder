@@ -83,7 +83,10 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
     let payload_rc = td.join("payload.rc");
     std::fs::copy(&apk_src, &payload_apk)?;
     std::fs::copy(&rc_src, &payload_rc)?;
-    std::fs::copy(payload_required(root, "overlay.bin")?, td.join("overlay.bin"))?;
+    std::fs::copy(
+        payload_required(root, "overlay.bin")?,
+        td.join("overlay.bin"),
+    )?;
     std::fs::copy(payload_required(root, "config.bin")?, td.join("config.bin"))?;
 
     let clean: Vec<String> = [
@@ -147,8 +150,15 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
         write.push("mkdir /etc/permissions".to_string());
         write.push("cd /etc/permissions".to_string());
         write.push(format!("rm {}", config::FEATURES_XML));
-        write.push(format!("write {} {}", forward_slashes(&feat_host), config::FEATURES_XML));
-        write.push(format!("set_inode_field {} mode 0x81A4", config::FEATURES_XML));
+        write.push(format!(
+            "write {} {}",
+            forward_slashes(&feat_host),
+            config::FEATURES_XML
+        ));
+        write.push(format!(
+            "set_inode_field {} mode 0x81A4",
+            config::FEATURES_XML
+        ));
         write.push(format!("set_inode_field {} uid 0", config::FEATURES_XML));
         write.push(format!("set_inode_field {} gid 0", config::FEATURES_XML));
         write.push(format!(
@@ -163,8 +173,15 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
             let qc_host = td.join("payload_qc.rc");
             std::fs::copy(qc_rc, &qc_host)?;
             write.push("cd /etc/init".to_string());
-            write.push(format!("write {} {}", forward_slashes(&qc_host), config::RC_NAME_QC));
-            write.push(format!("set_inode_field {} mode 0x81A4", config::RC_NAME_QC));
+            write.push(format!(
+                "write {} {}",
+                forward_slashes(&qc_host),
+                config::RC_NAME_QC
+            ));
+            write.push(format!(
+                "set_inode_field {} mode 0x81A4",
+                config::RC_NAME_QC
+            ));
             write.push(format!("set_inode_field {} uid 0", config::RC_NAME_QC));
             write.push(format!("set_inode_field {} gid 0", config::RC_NAME_QC));
             write.push(format!(
@@ -272,7 +289,9 @@ mod tests {
         assert_eq!(plan.clean.len(), 15, "clean commands");
         assert_eq!(plan.write.len(), 44, "write commands");
         assert!(
-            plan.write.iter().any(|c| c.contains("write") && c.ends_with("hd_oppo_qc_volte.rc")),
+            plan.write
+                .iter()
+                .any(|c| c.contains("write") && c.ends_with("hd_oppo_qc_volte.rc")),
             "MTK must also write the QC RC"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -315,7 +334,13 @@ mod tests {
         assert!(all.contains("ea_set -f overlay.bin OPPO_VoLTE_Overlay.apk security.selinux"));
         assert!(all.contains("ea_set -f config.bin hd_oppo_qc_volte.rc security.selinux"));
         assert!(all.contains("mkdir /etc/permissions"));
-        assert_eq!(plan.write.iter().filter(|c| c.starts_with("ea_set ")).count(), 6);
+        assert_eq!(
+            plan.write
+                .iter()
+                .filter(|c| c.starts_with("ea_set "))
+                .count(),
+            6
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -341,7 +366,14 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, true);
         let _ = overlay_commands(&root, &td, false).unwrap();
-        for name in ["payload.apk", "payload.rc", "payload_qc.rc", "overlay.bin", "config.bin", config::FEATURES_XML] {
+        for name in [
+            "payload.apk",
+            "payload.rc",
+            "payload_qc.rc",
+            "overlay.bin",
+            "config.bin",
+            config::FEATURES_XML,
+        ] {
             assert!(td.join(name).is_file(), "{name} must be copied");
         }
         let _ = std::fs::remove_dir_all(&root);

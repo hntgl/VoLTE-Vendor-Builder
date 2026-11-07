@@ -29,7 +29,10 @@ pub struct Error {
 
 impl Error {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Error { kind, message: message.into() }
+        Error {
+            kind,
+            message: message.into(),
+        }
     }
 
     pub fn build(message: impl Into<String>) -> Self {
@@ -100,6 +103,9 @@ mod tests {
 
     #[test]
     fn bad_magic_kind_is_distinct() {
-        assert_eq!(Error::bad_magic("rust-fs-ext4: bad magic number").kind(), ErrorKind::BadMagic);
+        assert_eq!(
+            Error::bad_magic("rust-fs-ext4: bad magic number").kind(),
+            ErrorKind::BadMagic
+        );
     }
 }

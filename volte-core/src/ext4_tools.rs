@@ -216,7 +216,9 @@ mod tests {
     fn tool_dir() -> PathBuf {
         let dir = match std::env::var("VOLTE_TOOL_DIR") {
             Ok(v) => PathBuf::from(v),
-            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("tool"),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tool"),
         };
         assert!(
             dir.join("mke2fs.exe").is_file(),
@@ -257,7 +259,9 @@ mod tests {
     fn a_missing_e2fsck_executable_is_an_error() {
         let dir = tmp("volte_ext4_fsck_missing");
         let img = make_ext4(&dir, "clean.img");
-        let mut fsck = E2fsck { exe: dir.join("no-such-e2fsck.exe") };
+        let mut fsck = E2fsck {
+            exe: dir.join("no-such-e2fsck.exe"),
+        };
         let err = fsck.check(&img, &dir).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Io);
         assert!(err.message().contains("e2fsck"), "{err}");
@@ -296,7 +300,11 @@ mod tests {
         let mut ops = RustFsExt4Backend::new();
         assert_eq!(read_vendor_flag_bit(&img, &dir, &mut ops), 0);
 
-        std::fs::write(dir.join("build.prop"), b"ro.x=1\npersist.mtk.volte_support=1\n").unwrap();
+        std::fs::write(
+            dir.join("build.prop"),
+            b"ro.x=1\npersist.mtk.volte_support=1\n",
+        )
+        .unwrap();
         let mut log = quiet_log();
         ops.run(
             &img,

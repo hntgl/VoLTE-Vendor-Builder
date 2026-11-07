@@ -177,7 +177,9 @@ pub fn unsparse(src: &Path, dst: &Path) -> Result<Unsparse> {
     }
     let hdr = parse_header(&head)?;
     if hdr.file_hdr_sz > FILE_HEADER_LEN {
-        f.seek(SeekFrom::Current((hdr.file_hdr_sz - FILE_HEADER_LEN) as i64))?;
+        f.seek(SeekFrom::Current(
+            (hdr.file_hdr_sz - FILE_HEADER_LEN) as i64,
+        ))?;
     }
 
     let out = BufWriter::new(File::create(dst)?);
@@ -206,7 +208,9 @@ fn write_image(
         let csize = u32::from_le_bytes([ch[4], ch[5], ch[6], ch[7]]) as u64;
         let tsize = u32::from_le_bytes([ch[8], ch[9], ch[10], ch[11]]) as u64;
         if hdr.chunk_hdr_sz > CHUNK_HEADER_LEN {
-            f.seek(SeekFrom::Current((hdr.chunk_hdr_sz - CHUNK_HEADER_LEN) as i64))?;
+            f.seek(SeekFrom::Current(
+                (hdr.chunk_hdr_sz - CHUNK_HEADER_LEN) as i64,
+            ))?;
         }
 
         let data_len = match ctype {
@@ -395,7 +399,12 @@ mod tests {
         ]);
         std::fs::write(&src, &sp).unwrap();
 
-        assert_eq!(unsparse(&src, &dst).unwrap(), Unsparse::Converted { written: 5 * BLK as u64 });
+        assert_eq!(
+            unsparse(&src, &dst).unwrap(),
+            Unsparse::Converted {
+                written: 5 * BLK as u64
+            }
+        );
         let raw = std::fs::read(&dst).unwrap();
         assert_eq!(raw.len(), 5 * BLK as usize);
         assert_eq!(&raw[..BLK as usize], &raw_block[..]);
@@ -409,7 +418,9 @@ mod tests {
             );
         }
         assert!(
-            raw[3 * BLK as usize..4 * BLK as usize].iter().all(|&b| b == 0),
+            raw[3 * BLK as usize..4 * BLK as usize]
+                .iter()
+                .all(|&b| b == 0),
             "DONT_CARE must stay a hole"
         );
         assert_eq!(&raw[4 * BLK as usize..], &tail_block[..]);
@@ -425,7 +436,9 @@ mod tests {
 
         assert_eq!(
             unsparse(&src, &dst).unwrap(),
-            Unsparse::Converted { written: 4 * BLK as u64 }
+            Unsparse::Converted {
+                written: 4 * BLK as u64
+            }
         );
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 4 * BLK as u64);
         assert!(std::fs::read(&dst).unwrap().iter().all(|&b| b == 0));
@@ -437,11 +450,17 @@ mod tests {
         let dir = tmp("volte_sparse_all_holes");
         let src = dir.join("image.sparse");
         let dst = dir.join("image.raw");
-        std::fs::write(&src, build_sparse(&[Chunk::DontCare(2), Chunk::DontCare(3)])).unwrap();
+        std::fs::write(
+            &src,
+            build_sparse(&[Chunk::DontCare(2), Chunk::DontCare(3)]),
+        )
+        .unwrap();
 
         assert_eq!(
             unsparse(&src, &dst).unwrap(),
-            Unsparse::Converted { written: 5 * BLK as u64 }
+            Unsparse::Converted {
+                written: 5 * BLK as u64
+            }
         );
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 5 * BLK as u64);
         let _ = std::fs::remove_dir_all(&dir);
@@ -460,7 +479,9 @@ mod tests {
 
         assert_eq!(
             unsparse(&src, &dst).unwrap(),
-            Unsparse::Converted { written: 3 * BLK as u64 }
+            Unsparse::Converted {
+                written: 3 * BLK as u64
+            }
         );
         assert_eq!(std::fs::metadata(&dst).unwrap().len(), 3 * BLK as u64);
         let _ = std::fs::remove_dir_all(&dir);
@@ -557,7 +578,12 @@ mod tests {
         sp[10..12].copy_from_slice(&16u16.to_le_bytes());
         sp.splice(32 + 12..32 + 12, [0u8; 4]);
         std::fs::write(&src, &sp).unwrap();
-        assert_eq!(unsparse(&src, &dst).unwrap(), Unsparse::Converted { written: BLK as u64 });
+        assert_eq!(
+            unsparse(&src, &dst).unwrap(),
+            Unsparse::Converted {
+                written: BLK as u64
+            }
+        );
         let raw = std::fs::read(&dst).unwrap();
         assert!(raw.iter().all(|&b| b == 9));
         let _ = std::fs::remove_dir_all(&dir);
@@ -698,7 +724,11 @@ mod tests {
         let dir = tmp("volte_sparse_output_size");
         let sp = dir.join("image.sparse");
         let raw = dir.join("image.raw");
-        std::fs::write(&sp, build_sparse(&[Chunk::DontCare(2), Chunk::Raw(vec![0; BLK as usize])])).unwrap();
+        std::fs::write(
+            &sp,
+            build_sparse(&[Chunk::DontCare(2), Chunk::Raw(vec![0; BLK as usize])]),
+        )
+        .unwrap();
         std::fs::write(&raw, vec![0u8; 64]).unwrap();
 
         assert_eq!(output_size(&sp).unwrap(), Some(3 * BLK as u64));

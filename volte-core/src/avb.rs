@@ -245,7 +245,9 @@ fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
         ));
     }
     let start = VBMETA_HEADER_LEN as u64 + auth + desc_offset;
-    let end = start.checked_add(desc_size).ok_or("descriptor size overflows")?;
+    let end = start
+        .checked_add(desc_size)
+        .ok_or("descriptor size overflows")?;
     if end > aux_end {
         return Err(format!(
             "descriptors end at {end}, past the auxiliary block end {aux_end}"
@@ -267,9 +269,7 @@ fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
         let total = 16usize
             .checked_add(nbf as usize)
             .ok_or("descriptor size overflows")?;
-        let last = pos
-            .checked_add(total)
-            .ok_or("descriptor end overflows")?;
+        let last = pos.checked_add(total).ok_or("descriptor end overflows")?;
         if last > end {
             return Err(format!(
                 "descriptor at {pos} ends at {last}, past the descriptor block end {end}"
@@ -431,7 +431,9 @@ pub fn fit_avb_part(img_sz: u64, hint: u64) -> u64 {
         if !need.is_multiple_of(BLOCK) {
             need = need.div_ceil(BLOCK) * BLOCK;
         }
-        let max_img = need.saturating_sub(tree_size(need)).saturating_sub(META_LEN);
+        let max_img = need
+            .saturating_sub(tree_size(need))
+            .saturating_sub(META_LEN);
         if max_img >= img_sz {
             return need;
         }
@@ -720,8 +722,7 @@ mod tests {
     const GOLDEN_VBMETA: &[u8] = include_bytes!("../../fixtures/avb/vbmeta_vendor_golden.bin");
     const GOLDEN_VBMETA_SHA256: &str =
         "1C5338CD481F787AE627389681932A40BD38CF6F6CC284577819AD2197F1E81C";
-    const GOLDEN_SALT: &str =
-        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const GOLDEN_SALT: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
     struct SharedSink(Rc<RefCell<Vec<String>>>);
 
@@ -793,15 +794,24 @@ mod tests {
         assert!(parse_footer(&b, 4 * 1024 * 1024).is_none(), "orig < 1 MiB");
 
         let b = footer_bytes(1, 0, 5 * 1024 * 1024, 1024 * 1024, 4096);
-        assert!(parse_footer(&b, 4 * 1024 * 1024).is_none(), "orig >= footer_end");
+        assert!(
+            parse_footer(&b, 4 * 1024 * 1024).is_none(),
+            "orig >= footer_end"
+        );
 
         let b = footer_bytes(1, 0, 2 * 1024 * 1024, 0, 4096);
         assert!(parse_footer(&b, 4 * 1024 * 1024).is_none(), "voff == 0");
 
         let b = footer_bytes(1, 0, 2 * 1024 * 1024, 4 * 1024 * 1024, 4096);
-        assert!(parse_footer(&b, 4 * 1024 * 1024).is_none(), "voff >= footer_end");
+        assert!(
+            parse_footer(&b, 4 * 1024 * 1024).is_none(),
+            "voff >= footer_end"
+        );
 
-        assert!(parse_footer(&[0u8; 10], 4 * 1024 * 1024).is_none(), "short blob");
+        assert!(
+            parse_footer(&[0u8; 10], 4 * 1024 * 1024).is_none(),
+            "short blob"
+        );
     }
 
     #[test]
@@ -873,7 +883,10 @@ mod tests {
         );
 
         let err = avb_info_fast(&set_vsz(300)).unwrap_err();
-        assert!(err.message().contains("outside the 300-byte vbmeta"), "{err}");
+        assert!(
+            err.message().contains("outside the 300-byte vbmeta"),
+            "{err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -904,7 +917,14 @@ mod tests {
 
     #[test]
     fn fit_partition_size_properties() {
-        for img in [1u64, 4096, 100_000, 5_000_000, 100 * 1024 * 1024, 1_200_000_000] {
+        for img in [
+            1u64,
+            4096,
+            100_000,
+            5_000_000,
+            100 * 1024 * 1024,
+            1_200_000_000,
+        ] {
             let part = fit_avb_part(img, 0);
             assert_eq!(part % 1048576, 0, "MiB aligned for {img}");
             assert!(part >= img, "holds the image for {img}");
@@ -914,7 +934,11 @@ mod tests {
             );
         }
         let hint = fit_avb_part(1000, 64 * 1024 * 1024);
-        assert_eq!(hint, 64 * 1024 * 1024, "hint wins when already large enough");
+        assert_eq!(
+            hint,
+            64 * 1024 * 1024,
+            "hint wins when already large enough"
+        );
     }
 
     #[test]
@@ -955,7 +979,9 @@ mod tests {
         let a = random_salt_hex().unwrap();
         let b = random_salt_hex().unwrap();
         assert_eq!(a.len(), 64);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
     }
 
@@ -1007,7 +1033,10 @@ mod tests {
                 let at = golden_salt_offset();
                 vb[at..at + 32].copy_from_slice(&salt);
             }
-            let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&req.image)?;
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&req.image)?;
             f.seek(SeekFrom::Start(1024 * 1024))?;
             f.write_all(&vb)?;
             let footer = footer_bytes(1, 0, 1024 * 1024, 1024 * 1024, vb.len() as u64);
@@ -1105,7 +1134,10 @@ mod tests {
             &p,
             &info,
             0,
-            &mut FooterWriter { grow: 0, salt: None },
+            &mut FooterWriter {
+                grow: 0,
+                salt: None,
+            },
             &mut log,
         )
         .unwrap_err();
@@ -1134,7 +1166,11 @@ mod tests {
         .unwrap()
         .expect("footer rebuilt");
         assert!(out.has_footer);
-        assert_eq!(out.salt, hex_lower(&fresh_salt), "the new footer is re-read");
+        assert_eq!(
+            out.salt,
+            hex_lower(&fresh_salt),
+            "the new footer is re-read"
+        );
         assert_eq!(out.partition_name, "vendor");
         assert_eq!(out.props, info.props);
         let text = lines.borrow().join("\n");
@@ -1163,7 +1199,10 @@ mod tests {
         let seen = Rc::new(RefCell::new(None));
         let mut backend = RecordingBackend {
             seen: seen.clone(),
-            inner: FooterWriter { grow: 0, salt: None },
+            inner: FooterWriter {
+                grow: 0,
+                salt: None,
+            },
         };
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         rebuild_hashtree(&p, &info, 0, &mut backend, &mut log)
@@ -1196,7 +1235,7 @@ mod tests {
             &mut log,
         )
         .unwrap()
-            .expect("footer rebuilt");
+        .expect("footer rebuilt");
         assert!(out.has_footer);
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
         let _ = std::fs::remove_dir_all(&dir);

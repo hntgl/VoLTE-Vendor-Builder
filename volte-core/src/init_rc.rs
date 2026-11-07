@@ -9,10 +9,10 @@
 use std::path::Path;
 
 use crate::env::forward_slashes;
+use crate::error::Result;
 use crate::ext4_tools::Ext4Ops;
 use crate::logging::Logger;
 use crate::profile;
-use crate::error::Result;
 
 /// The 21 MTK / 8 QC candidates in Python's order (shared tail included).
 pub fn candidate_vpaths(needles: &[&str]) -> Vec<&'static str> {
@@ -240,7 +240,11 @@ mod tests {
     #[test]
     fn inserts_the_missing_imports_and_keeps_the_file_lf_terminated() {
         let dir = tmp("volte_initrc_insert");
-        std::fs::write(dir.join("config.bin"), b"u:object_r:vendor_configs_file:s0\0").unwrap();
+        std::fs::write(
+            dir.join("config.bin"),
+            b"u:object_r:vendor_configs_file:s0\0",
+        )
+        .unwrap();
         let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", b"on boot\n    exec x")]);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         let cfg = dir.join("config.bin");
@@ -268,10 +272,22 @@ mod tests {
     #[test]
     fn existing_imports_are_idempotent_and_skip_the_write_back() {
         let dir = tmp("volte_initrc_idempotent");
-        let body = format!("on boot\n{}\n{}\n", profile::IMPORT_LINE, profile::IMPORT_LINE_HW);
+        let body = format!(
+            "on boot\n{}\n{}\n",
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE_HW
+        );
         let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", body.as_bytes())]);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert!(link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         assert!(ops.written.is_empty());
         assert_eq!(ops.existing.len(), 2, "no mkdir probe on the early return");
         let _ = std::fs::remove_dir_all(&dir);
@@ -282,7 +298,15 @@ mod tests {
         let dir = tmp("volte_initrc_undumpable");
         let mut ops = FakeOps::new(&[]);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert!(!link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(!link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         assert!(ops.written.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -293,7 +317,15 @@ mod tests {
         let mut ops = FakeOps::new(&[]);
         ops.fail_dump = true;
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert!(!link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(!link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -302,13 +334,23 @@ mod tests {
         let dir = tmp("volte_initrc_mkdir_filter");
         std::fs::write(dir.join("config.bin"), b"label\0").unwrap();
         let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", b"on boot\n    exec x\n")]);
-        ops.existing = vec!["/etc".to_owned(), "/etc/init".to_owned(), "/etc/init/hw".to_owned()];
+        ops.existing = vec![
+            "/etc".to_owned(),
+            "/etc/init".to_owned(),
+            "/etc/init/hw".to_owned(),
+        ];
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         let cfg = dir.join("config.bin");
         let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>, FakeOps);
         impl Ext4Ops for Recorder {
-            fn run(&mut self, image: &Path, commands: &[String], workdir: &Path, log: &mut Logger) -> Result<String> {
+            fn run(
+                &mut self,
+                image: &Path,
+                commands: &[String],
+                workdir: &Path,
+                log: &mut Logger,
+            ) -> Result<String> {
                 if commands.iter().all(|c| !c.starts_with("dump ")) {
                     self.0.lock().unwrap().extend(commands.iter().cloned());
                 }
@@ -319,7 +361,15 @@ mod tests {
             }
         }
         let mut rec = Recorder(recorded.clone(), ops);
-        assert!(link(Path::new("img"), &dir, Some(&cfg), &qc_needles(), &mut rec, &mut log).unwrap());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            Some(&cfg),
+            &qc_needles(),
+            &mut rec,
+            &mut log
+        )
+        .unwrap());
         let cmds = recorded.lock().unwrap().clone();
         assert!(!cmds.iter().any(|c| c.starts_with("mkdir ")), "{cmds:?}");
         assert_eq!(cmds[0], "rm /etc/init/hw/init.target.rc");
@@ -362,11 +412,23 @@ mod tests {
             }
         }
         let mut log = Logger::new().with_sink(Collect(lines.clone()));
-        assert!(link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         assert_eq!(ops.written.len(), 1);
         assert_eq!(ops.written[0].0, "init.target.rc");
         assert!(ops.commands.iter().any(|c| c == "rm /init.target.rc"));
-        assert!(ops.commands.iter().any(|c| c == "cd /"), "{:?}", ops.commands);
+        assert!(
+            ops.commands.iter().any(|c| c == "cd /"),
+            "{:?}",
+            ops.commands
+        );
         assert!(
             !ops.commands.iter().any(|c| c == "cd /etc/init/hw"),
             "the root file must not be redirected: {:?}",
@@ -383,7 +445,15 @@ mod tests {
         let snap = "/etc/init/hw/init.target.rc";
         let mut ops = FakeOps::new(&[(snap, b"on boot\n    exec x\n")]);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert!(link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         assert_eq!(ops.written[0].0, "init.target.rc");
         assert!(ops.commands.iter().any(|c| c == "cd /etc/init/hw"));
         assert!(!ops.commands.iter().any(|c| c == "cd /"));
