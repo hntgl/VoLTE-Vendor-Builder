@@ -390,7 +390,8 @@ pub fn run(
     for c in &clean {
         log.log(format!("debugfs: {c}"));
     }
-    match deps.ops.run(&work, &clean, td, log) {
+    // The clean batch removes paths that may legitimately be absent.
+    match deps.ops.run_best_effort(&work, &clean, td, log) {
         Ok(out) => log_lines(log, &out),
         Err(e) => log.log(format!("[WARN] debugfs clean: {}", trunc(e.message(), 200))),
     }
@@ -591,6 +592,7 @@ mod tests {
     use crate::avb::HashtreeRequest;
     use crate::ext4::{DebugfsBackend, E2fsck};
     use crate::logging::Sink;
+    use crate::rustfs_ext4::RustFsExt4Backend;
     use std::cell::RefCell;
     use std::process::Command;
     use std::rc::Rc;
@@ -988,6 +990,67 @@ mod tests {
             .collect();
         assert_eq!(log_files.len(), 1);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_explicit_out_path_that_differs_from_the_source_is_accepted() {
+        let dir = tmp("volte_pipeline_explicit_out");
+        let tool = tool_dir();
+        let src = make_ext4(&dir, "vendor.img");
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+        let out_dir = dir.join("output");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let out_path = out_dir.join("vendor_volte_custom.img");
+        let out_s = out_path.to_string_lossy().into_owned();
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = CountingFsck {
+            inner: E2fsck::new(&tool),
+            calls: 0,
+        };
+        let mut avb = NoFooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: &out_s,
+            chip: "mtk",
+            keep_out: true,
+            root: &dir,
+            logs_dir: &logs,
+        };
+        let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
+
+        assert_eq!(
+            out,
+            std::path::absolute(&out_path).unwrap(),
+            "a normal explicit --out is used as given"
+        );
+        assert_eq!(
+            crate::sha256::file_hex_upper(&src).unwrap(),
+            src_sha,
+            "the source is untouched"
+        );
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            std::fs::metadata(&src).unwrap().len()
+        );
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("[OUTPUT] "), "{text}");
+        assert!(text.contains("e2fsck=PASS"), "{text}");
+        assert!(
+            text.contains("APK_SHA256=") && !text.contains("APK_SHA256=UNVERIFIED"),
+            "the overlay must be verified through the default backend\n{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

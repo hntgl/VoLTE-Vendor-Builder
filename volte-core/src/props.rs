@@ -158,7 +158,7 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
         }
         let dump = format!("dump {vpath} {}", forward_slashes(&host));
         let mut quiet = Logger::new();
-        if ops.run(image, &[dump], td, &mut quiet).is_err() {
+        if ops.run_best_effort(image, &[dump], td, &mut quiet).is_err() {
             continue;
         }
         let big_enough = std::fs::metadata(&host)
@@ -252,7 +252,7 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
             ),
         ];
         let mut quiet = Logger::new();
-        let _ = ops.run(image, &cmds, td, &mut quiet);
+        let _ = ops.run_best_effort(image, &cmds, td, &mut quiet);
     }
     if changed == 0 {
         log.log("[WARN] Could not write the VoLTE show props (build.prop dump/write failed).");
@@ -269,7 +269,7 @@ pub fn identify(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger
         .map(|(src, name)| format!("dump -p {src} {}", forward_slashes(&td.join(name))))
         .collect();
     let mut quiet = Logger::new();
-    if ops.run(image, &cmds, td, &mut quiet).is_err() {
+    if ops.run_best_effort(image, &cmds, td, &mut quiet).is_err() {
         return String::new();
     }
     let mut blob: Vec<u8> = Vec::new();

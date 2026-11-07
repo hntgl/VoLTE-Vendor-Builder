@@ -74,9 +74,9 @@ fn dump_batch(image: &Path, td: &Path, vpaths: [String; 2], host: &Path, ops: &m
         format!("dump -p {} {dest}", vpaths[0]),
         format!("dump -p {} {dest}", vpaths[1]),
     ];
-    // Python swallows a failed dump and moves on to the next candidate name.
+    // Candidate paths are expected to be missing; both are probes.
     let mut quiet = Logger::new();
-    let _ = ops.run(image, &commands, td, &mut quiet);
+    let _ = ops.run_best_effort(image, &commands, td, &mut quiet);
 }
 
 /// `verify_payload` (`:1208`). Dump failures are not errors; a hash failure is.

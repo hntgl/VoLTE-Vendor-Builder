@@ -38,6 +38,8 @@ pub const CMD_FILE: &str = "hd_debugfs_cmds.txt";
 /// The two ext4 verbs the pipeline needs. Implemented by `DebugfsBackend`,
 /// mocked by callers that must not spawn a process.
 pub trait Ext4Ops {
+    /// Runs one command batch. A command that fails is a build error, so a
+    /// mutation that did not happen is never reported as success.
     fn run(
         &mut self,
         image: &Path,
@@ -45,6 +47,21 @@ pub trait Ext4Ops {
         workdir: &Path,
         log: &mut Logger,
     ) -> Result<String>;
+
+    /// Runs a probe batch whose failures are expected and ignored: candidate
+    /// dumps, property files that may not exist, cleanup entries that may be
+    /// absent. `debugfs -f` already continues after a failure, so the default
+    /// forwards to [`run`](Self::run); backends with a fail-fast `run` override
+    /// this with a per-command loop.
+    fn run_best_effort(
+        &mut self,
+        image: &Path,
+        commands: &[String],
+        workdir: &Path,
+        log: &mut Logger,
+    ) -> Result<String> {
+        self.run(image, commands, workdir, log)
+    }
 
     fn path_exists(&mut self, image: &Path, vpath: &str, workdir: &Path) -> Result<bool>;
 }
@@ -251,7 +268,7 @@ pub fn read_vendor_flag_bit(image: &Path, workdir: &Path, ops: &mut dyn Ext4Ops)
         "dump /build.prop hd_flg_build.prop".to_owned(),
     ];
     let mut sink = Logger::new();
-    let _ = ops.run(image, &commands, workdir, &mut sink);
+    let _ = ops.run_best_effort(image, &commands, workdir, &mut sink);
     flag_bit_from_dumps(workdir)
 }
 

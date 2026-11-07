@@ -55,7 +55,10 @@ pub fn link(
         }
         let command = format!("dump {vpath} {}", forward_slashes(&host));
         let mut quiet = Logger::new();
-        if ops.run(image, &[command], td, &mut quiet).is_err() {
+        if ops
+            .run_best_effort(image, &[command], td, &mut quiet)
+            .is_err()
+        {
             continue;
         }
         let big_enough = std::fs::metadata(&host)
