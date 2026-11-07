@@ -51,8 +51,11 @@ copy target\release\volte-cli.exe .
 volte-cli.exe <vendor.img> [--mtk | --qc] [--out <path>]
 ```
 
-Exit code `0` on success, `2` on error, matching the Python tool. Logs, the command
-list and the report go to `.\Logs\`, which is created on demand.
+Exit code `0` on success, `2` on error, matching the Python tool. A failed mandatory step
+fails the build: when `e2fsck -fn` reports an error the CLI exits `2` without printing any
+flashable line, and an AVB backend error degrades to the documented `AVB_HASHTREE=SKIP` path,
+never to a PASS claim. Logs, the command list and the report go to `.\Logs\`, which is
+created on demand.
 
 ## External tools
 

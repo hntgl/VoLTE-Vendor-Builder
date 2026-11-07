@@ -53,12 +53,33 @@ pub fn flag_note(nflag: i64) -> (u8, String, String) {
     (n, hit, tip)
 }
 
+/// Verdict of the mandatory `e2fsck -fn` step, rendered as the `e2fsck=` token.
+///
+/// Python only ever writes `PASS`; the port distinguishes the three real states
+/// so a failed or never-run check can never be rendered as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsckStatus {
+    NotRun,
+    Pass,
+    Fail,
+}
+
+impl FsckStatus {
+    pub fn token(self) -> &'static str {
+        match self {
+            FsckStatus::NotRun => "NOTRUN",
+            FsckStatus::Pass => "PASS",
+            FsckStatus::Fail => "FAIL",
+        }
+    }
+}
+
 /// The token block after the final size check (`:1721-1736`). `File=` and
 /// `Size=` are emitted by the pipeline first, before its own size check.
 pub struct Summary<'a> {
     pub out_path: &'a str,
     pub out_size: u64,
-    pub e2fsck: &'a str,
+    pub e2fsck: FsckStatus,
     pub avb_hashtree: &'a str,
     pub flags: u8,
     pub apk_sha256: Option<&'a str>,
@@ -67,10 +88,18 @@ pub struct Summary<'a> {
 }
 
 /// The summary lines in Python's order and spelling of the machine tokens.
+/// The flashability lines are derived from the verdicts, never from a constant.
 pub fn summary_lines(s: &Summary) -> Vec<String> {
     let mut lines = vec![
-        "[OK] EDL size matches - UnlockTool can flash it.".to_string(),
-        format!("{}{}", config::TOKEN_E2FSCK, s.e2fsck),
+        if s.e2fsck == FsckStatus::Pass {
+            "[OK] EDL size matches - UnlockTool can flash it.".to_string()
+        } else {
+            format!(
+                "[ERROR] e2fsck={} - the image is not confirmed flashable.",
+                s.e2fsck.token()
+            )
+        },
+        format!("{}{}", config::TOKEN_E2FSCK, s.e2fsck.token()),
         format!("{}{}", config::TOKEN_AVB_HASHTREE, s.avb_hashtree),
     ];
     if s.avb_hashtree == "SKIP" {
@@ -78,9 +107,13 @@ pub fn summary_lines(s: &Summary) -> Vec<String> {
             "[NOTE] AVB hashtree skipped - EDL + overlay; the device boots the original image (footer not truncated)."
                 .to_string(),
         );
-    } else {
+    } else if s.e2fsck == FsckStatus::Pass {
         lines.push(
             "[NOTE] STANDARD AVB hashtree PASS + matching size - safe to boot.".to_string(),
+        );
+    } else {
+        lines.push(
+            "[ERROR] AVB hashtree PASS but e2fsck did not pass - do not flash.".to_string(),
         );
     }
     lines.push(format!("{}{}", config::TOKEN_FLAGS, s.flags));
@@ -98,7 +131,12 @@ pub fn summary_lines(s: &Summary) -> Vec<String> {
 }
 
 /// `vendor_VolLTE_report.txt` (`:1740-1745`): six lines, LF terminated.
-pub fn report_body(out_path: &str, out_size: u64, e2fsck: &str, avb_hashtree: &str) -> String {
+pub fn report_body(
+    out_path: &str,
+    out_size: u64,
+    e2fsck: FsckStatus,
+    avb_hashtree: &str,
+) -> String {
     format!(
         "{}{}\n{}{}\n{}{}\n{}{}\n{}\n{}\n",
         config::TOKEN_FILE,
@@ -106,7 +144,7 @@ pub fn report_body(out_path: &str, out_size: u64, e2fsck: &str, avb_hashtree: &s
         config::TOKEN_SIZE,
         out_size,
         config::TOKEN_E2FSCK,
-        e2fsck,
+        e2fsck.token(),
         config::TOKEN_AVB_HASHTREE,
         avb_hashtree,
         config::TOKEN_AVB_ALGORITHM_NONE,
@@ -132,7 +170,7 @@ mod tests {
         Summary {
             out_path: "/out/vendor_VolLTE.img",
             out_size: 2 * 1024 * 1024,
-            e2fsck: "PASS",
+            e2fsck: FsckStatus::Pass,
             avb_hashtree: avb,
             flags: 1,
             apk_sha256: Some("abc"),
@@ -214,6 +252,29 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_fsck_is_never_rendered_as_flashable() {
+        let mut s = summary("PASS");
+        s.e2fsck = FsckStatus::Fail;
+        let lines = summary_lines(&s);
+        assert!(!lines.iter().any(|l| l.contains("[OK]")), "{lines:?}");
+        assert_eq!(
+            lines[0],
+            "[ERROR] e2fsck=FAIL - the image is not confirmed flashable."
+        );
+        assert_eq!(lines[1], "e2fsck=FAIL");
+        assert!(lines[3].contains("do not flash"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_never_run_fsck_is_never_rendered_as_flashable() {
+        let mut s = summary("PASS");
+        s.e2fsck = FsckStatus::NotRun;
+        let lines = summary_lines(&s);
+        assert_eq!(lines[1], "e2fsck=NOTRUN");
+        assert!(!lines.iter().any(|l| l.contains("[OK]")), "{lines:?}");
+    }
+
+    #[test]
     fn missing_hashes_omit_the_token_like_python_falsy_values() {
         let mut s = summary("PASS");
         s.apk_sha256 = None;
@@ -226,7 +287,7 @@ mod tests {
     #[test]
     fn report_body_is_the_six_line_python_file() {
         assert_eq!(
-            report_body("/out/vendor_VolLTE.img", 2 * 1024 * 1024, "FAIL", "SKIP"),
+            report_body("/out/vendor_VolLTE.img", 2 * 1024 * 1024, FsckStatus::Fail, "SKIP"),
             "File=/out/vendor_VolLTE.img\nSize=2097152\ne2fsck=FAIL\n\
              AVB_HASHTREE=SKIP\nAVB_ALGORITHM=NONE\nFLASH=NO\n"
         );

@@ -57,6 +57,7 @@ pub fn unsparse(src: &Path, dst: &Path) -> Result<Unsparse> {
     let file_hdr_sz = u16::from_le_bytes([head[8], head[9]]) as u64;
     let chunk_hdr_sz = u16::from_le_bytes([head[10], head[11]]) as u64;
     let blk_sz = u32::from_le_bytes([head[12], head[13], head[14], head[15]]) as u64;
+    let total_blks = u32::from_le_bytes([head[16], head[17], head[18], head[19]]) as u64;
     let total_chunks = u32::from_le_bytes([head[20], head[21], head[22], head[23]]);
     if magic != SPARSE_MAGIC {
         return Ok(Unsparse::NotSparse);
@@ -121,7 +122,24 @@ pub fn unsparse(src: &Path, dst: &Path) -> Result<Unsparse> {
         }
     }
 
+    let expected = total_blks
+        .checked_mul(blk_sz)
+        .ok_or_else(|| Error::build("sparse header declares an overflowing image size"))?;
+    if written != expected {
+        return Err(Error::build(format!(
+            "sparse chunks cover {written} bytes but the header declares {expected} \
+             ({total_blks} blocks x {blk_sz})"
+        )));
+    }
     out.flush()?;
+    let file = out.get_ref();
+    file.set_len(written)?;
+    let actual = file.metadata()?.len();
+    if actual != written {
+        return Err(Error::build(format!(
+            "sparse output is {actual} bytes after conversion, expected {written}"
+        )));
+    }
     Ok(Unsparse::Converted { written })
 }
 
@@ -257,6 +275,70 @@ mod tests {
             "DONT_CARE must stay a hole"
         );
         assert_eq!(&raw[4 * BLK as usize..], &tail_block[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_trailing_dont_care_chunk_extends_the_output() {
+        let dir = tmp("volte_sparse_trailing_hole");
+        let src = dir.join("image.sparse");
+        let dst = dir.join("image.raw");
+        std::fs::write(&src, build_sparse(&[Chunk::DontCare(4)])).unwrap();
+
+        assert_eq!(
+            unsparse(&src, &dst).unwrap(),
+            Unsparse::Converted { written: 4 * BLK as u64 }
+        );
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 4 * BLK as u64);
+        assert!(std::fs::read(&dst).unwrap().iter().all(|&b| b == 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_all_dont_care_image_is_zero_filled_to_the_declared_size() {
+        let dir = tmp("volte_sparse_all_holes");
+        let src = dir.join("image.sparse");
+        let dst = dir.join("image.raw");
+        std::fs::write(&src, build_sparse(&[Chunk::DontCare(2), Chunk::DontCare(3)])).unwrap();
+
+        assert_eq!(
+            unsparse(&src, &dst).unwrap(),
+            Unsparse::Converted { written: 5 * BLK as u64 }
+        );
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 5 * BLK as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_without_dont_care_keeps_the_exact_length() {
+        let dir = tmp("volte_sparse_no_holes");
+        let src = dir.join("image.sparse");
+        let dst = dir.join("image.raw");
+        let sp = build_sparse(&[
+            Chunk::Raw(vec![1u8; BLK as usize]),
+            Chunk::Fill([2, 3, 4, 5], 2),
+        ]);
+        std::fs::write(&src, &sp).unwrap();
+
+        assert_eq!(
+            unsparse(&src, &dst).unwrap(),
+            Unsparse::Converted { written: 3 * BLK as u64 }
+        );
+        assert_eq!(std::fs::metadata(&dst).unwrap().len(), 3 * BLK as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_header_size_that_the_chunks_do_not_cover_is_an_error() {
+        let dir = tmp("volte_sparse_size_mismatch");
+        let src = dir.join("image.sparse");
+        let dst = dir.join("image.raw");
+        let mut sp = build_sparse(&[Chunk::Raw(vec![0u8; BLK as usize]), Chunk::DontCare(1)]);
+        sp[16..20].copy_from_slice(&5u32.to_le_bytes());
+        std::fs::write(&src, &sp).unwrap();
+
+        let err = unsparse(&src, &dst).unwrap_err();
+        assert!(err.message().contains("header declares"), "{}", err);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

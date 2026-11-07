@@ -6,7 +6,7 @@ Status of the 30 ported mapping IDs (`..\reports\PYTHON_TO_RUST_MAPPING.md` §1 
 Status values: `pending` (not written yet), `ported` (code + unit test), `verified` (group test
 green and Step C re-measurement done), `diverges` (intentional, documented difference).
 
-Last measured: 2026-11-07 (`cargo test --workspace`: 151 passed in `volte-core`, 10 in `volte-cli`,
+Last measured: 2026-11-07 (`cargo test --workspace`: 163 passed in `volte-core`, 11 in `volte-cli`,
 0 failed, 0 ignored) **with `tool\debugfs.exe` absent**. The Phase 4 Step C evidence in
 `..\reports\` records the earlier count:
 `_p4_c_test1/2.txt` (10 + 130 passed, 0 ignored), `_p4_c_check1/2.txt`, `_p4_c_build1/2.txt`,
@@ -23,7 +23,7 @@ Last measured: 2026-11-07 (`cargo test --workspace`: 151 passed in `volte-core`,
 | 06 | `debugfs_exists` | `ext4_tools::Ext4Ops::path_exists` (`RustFsExt4Backend`) | verified |
 | 07 | `run_e2fsck` | `ext4_tools::Fsck::check` (`E2fsck`) | verified |
 | 08 | `is_sparse` | `sparse::is_sparse` | verified |
-| 09 | `unsparse` | `sparse::unsparse` | verified |
+| 09 | `unsparse` | `sparse::unsparse` | diverges |
 | 10 | `_parse_avbf` | `avb::parse_footer` | verified |
 | 11 | `avb_info_fast` | `avb::avb_info_fast` | verified |
 | 12 | `fit_avb_part` | `avb::fit_avb_part` | verified |
@@ -41,12 +41,12 @@ Last measured: 2026-11-07 (`cargo test --workspace`: 151 passed in `volte-core`,
 | 24 | `dump_device_props` | `props::identify` | verified |
 | 25 | `verify_payload` | `verify::verify_payload` | diverges |
 | 26 | `avb_module` | `avb::PythonAvbtool` | verified |
-| 27 | `rebuild_hashtree` | `avb::rebuild_hashtree` | verified |
+| 27 | `rebuild_hashtree` | `avb::rebuild_hashtree` | diverges |
 | 28 | `hue_avb_lines` | `report::avb_lines` | verified |
 | 29 | `build` | `pipeline::run` | diverges |
 | 30 | `main` | `volte_cli::{parse, build, run}` | diverges |
 
-Test counts behind the table: 151 unit/integration tests in `volte-core` and 10 in `volte-cli`
+Test counts behind the table: 163 unit/integration tests in `volte-core` and 11 in `volte-cli`
 (`cargo test`, 0 ignored); every module listed above carries at least four `#[test]` functions,
 the smallest being `env` (4) and `slot` (5).
 
@@ -62,6 +62,13 @@ tool output. The port writes UTF-8 bytes + LF and flushes per line, because V1.0
 UTF-8 console and the log text is English; `decode` keeps the cp1258/cp1252 fallback chain.
 The log file is still appended UTF-8 with LF, like `BuildLog` (`:346`).
 
+**ID 09 — `unsparse`.** Python seeks over a `DONT_CARE` chunk (`:504-507`) and never extends
+the output, so an image whose last chunk is a hole converts to a short file. The port calls
+`File::set_len(written)` after the chunk loop and then verifies the on-disk length, and it
+rejects a header whose `total_blks × blk_sz` differs from the bytes the chunks cover (Python
+logs the declared count and returns success). Both changes turn a short/corrupt conversion
+into an error instead of a silently truncated image (audit B01).
+
 **ID 25 — `verify_payload`.** Python treats a failed dump as success and then prints
 `[OK] ĐÃ XÁC NHẬN BẬT NÚT VOLTE THÀNH CÔNG` (`:1246`) with the `VERIFIED_APK_OK` /
 `VERIFIED_RC_OK` fallbacks (`:1240-1243`) and `VERIFIED_OK` in the exception path
@@ -69,7 +76,14 @@ The log file is still appended UTF-8 with LF, like `BuildLog` (`:346`).
 emits them: a failed dump yields `UNVERIFIED` plus a `[WARN]` line (verify.rs:8) and is never
 counted as PASS evidence. See AGENTS.md §8.
 
-**ID 29 — `build`.** Three differences. (a) The log file name is stamped in UTC
+**ID 27 — `rebuild_hashtree`.** Python checks `info.get("has_footer")` before `last_err`
+(`:1357-1372`), so an `avbtool.py` failure over an image with an old footer returns True and
+logs `[AVB] Rebuild hashtree completed.` The port propagates the backend `Err`, and on success
+hashes the vbmeta region before and after the call; an unchanged region is an error. A failed
+rebuild therefore ends in the documented `AVB_HASHTREE=SKIP` path, never a PASS claim
+(audit D01/N05).
+
+**ID 29 — `build`.** Four differences. (a) The log file name is stamped in UTC
 (`pipeline::log_stamp`, `SystemTime` + civil-from-days) whereas Python uses local time
 (`time.strftime` at `:1410`); the format `hue_chuan_%Y%m%d_%H%M%S` is identical, the offset is
 not, so a log filename taken from the two tools can differ by the UTC offset (UTC+7 on this
@@ -77,6 +91,11 @@ machine). std has no local-time formatter without FFI, and keeping std-only was 
 constraint. (b) Redundant `mkdir` commands are skipped through `Ext4Ops::path_exists`
 (the user-requested divergence of 2026-11-04, AGENTS.md §4.6), so the `mkdir` orphan-inode
 collision cannot occur. (c) Console and report text is English, per master prompt item 14.
+(d) A failed `e2fsck -fn` aborts the build (`[ERROR] e2fsck: …`, `e2fsck=FAIL`, exit code 2)
+before the AVB step, so no `[OK]`/flashable line or report file is produced. Python logs
+`e2fsck=FAIL` (`:1650-1655`) and still prints `[OK] EDL size matches - UnlockTool can flash
+it.`, then returns success. The port never calls an image flashable after a failed mandatory
+check (audit A04); there is no opt-out flag.
 
 **ID 30 — `main`.** `--gui`, or no image argument, exits with code 2 and
 `[ERROR] GUI is not part of V1.0 - pass a vendor.img path (see --help).` instead of starting

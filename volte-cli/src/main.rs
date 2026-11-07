@@ -192,15 +192,21 @@ fn build(a: &Args) -> i32 {
         logs_dir: &logs,
     };
 
-    match pipeline::run(&opts, &mut deps, &mut log, &mut progress) {
-        Ok(out) => {
-            println!("{}{}", config::TAG_OK, out.display());
-            0
-        }
-        Err(e) => {
-            println!("{}{}", config::TAG_ERROR, e.message());
-            2
-        }
+    let result = pipeline::run(&opts, &mut deps, &mut log, &mut progress);
+    match &result {
+        Ok(out) => println!("{}{}", config::TAG_OK, out.display()),
+        Err(e) => println!("{}{}", config::TAG_ERROR, e.message()),
+    }
+    exit_code(result)
+}
+
+/// Any pipeline error, including a failed mandatory `e2fsck`, is exit code 2
+/// (Python's `main` returns 2 for every `BuildError`).
+fn exit_code(result: volte_core::error::Result<PathBuf>) -> i32 {
+    if result.is_ok() {
+        0
+    } else {
+        2
     }
 }
 
@@ -323,5 +329,14 @@ mod tests {
         assert!(opens_gui(&a));
         let with_image = build_args(&["vendor.img", "--gui"]);
         assert!(opens_gui(&with_image), "Python ignores the image when --gui is set");
+    }
+
+    #[test]
+    fn a_pipeline_error_exits_non_zero() {
+        let failed: volte_core::error::Result<PathBuf> =
+            Err(volte_core::error::Error::build("e2fsck failed"));
+        assert_eq!(exit_code(failed), 2);
+        let ok: volte_core::error::Result<PathBuf> = Ok(PathBuf::from("out.img"));
+        assert_eq!(exit_code(ok), 0);
     }
 }

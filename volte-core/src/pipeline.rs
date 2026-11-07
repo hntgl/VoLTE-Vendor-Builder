@@ -493,18 +493,21 @@ pub fn run(
 
     log.log("e2fsck -fn");
     progress(78, "e2fsck");
-    let mut fsck_status = "PASS";
-    match deps.fsck.check(&work, td) {
+    let fsck_status = match deps.fsck.check(&work, td) {
         Ok(out) => {
             log_lines(log, &out);
             log.log("e2fsck=PASS");
+            report::FsckStatus::Pass
         }
         Err(e) => {
-            fsck_status = "FAIL";
-            log.log(format!("[WARN] e2fsck: {}", trunc(e.message(), 200)));
+            log.log(format!("[ERROR] e2fsck: {}", trunc(e.message(), 200)));
             log.log("e2fsck=FAIL");
+            return Err(Error::build(format!(
+                "e2fsck failed - refusing to report the image as flashable: {}",
+                trunc(e.message(), 200)
+            )));
         }
-    }
+    };
 
     let slot_size = orig_sz;
     let pre_avb = td.join("vendor_pre_avb.img");
@@ -712,6 +715,28 @@ mod tests {
         fn check(&mut self, image: &Path, workdir: &Path) -> Result<String> {
             self.calls += 1;
             self.inner.check(image, workdir)
+        }
+    }
+
+    struct AlwaysFailFsck {
+        calls: usize,
+    }
+
+    impl Fsck for AlwaysFailFsck {
+        fn check(&mut self, _image: &Path, _workdir: &Path) -> Result<String> {
+            self.calls += 1;
+            Err(Error::build("e2fsck simulated failure (exit 4)"))
+        }
+    }
+
+    struct FailingAvb {
+        calls: usize,
+    }
+
+    impl avb::Avb for FailingAvb {
+        fn add_hashtree_footer(&mut self, _req: &HashtreeRequest) -> Result<()> {
+            self.calls += 1;
+            Err(Error::build("simulated avbtool.py failure"))
         }
     }
 
@@ -1051,6 +1076,87 @@ mod tests {
             text.contains("APK_SHA256=") && !text.contains("APK_SHA256=UNVERIFIED"),
             "the overlay must be verified through the default backend\n{text}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_e2fsck_failure_fails_the_build_before_avb() {
+        let dir = tmp("volte_pipeline_fsck_fail");
+        let src = make_ext4(&dir, "vendor.img");
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = AlwaysFailFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+        let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert!(err.message().contains("e2fsck failed"), "{err}");
+        assert_eq!(fsck.calls, 1);
+        assert_eq!(avb.calls, 0, "the AVB step must not run after a failed fsck");
+        assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
+
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("e2fsck=FAIL"), "{text}");
+        assert!(!text.contains("[OK] EDL size matches"), "{text}");
+        assert!(!text.contains("AVB_HASHTREE="), "{text}");
+        assert!(!text.contains("FLASH=NO"), "{text}");
+        assert!(!text.contains("[OK] AVB"), "{text}");
+        assert!(!logs.join("vendor_VolLTE_report.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_avb_backend_failure_never_claims_a_passed_hashtree() {
+        let dir = tmp("volte_pipeline_avb_fail");
+        let src = make_ext4(&dir, "vendor.img");
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FailingAvb { calls: 0 };
+        let mut deps = Deps { ops: &mut ops, fsck: &mut fsck, avb: &mut avb };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
+        assert_eq!(avb.calls, 1);
+        assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            std::fs::metadata(&src).unwrap().len()
+        );
+
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("[WARN] AVB hashtree:"), "{text}");
+        assert!(text.contains("AVB_HASHTREE=SKIP"), "{text}");
+        assert!(!text.contains("AVB_HASHTREE=PASS"), "{text}");
+        assert!(!text.contains("Rebuild hashtree completed."), "{text}");
+        assert!(!text.contains("[OK] AVB hashtree + EDL size match"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

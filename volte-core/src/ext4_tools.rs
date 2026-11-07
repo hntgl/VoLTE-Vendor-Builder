@@ -159,7 +159,12 @@ impl Fsck for E2fsck {
     fn check(&mut self, image: &Path, workdir: &Path) -> Result<String> {
         let mut cmd = Command::new(&self.exe);
         cmd.arg("-fn").arg(image).current_dir(workdir);
-        let out = capture(&mut cmd, FSCK_TIMEOUT)?;
+        let out = capture(&mut cmd, FSCK_TIMEOUT).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("e2fsck ({}): {}", self.exe.display(), e.message()),
+            )
+        })?;
         let text = out.text();
         if out.code != 0 && out.code != 1 {
             return Err(Error::build(format!(
@@ -242,6 +247,17 @@ mod tests {
     fn e2fsck_falls_back_to_the_bare_name() {
         let fsck = E2fsck::new(Path::new(r"E:\no\such\tool"));
         assert_eq!(fsck.exe(), Path::new("e2fsck.exe"));
+    }
+
+    #[test]
+    fn a_missing_e2fsck_executable_is_an_error() {
+        let dir = tmp("volte_ext4_fsck_missing");
+        let img = make_ext4(&dir, "clean.img");
+        let mut fsck = E2fsck { exe: dir.join("no-such-e2fsck.exe") };
+        let err = fsck.check(&img, &dir).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert!(err.message().contains("e2fsck"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

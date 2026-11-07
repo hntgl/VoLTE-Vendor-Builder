@@ -6,6 +6,7 @@
 //! frozen parameters are exactly the ones the Python call passes.
 
 use std::collections::hash_map::RandomState;
+use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -329,16 +330,14 @@ impl Avb for PythonAvbtool {
     }
 }
 
-fn truncate_err(e: &Error) -> String {
-    e.message().chars().take(240).collect()
-}
-
 /// `rebuild_hashtree` (`:1271`).
 ///
-/// `Ok(Some(info))` means a footer was rebuilt (and the image was padded to the
-/// locked slot when needed); `Ok(None)` means the original footer/EXT4 tail must
-/// be kept — Python returns `False` in that case and the pipeline restores its
-/// pre-AVB snapshot.
+/// `Ok(Some(info))` means a footer was rebuilt, verified against the pre-call
+/// vbmeta region, and the image was padded to the locked slot when needed;
+/// `Ok(None)` means the hashtree did not fit and the original footer/EXT4 tail
+/// must be kept — Python returns `False` in that case and the pipeline restores
+/// its pre-AVB snapshot. `Err` means the backend failed or left the old footer
+/// untouched; it is never reported as success.
 pub fn rebuild_hashtree(
     image: &Path,
     info: &AvbInfo,
@@ -381,7 +380,6 @@ pub fn rebuild_hashtree(
     };
 
     log.log("[STATUS] Erasing old AVB footer...");
-    log.log("[OK] Old AVB footer removed.");
     log.log("[STATUS] Rebuilding AVB hashtree...");
     if lock > 0 {
         log.log(format!(
@@ -395,10 +393,26 @@ pub fn rebuild_hashtree(
         "[AVB] add_hashtree partition_size={} (attempt 1)",
         req.partition_size
     ));
-    let last_err = backend.add_hashtree_footer(&req).err();
+    let old_vbmeta = if info.has_footer && info.vbmeta_size > 0 {
+        Some(vbmeta_digest(image, info.vbmeta_offset, info.vbmeta_size)?)
+    } else {
+        None
+    };
+    backend.add_hashtree_footer(&req)?;
 
     let after = avb_info_fast(image)?;
     if after.has_footer {
+        if let Some(before) = old_vbmeta {
+            let unchanged = after.vbmeta_offset == info.vbmeta_offset
+                && after.vbmeta_size == info.vbmeta_size
+                && vbmeta_digest(image, after.vbmeta_offset, after.vbmeta_size)? == before;
+            if unchanged {
+                return Err(Error::build(
+                    "AVB backend returned Ok but the vbmeta region is unchanged - \
+                     the old footer was kept, so the rebuild is not verified",
+                ));
+            }
+        }
         let cur = std::fs::metadata(image)?.len();
         if lock > 0 && cur > lock {
             log.log(format!(
@@ -409,25 +423,56 @@ pub fn rebuild_hashtree(
         if lock > 0 && cur < lock {
             force_slot_size(image, lock, false, "AVB-PAD", log)?;
         }
+        log.log("[OK] Old AVB footer replaced.");
         log.log("[AVB] Rebuild hashtree completed.");
         for line in crate::report::avb_lines(&after) {
             log.log(line);
         }
         return Ok(Some(after));
     }
-    if let Some(e) = last_err {
-        log.log(format!("[WARN] {}", truncate_err(&e)));
-    }
     log.log("[WARN] Hashtree does not fit the slot - keeping the original EXT4 overlay.");
     log.log("[WARN] Could not create a real AVB footer - keeping the original footer (avoid bootloop).");
     Ok(None)
 }
 
+/// SHA-256 of a vbmeta region, used to prove a rebuild actually replaced the
+/// old footer. A re-written footer with a fresh salt always changes these bytes;
+/// an untouched region means the backend did not rebuild anything.
+fn vbmeta_digest(image: &Path, offset: u64, size: u64) -> Result<String> {
+    let mut f = File::open(image)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut hasher = crate::sha256::Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut left = size;
+    while left > 0 {
+        let n = (left as usize).min(buf.len());
+        f.read_exact(&mut buf[..n])?;
+        hasher.update(&buf[..n]);
+        left -= n as u64;
+    }
+    Ok(crate::sha256::hex_upper(&hasher.finish()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::rc::Rc;
+
+    struct SharedSink(Rc<RefCell<Vec<String>>>);
+
+    impl crate::logging::Sink for SharedSink {
+        fn emit(&mut self, line: &str) {
+            self.0.borrow_mut().push(line.to_owned());
+        }
+    }
+
+    fn catching_logger() -> (Logger, Rc<RefCell<Vec<String>>>) {
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        (Logger::new().with_sink(SharedSink(lines.clone())), lines)
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(name);
@@ -636,14 +681,93 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_keeps_original_when_backend_fails() {
+    fn a_failing_backend_is_an_error_and_keeps_the_image_untouched() {
         let dir = tmp("volte_avb_rebuild_fail");
         let p = plain_image(&dir, 2 * 1024 * 1024);
+        let before = std::fs::read(&p).unwrap();
         let info = avb_info_fast(&p).unwrap();
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        let out = rebuild_hashtree(&p, &info, 0, &mut NoopBackend, &mut log).unwrap();
-        assert!(out.is_none());
+        let err = rebuild_hashtree(&p, &info, 0, &mut NoopBackend, &mut log).unwrap_err();
+        assert!(err.message().contains("simulated avbtool failure"), "{err}");
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_backend_over_an_old_footer_is_never_reported_as_success() {
+        let dir = tmp("volte_avb_rebuild_fail_old_footer");
+        let p = image_with_footer(&dir, 0);
+        let info = avb_info_fast(&p).unwrap();
+        assert!(info.has_footer);
+        let (mut log, lines) = catching_logger();
+        rebuild_hashtree(&p, &info, 0, &mut NoopBackend, &mut log).unwrap_err();
+        let text = lines.borrow().join("\n");
+        assert!(!text.contains("Rebuild hashtree completed."), "{text}");
+        assert!(!text.contains("[OK] Old AVB footer"), "{text}");
+        assert!(!text.contains("[OK] AVB"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct RewriteFooter {
+        change_vbmeta: bool,
+    }
+
+    impl Avb for RewriteFooter {
+        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+            let size = req.partition_size;
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&req.image)?;
+            if self.change_vbmeta {
+                f.seek(SeekFrom::Start(1024 * 1024 + 8))?;
+                f.write_all(b"new")?;
+            }
+            f.seek(SeekFrom::Start(size - 64))?;
+            f.write_all(&footer_bytes(1, 0, 1024 * 1024, 1024 * 1024, 4096))?;
+            f.set_len(size)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_backend_that_returns_ok_without_rebuilding_is_an_error() {
+        let dir = tmp("volte_avb_rebuild_unchanged");
+        let p = image_with_footer(&dir, 0);
+        let info = avb_info_fast(&p).unwrap();
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let err = rebuild_hashtree(
+            &p,
+            &info,
+            0,
+            &mut RewriteFooter { change_vbmeta: false },
+            &mut log,
+        )
+        .unwrap_err();
+        assert!(err.message().contains("unchanged"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_verified_rebuild_reports_the_new_footer() {
+        let dir = tmp("volte_avb_rebuild_verified");
+        let p = image_with_footer(&dir, 0);
+        let info = avb_info_fast(&p).unwrap();
+        let (mut log, lines) = catching_logger();
+        let out = rebuild_hashtree(
+            &p,
+            &info,
+            0,
+            &mut RewriteFooter { change_vbmeta: true },
+            &mut log,
+        )
+        .unwrap()
+        .expect("footer rebuilt");
+        assert!(out.has_footer);
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("[OK] Old AVB footer replaced."), "{text}");
+        assert!(text.contains("[AVB] Rebuild hashtree completed."), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
