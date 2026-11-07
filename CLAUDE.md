@@ -63,12 +63,3 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
-
-## 5. Project notes (VoLTE-Vendor-Builder)
-
-- One EXT4 engine only: the in-process `rust-fs-ext4` backend. `debugfs`/`DebugfsBackend` was
-  removed after the Đợt 2.5 parity check; do not reintroduce a lenient external engine.
-- Hashtree rebuilds pass `--do_not_generate_fec`, so rebuilt footers show `FEC num roots: 0`.
-  That is the frozen Python parameter set, not a regression.
-- Known limitation: `rust-fs-ext4` does not update superblock `s_mtime` / `Lifetime writes`.
-  `e2fsck` remains clean; do not describe the pipeline as refreshing all superblock metadata.
