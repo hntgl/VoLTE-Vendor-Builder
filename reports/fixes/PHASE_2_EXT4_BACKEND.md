@@ -4,6 +4,7 @@
 **Nhánh:** `ai2/fix-audit-findings`
 **Baseline của đợt:** `1075c60` (Đợt 1: báo cáo PHASE_1_SOURCE_PROTECTION)
 **Commit của đợt:** `ac54ad33f4c2c5be3c5cf2e33574d2cef9ee0f60` (`ac54ad3`)
+**Commit bổ sung (chốt trước Đợt 2.5):** `01cb647` — test `ea_set` với host path có dấu cách
 **Trạng thái đợt:** HOÀN THÀNH — dừng chờ người dùng xác nhận trước Đợt 2.5
 
 ---
@@ -46,6 +47,54 @@ end-to-end cho Đợt 2.
 `g02_flags_case_alias_bypasses_same_path` → `g02_flags_case_alias_patches_in_place` trong
 `C:\Users\HNTCPR\AppData\Local\Temp\volte_audit_repro\tests\repro.rs:111`. Chỉ đổi tên hàm; nội dung
 và assertion giữ nguyên. Harness chạy lại: test PASS.
+
+## Bổ sung theo yêu cầu người dùng (chốt trước Đợt 2.5)
+
+**2.3. Test `ea_set` với host path chứa dấu cách.**
+
+Trước bổ sung này, C02 mới chỉ có test cho `write` + `dump`
+(`host_paths_with_spaces_and_non_ascii_survive_write_and_dump`). `ea_set -f` là verb thứ ba có host
+path tự do và là nhánh parser khó nhất (bóc `attr` rồi `name` từ cuối chuỗi), nên đã thêm:
+
+`rustfs_ext4::ea_set_accepts_a_host_path_with_spaces` (`volte-core/src/rustfs_ext4.rs:660`).
+Test tạo ảnh EXT4 thật, đặt trong workdir `audit dir`:
+
+- `payload file.apk` (nội dung `apk bytes`) → ghi vào ảnh qua `write`;
+- `overlay label.bin` chứa nhãn `u:object_r:vendor_overlay_file:s0\0` → gán qua
+  `ea_set -f <host có dấu cách> payload.apk security.selinux`.
+
+Sau batch, test mount ảnh read-only, `lookup_path_bytes(b"/payload.apk")`, đọc raw inode và khẳng định
+chuỗi nhãn xuất hiện trong vùng xattr của inode. Nhãn chỉ có thể vào ảnh qua `ea_set`, nên test không
+thể PASS nếu host path bị cắt tại dấu cách (parser cũ `split_whitespace` sẽ tách host thành
+`...\audit` + `dir\overlay` + `label.bin`, và lệnh `ea_set` không đọc được file nhãn).
+
+Kết quả: `cargo test --offline -p volte-core ea_set_accepts_a_host_path_with_spaces` → **PASS**
+(1 passed, 1.04 s).
+
+**2.4. `DebugfsBackend` giữ lenient là quyết định có chủ đích — không phải bỏ sót.**
+
+`DebugfsBackend::run` và `run_best_effort` **cố ý không** được đồng bộ sang fail-closed như
+`RustFsExt4Backend::run`. Lý do:
+
+1. `DebugfsBackend` là backend tạm thời, sẽ bị **xoá ở Đợt 2.5** cùng `debugfs.exe`; đầu tư sửa hành
+   vi của nó chỉ tạo thêm bề mặt phải kiểm chứng rồi vứt bỏ.
+2. Nó phải giữ **nguyên hành vi baseline** để làm oracle: nếu sửa nó sang strict, ảnh oracle sẽ được
+   tạo bởi một backend khác với bản đã sinh ra output được audit — mất giá trị tham chiếu.
+3. Hành vi lenient của nó khớp đúng `debugfs -f` (tiếp tục sau lỗi), nên nó phản ánh trung thực
+   công cụ đang được thay thế.
+
+**2.5. Cam kết về tiêu chuẩn so sánh của Đợt 2.5.**
+
+Đợt 2.5 **sẽ không** dùng `DebugfsBackend::run`/`run_best_effort` (lenient, luôn `Ok` kèm text) làm
+tiêu chuẩn "thành công" hay tiêu chuẩn so sánh sai lệch. Cụ thể:
+
+- Ảnh oracle chỉ được dùng làm **tham chiếu nội dung cuối cùng**, không dùng giá trị trả về của
+  `DebugfsBackend` làm bằng chứng thành công.
+- Build oracle phải được xác nhận độc lập: rc của `e2fsck`, đọc lại ảnh bằng đường đọc riêng
+  (`debugfs dump` / mount read-only của `rust-fs-ext4`), hash từng file, mode/uid/gid, xattr SELinux.
+- Nếu log/text của batch debugfs có bất kỳ lỗi lệnh nào, phép so sánh bị đánh dấu **BLOCKED** và không
+  được báo "parity PASS"; tuyệt đối không lấy "debugfs trả `Ok`" để bỏ qua lỗi.
+- So sánh là **trạng thái ảnh cuối** giữa hai backend, không so sánh return value hay text output.
 
 ## 2. Finding được xử lý
 
@@ -100,7 +149,7 @@ và assertion giữ nguyên. Harness chạy lại: test PASS.
 
 | File | Thay đổi |
 |---|---|
-| `volte-core/src/rustfs_ext4.rs` | parser theo verb; `run` fail-closed; override `run_best_effort`; `open_session`; `rm` idempotent; +7 test mới, 1 test cũ viết lại |
+| `volte-core/src/rustfs_ext4.rs` | parser theo verb; `run` fail-closed; override `run_best_effort`; `open_session`; `rm` idempotent; +8 test mới (7 đợt chính + 1 bổ sung `ea_set`), 1 test cũ viết lại |
 | `volte-core/src/ext4.rs` | thêm method default `run_best_effort` vào trait; `read_vendor_flag_bit` dùng probe |
 | `volte-core/src/pipeline.rs` | clean batch dùng probe; +1 test end-to-end `--out` tường minh |
 | `volte-core/src/props.rs` | 3 call site dump/`ea_set` chuyển sang probe |
@@ -127,7 +176,7 @@ và assertion giữ nguyên. Harness chạy lại: test PASS.
 
 ## 8. Regression tests mới (chạy qua `RustFsExt4Backend`)
 
-Tổng: **+7 test** so với baseline (157 → 164).
+Tổng: **+8 test** so với baseline (157 → 165).
 
 | Test | Nội dung |
 |---|---|
@@ -137,6 +186,7 @@ Tổng: **+7 test** so với baseline (157 → 164).
 | `rustfs_ext4::removing_an_absent_path_is_idempotent` | `rm` path vắng không chặn batch (cleanup hợp lệ) |
 | `rustfs_ext4::best_effort_reports_failures_and_keeps_going` | probe batch báo lỗi trong output và chạy tiếp (viết lại từ test cũ) |
 | `rustfs_ext4::host_paths_with_spaces_and_non_ascii_survive_write_and_dump` | workdir `audit dir\thư mục làm việc`, host `seed file.prop` → write + dump đúng nội dung |
+| `rustfs_ext4::ea_set_accepts_a_host_path_with_spaces` | host `audit dir\overlay label.bin` → `ea_set -f ... security.selinux`; nhãn đọc lại từ inode (yêu cầu 2.3) |
 | `rustfs_ext4::props_upsert_works_from_a_work_directory_with_spaces` | `props::upsert` trên workdir có dấu cách trả đủ 75 thay đổi và prop nằm trong ảnh |
 | `pipeline::an_explicit_out_path_that_differs_from_the_source_is_accepted` | build đầy đủ qua backend mặc định với `--out` tường minh (yêu cầu 2.1) |
 
@@ -174,8 +224,9 @@ khi sửa là dấu hiệu bug không còn tái hiện.
 ```
 cargo check --offline --workspace --all-targets                      → PASS
 cargo clippy --offline --workspace --all-targets -- -D warnings     → PASS, 0 cảnh báo
-cargo test --offline --workspace                                     → 10 CLI + 154 core = 164 PASS, 0 FAIL
-cargo test --offline -p volte-core rustfs_ext4::                     → 11 PASS
+cargo test --offline --workspace                                     → 10 CLI + 155 core = 165 PASS, 0 FAIL
+cargo test --offline -p volte-core rustfs_ext4::                     → 12 PASS
+cargo test --offline -p volte-core ea_set_accepts_a_host_path_...    → 1 PASS
 cargo test --offline -p volte-core an_explicit_out_path_...          → 1 PASS
 cargo fmt --check                                                    → 112 diff block (xem §12)
 cargo test --offline --test repro -- --test-threads=1 (ngoài repo)   → 7 PASS, 4 FAIL (kỳ vọng)
@@ -183,7 +234,8 @@ cargo test --offline --test repro -- --test-threads=1 (ngoài repo)   → 7 PASS
 
 ## 11. Kết quả thực tế
 
-- Test: **164 PASS / 0 FAIL** (157 → 164, +7).
+- Test: **165 PASS / 0 FAIL** (157 → 165, +8; 155 core + 10 CLI).
+- `ea_set_accepts_a_host_path_with_spaces` (bổ sung sau xác nhận): PASS 1/1, 1.04 s.
 - `an_explicit_out_path_that_differs_from_the_source_is_accepted` chạy thật toàn pipeline qua
   `RustFsExt4Backend` + `e2fsck.exe` thật: PASS (44 s), chứng minh strict `run` không chặn build hợp lệ.
 - `cargo fmt --check`: **112 diff block**. Baseline `1075c60` đo bằng `git worktree` riêng: **113**.
@@ -209,8 +261,8 @@ cargo test --offline --test repro -- --test-threads=1 (ngoài repo)   → 7 PASS
 - Pipeline vẫn chỉ `[WARN]` khi `init_rc::link`/`props::upsert` thất bại (B01/A04) — thuộc Đợt 3/4.
 - Parser vẫn giả định tên file trong ảnh và `vpath` không chứa dấu cách (đúng với mọi lệnh pipeline
   sinh ra); chỉ host path là trường tự do.
-- `DebugfsBackend` vẫn lenient (đúng vai trò oracle); sau 2.5 khi gỡ `debugfs.exe` cần rà lại mọi
-  caller còn dùng `run_best_effort`.
+- `DebugfsBackend` vẫn lenient — quyết định có chủ đích (§2.4), vì nó chỉ còn vai trò oracle và sẽ bị
+  xoá ở Đợt 2.5; sau 2.5 cần rà lại mọi caller còn dùng `run_best_effort`.
 
 ## 14. Ảnh hưởng đến Python reference
 
@@ -224,6 +276,8 @@ cargo test --offline --test repro -- --test-threads=1 (ngoài repo)   → 7 PASS
 
 - Code + test: `ac54ad33f4c2c5be3c5cf2e33574d2cef9ee0f60` (`ac54ad3`)
   `Đợt 2: backend EXT4 báo lỗi thật và xử lý host path có dấu cách (C01/C02)`
+- Test bổ sung: `01cb647`
+  `Đợt 2: thêm regression test ea_set với host path có dấu cách`
 - Baseline: `1075c60`
 
 ## 16. Kết luận đợt
