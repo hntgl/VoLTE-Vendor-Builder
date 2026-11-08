@@ -342,12 +342,6 @@ impl Sink for FileSink {
     }
 }
 
-impl Drop for FileSink {
-    fn drop(&mut self) {
-        self.file = None;
-    }
-}
-
 /// Collects lines in memory (the Python `sink` callback, used by tests).
 #[derive(Default)]
 pub struct MemorySink {
