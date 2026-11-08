@@ -16,7 +16,7 @@ use crate::logging::Logger;
 use crate::profile;
 
 /// The 21 MTK / 8 QC candidates in Python's order (shared tail included).
-pub fn candidate_vpaths(needles: &[&str]) -> Vec<&'static str> {
+pub(crate) fn candidate_vpaths(needles: &[&str]) -> Vec<&'static str> {
     let mut vpaths: Vec<&'static str> = Vec::new();
     if needles.iter().any(|n| n.contains(config::RC_NAME_MTK)) {
         vpaths.extend(profile::INIT_VPATHS_MTK);

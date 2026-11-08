@@ -30,7 +30,7 @@ use crate::profile;
 
 /// `payload_dirs`: `payload\` → `tool\payload\` → root → `vendor_fix_payload\`,
 /// existing directories only, de-duplicated in that order.
-pub fn payload_dirs(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn payload_dirs(root: &Path) -> Vec<PathBuf> {
     let mut seen: Vec<PathBuf> = Vec::new();
     for cand in [
         root.join("payload"),
@@ -46,7 +46,7 @@ pub fn payload_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// `payload_file`: first directory that holds `name`.
-pub fn payload_file(root: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn payload_file(root: &Path, name: &str) -> Option<PathBuf> {
     for dir in payload_dirs(root) {
         let p = dir.join(name);
         if p.is_file() {
@@ -57,7 +57,7 @@ pub fn payload_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// `payload_required`: same lookup, but a missing file is a build error.
-pub fn payload_required(root: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn payload_required(root: &Path, name: &str) -> Result<PathBuf> {
     payload_file(root, name).ok_or_else(|| {
         Error::new(
             crate::error::ErrorKind::Missing,

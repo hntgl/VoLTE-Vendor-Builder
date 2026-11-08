@@ -181,7 +181,7 @@ pub const FLAG_PAIRS: [(&[u8], &[u8]); 65] = [
 /// `_prop_boundary`: a match is accepted only when the preceding byte is not
 /// part of a property name. Note `i == 0` returns true — including at the start
 /// of every 16 MiB window, which is how Python behaves.
-pub fn prop_boundary(buf: &[u8], i: usize) -> bool {
+pub(crate) fn prop_boundary(buf: &[u8], i: usize) -> bool {
     if i == 0 {
         return true;
     }

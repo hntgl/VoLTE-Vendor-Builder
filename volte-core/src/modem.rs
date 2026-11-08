@@ -402,12 +402,12 @@ impl Fat16Image {
         })
     }
 
-    pub fn cluster_size(&self) -> u32 {
+    pub(crate) fn cluster_size(&self) -> u32 {
         self.cluster_size
     }
 
     /// The 8-byte OEM id in the boot sector, trimmed of spaces/NUL.
-    pub fn oem_label(&self) -> String {
+    pub(crate) fn oem_label(&self) -> String {
         latin1_decode(&self.oem)
             .trim_end_matches(['\u{0}', ' '])
             .to_string()
@@ -730,14 +730,14 @@ impl Fat16Image {
         })
     }
 
-    pub fn read_file(&self, entry: &Entry) -> Vec<u8> {
+    pub(crate) fn read_file(&self, entry: &Entry) -> Vec<u8> {
         self.read_clusters(entry.cluster, entry.size as usize)
     }
 
     /// Rewrites `entry`'s content, growing/shrinking its cluster chain as
     /// needed, and updates its directory slot (size + first cluster) in
     /// place. Returns the entry with the new cluster/size.
-    pub fn write_file(&mut self, entry: &Entry, blob: &[u8]) -> Result<Entry> {
+    pub(crate) fn write_file(&mut self, entry: &Entry, blob: &[u8]) -> Result<Entry> {
         let need = if blob.is_empty() {
             0
         } else {
@@ -835,7 +835,7 @@ impl Fat16Image {
 
     /// Finds a usable (>1000 byte) Viettel `mcfg_sw.mbn` under `sea` or
     /// `row`. Returns the entry plus the relative path it was found at.
-    pub fn find_viettel_mbn(&self) -> (Option<Entry>, String) {
+    pub(crate) fn find_viettel_mbn(&self) -> (Option<Entry>, String) {
         let base = match self.find(&BASE_PARTS) {
             Some(b) if b.is_dir() => b,
             _ => return (None, String::new()),
@@ -880,7 +880,7 @@ impl Fat16Image {
         (None, String::new())
     }
 
-    pub fn list_sea_carriers(&self) -> Vec<String> {
+    pub(crate) fn list_sea_carriers(&self) -> Vec<String> {
         let base = match self.find(&BASE_PARTS) {
             Some(b) if b.is_dir() => b,
             _ => return Vec::new(),
@@ -1031,7 +1031,7 @@ fn log_post_build_notes(log: &mut Logger, is_fix: bool) {
 
 /// SCAN MODEM PROFILES: lists carriers / Viettel MBN / oem_sw.txt without
 /// writing anything.
-pub fn scan_modem_profiles(src: &Path, log: &mut Logger) -> Result<ScanReport> {
+pub(crate) fn scan_modem_profiles(src: &Path, log: &mut Logger) -> Result<ScanReport> {
     let data = std::fs::read(src)?;
     let data_len = data.len();
     let fat = Fat16Image::new(data).map_err(|_| Error::bad_magic(BAD_FAT_MSG))?;

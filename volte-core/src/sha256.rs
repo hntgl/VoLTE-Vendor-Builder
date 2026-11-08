@@ -45,7 +45,7 @@ impl Sha256 {
         }
     }
 
-    pub fn update(&mut self, mut data: &[u8]) {
+    pub(crate) fn update(&mut self, mut data: &[u8]) {
         self.total = self.total.wrapping_add(data.len() as u64);
         if self.buf_len > 0 {
             let take = (64 - self.buf_len).min(data.len());

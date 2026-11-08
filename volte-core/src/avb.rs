@@ -99,7 +99,7 @@ impl AvbInfo {
 
 /// `_parse_avbf`: the 36-byte big-endian footer prefix, with the same size
 /// constraints. `footer_end` is where the footer is assumed to end.
-pub fn parse_footer(blob: &[u8], footer_end: u64) -> Option<AvbFooter> {
+pub(crate) fn parse_footer(blob: &[u8], footer_end: u64) -> Option<AvbFooter> {
     if blob.len() < FOOTER_LEN || blob[..4] != AVB_MAGIC {
         return None;
     }
@@ -557,7 +557,7 @@ pub fn avb_info_fast(path: &Path) -> Result<AvbInfo> {
 }
 
 /// `tree_size` inside `fit_avb_part`: total hashtree bytes for a partition.
-pub fn tree_size(mut size: u64) -> u64 {
+pub(crate) fn tree_size(mut size: u64) -> u64 {
     let mut total = 0u64;
     while size > BLOCK {
         let num_blocks = size.div_ceil(BLOCK);
@@ -570,7 +570,7 @@ pub fn tree_size(mut size: u64) -> u64 {
 
 /// `fit_avb_part` (`:608`): smallest MiB-aligned partition that holds the
 /// image plus hashtree, vbmeta and footer; 48 rounds then a 64 MiB fallback.
-pub fn fit_avb_part(img_sz: u64, hint: u64) -> u64 {
+pub(crate) fn fit_avb_part(img_sz: u64, hint: u64) -> u64 {
     let mut need = hint.max(img_sz);
     for _ in 0..48 {
         need = need.div_ceil(1048576) * 1048576;
@@ -591,7 +591,7 @@ pub fn fit_avb_part(img_sz: u64, hint: u64) -> u64 {
 /// 32 bytes from the OS CSPRNG as lower-case hex (`os.urandom(32).hex()`).
 /// A failing entropy source aborts the build instead of falling back to a
 /// predictable salt.
-pub fn random_salt_hex() -> Result<String> {
+pub(crate) fn random_salt_hex() -> Result<String> {
     let mut out = [0u8; 32];
     getrandom::fill(&mut out)
         .map_err(|e| Error::build(format!("cannot read the OS random source: {e}")))?;
@@ -615,7 +615,7 @@ pub struct HashtreeRequest {
 
 impl HashtreeRequest {
     /// CLI form of the same arguments, for `avbtool.py add_hashtree_footer`.
-    pub fn cli_args(&self) -> Vec<String> {
+    pub(crate) fn cli_args(&self) -> Vec<String> {
         let mut args = vec![
             "add_hashtree_footer".to_string(),
             "--image".to_string(),
