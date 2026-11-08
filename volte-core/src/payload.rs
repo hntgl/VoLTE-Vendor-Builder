@@ -6,6 +6,20 @@
 //! intentionally different: it removes each candidate by absolute path instead
 //! of `cd`-ing into a directory first, so a missing directory cannot leave the
 //! shell at `/` and turn the following `rm` into a no-op.
+//!
+//! Divergence of 2026-11-08: the clean list no longer removes the retired
+//! `HD_OPPO_MTK_`/`HD_OPPO_QC_` OEM overlay apk names. Those only ever existed
+//! on a vendor image previously patched by the old Python/C# tools; on a
+//! stock vendor image (this project's only target now) they never exist, so
+//! the `rm` was always a harmless best-effort no-op there. Removed by
+//! request to keep the command list minimal for stock-only builds.
+//!
+//! Divergence of 2026-11-08 (follow-up): the second overlay apk copy under
+//! `/overlay/HDVoLTE/` was dropped. `HDVoLTE` was confirmed by the user to be
+//! an arbitrary folder name the previous tool author invented, not an OPPO
+//! firmware requirement — AOSP's overlay scanner only needs one canonical
+//! copy at `/overlay/<apk_name>`. Only that copy is now written, cleaned and
+//! verified.
 
 use std::path::{Path, PathBuf};
 
@@ -90,17 +104,11 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
     std::fs::copy(payload_required(root, "config.bin")?, td.join("config.bin"))?;
 
     let clean: Vec<String> = [
-        "rm /overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk",
-        "rm /overlay/HDVoLTE/HD_OPPO_MTK_VoLTE_Overlay.apk",
-        "rm /overlay/HDVoLTE/HD_OPPO_QC_VoLTE_Overlay.apk",
         "rm /overlay/OPPO_VoLTE_Overlay.apk",
-        "rm /overlay/HD_OPPO_MTK_VoLTE_Overlay.apk",
-        "rm /overlay/HD_OPPO_QC_VoLTE_Overlay.apk",
-        "rmdir /overlay/HDVoLTE",
-        "rm /etc/init/hd_oppo_mtk_volte.rc",
-        "rm /etc/init/hd_oppo_qc_volte.rc",
-        "rm /etc/init/hw/hd_oppo_qc_volte.rc",
-        "rm /etc/init/hw/hd_oppo_mtk_volte.rc",
+        "rm /etc/init/oppo_mtk_volte.rc",
+        "rm /etc/init/oppo_qc_volte.rc",
+        "rm /etc/init/hw/oppo_qc_volte.rc",
+        "rm /etc/init/hw/oppo_mtk_volte.rc",
         "mkdir /overlay",
         "mkdir /etc",
         "mkdir /etc/init",
@@ -110,20 +118,7 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
     .map(|s| s.to_string())
     .collect();
 
-    let ovdir = "HDVoLTE";
     let mut write = vec![
-        format!("mkdir /overlay/{ovdir}"),
-        format!("cd /overlay/{ovdir}"),
-        format!("write {} {}", forward_slashes(&payload_apk), apk_name),
-        format!("set_inode_field {apk_name} mode 0x81A4"),
-        format!("set_inode_field {apk_name} uid 0"),
-        format!("set_inode_field {apk_name} gid 0"),
-        format!("ea_set -f overlay.bin {apk_name} security.selinux"),
-        "cd /overlay".to_string(),
-        format!("set_inode_field {ovdir} mode 0x41ED"),
-        format!("set_inode_field {ovdir} uid 0"),
-        format!("set_inode_field {ovdir} gid 2000"),
-        format!("ea_set -f overlay.bin {ovdir} security.selinux"),
         "cd /overlay".to_string(),
         format!("write {} {}", forward_slashes(&payload_apk), apk_name),
         format!("set_inode_field {apk_name} mode 0x81A4"),
@@ -268,14 +263,18 @@ mod tests {
     }
 
     #[test]
+    // Divergence of 2026-11-08: the clean list no longer removes the retired
+    // HD_OPPO_MTK_/HD_OPPO_QC_ OEM overlay names (the user only targets stock
+    // vendor images, which never had them), so the count is 4 lower than the
+    // original Python tool's.
     fn qc_command_counts_match_python() {
         let root = tmp("volte_overlay_qc");
         let td = root.join("work");
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, false);
         let plan = overlay_commands(&root, &td, true).unwrap();
-        assert_eq!(plan.clean.len(), 15, "clean commands");
-        assert_eq!(plan.write.len(), 38, "write commands");
+        assert_eq!(plan.clean.len(), 9, "clean commands");
+        assert_eq!(plan.write.len(), 26, "write commands");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -286,12 +285,12 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, true);
         let plan = overlay_commands(&root, &td, false).unwrap();
-        assert_eq!(plan.clean.len(), 15, "clean commands");
-        assert_eq!(plan.write.len(), 44, "write commands");
+        assert_eq!(plan.clean.len(), 9, "clean commands");
+        assert_eq!(plan.write.len(), 32, "write commands");
         assert!(
             plan.write
                 .iter()
-                .any(|c| c.contains("write") && c.ends_with("hd_oppo_qc_volte.rc")),
+                .any(|c| c.contains("write") && c.ends_with("oppo_qc_volte.rc")),
             "MTK must also write the QC RC"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -329,17 +328,19 @@ mod tests {
         let plan = overlay_commands(&root, &td, true).unwrap();
         let all = plan.clean.join("\n") + "\n" + &plan.write.join("\n");
         assert!(all.contains("set_inode_field OPPO_VoLTE_Overlay.apk mode 0x81A4"));
-        assert!(all.contains("set_inode_field HDVoLTE mode 0x41ED"));
-        assert!(all.contains("set_inode_field HDVoLTE gid 2000"));
         assert!(all.contains("ea_set -f overlay.bin OPPO_VoLTE_Overlay.apk security.selinux"));
-        assert!(all.contains("ea_set -f config.bin hd_oppo_qc_volte.rc security.selinux"));
+        assert!(all.contains("ea_set -f config.bin oppo_qc_volte.rc security.selinux"));
         assert!(all.contains("mkdir /etc/permissions"));
+        assert!(
+            !all.contains("HDVoLTE"),
+            "the retired second overlay copy must be gone: {all}"
+        );
         assert_eq!(
             plan.write
                 .iter()
                 .filter(|c| c.starts_with("ea_set "))
                 .count(),
-            6
+            4
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -351,11 +352,11 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, false, false);
         let qc = overlay_commands(&root, &td, true).unwrap();
-        assert_eq!(qc.write.len(), 30);
-        assert!(!qc.write.iter().any(|c| c.contains("hd_volte_features.xml")));
+        assert_eq!(qc.write.len(), 18);
+        assert!(!qc.write.iter().any(|c| c.contains("volte_features.xml")));
         std::fs::write(root.join("payload").join(config::RC_NAME_QC), b"qc rc").unwrap();
         let mtk = overlay_commands(&root, &td, false).unwrap();
-        assert_eq!(mtk.write.len(), 36);
+        assert_eq!(mtk.write.len(), 24);
         let _ = std::fs::remove_dir_all(&root);
     }
 

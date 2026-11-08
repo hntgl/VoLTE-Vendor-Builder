@@ -19,15 +19,26 @@ VoLTE-Vendor-Builder/
 ├── tests/                reserved for gate evidence (currently empty)
 ├── tool/                 bundled runtime: e2fsck.exe, mke2fs.exe,
 │                         avbtool.py, Python 3.10, MSYS/Cygwin DLLs, etc\mke2fs.conf
-└── payload/              OPPO_VoLTE_Overlay.apk, hd_oppo_{mtk,qc}_volte.rc,
-                          hd_volte_features.xml, overlay.bin, config.bin
+└── payload/              OPPO_VoLTE_Overlay.apk, oppo_{mtk,qc}_volte.rc,
+                          volte_features.xml, overlay.bin, config.bin
 ```
 
-The tree is standalone for testing and running: `tool\` and `payload\` are copies of
+The tree is standalone for testing and running: `tool\` and `payload\` started as copies of
 `..\VoLTE\vendor_patcher\tool\` and the payload files (`__pycache__` directories were
 the only entries left out), except that `tool\debugfs.exe` was intentionally removed after
 the Đợt 2.5 parity check. Neither the test suite nor the binary reads anything from the
 original repository.
+
+The two `.rc` payload files and the features XML were renamed on 2026-11-08, dropping the
+`hd_` prefix the original Python tool used (`hd_oppo_mtk_volte.rc` → `oppo_mtk_volte.rc`,
+`hd_oppo_qc_volte.rc` → `oppo_qc_volte.rc`, `hd_volte_features.xml` → `volte_features.xml`).
+This is a deliberate, user-requested rename, not a port divergence: the new names are what
+`volte-core` now writes into the vendor partition and imports from `init.target.rc`, and
+`docs/PORT_STATUS.md` (ID 30) and `volte-core/src/profile.rs` record it. `config.bin` and
+`overlay.bin` were intentionally left unrenamed — they are host-side SELinux-label source
+files, never written into the vendor image under those names. The historical fix reports
+under `reports/fixes/` describe the pre-rename state and were left as-is; they are an audit
+trail, not current documentation.
 
 ## Build and test
 
@@ -53,7 +64,7 @@ Target: `x86_64-pc-windows-msvc`, stable toolchain, no nightly, no `rust-toolcha
 ```bat
 cargo build --release
 copy target\release\volte-cli.exe .
-volte-cli.exe <vendor.img> [--mtk | --qc] [--out <path>]
+volte-cli.exe vendor <vendor.img> [--mtk | --qc] [--out <path>]
 ```
 
 Exit code `0` on success and for `--help`; `2` for a usage error, the GUI divergence and any
@@ -61,6 +72,48 @@ pipeline error, matching the Python tool. A failed mandatory step fails the buil
 `e2fsck -fn` reports an error the CLI exits `2` without printing any flashable line, and an
 AVB backend error degrades to the documented `AVB_HASHTREE=SKIP` path, never to a PASS claim.
 Logs, the command list and the report go to `.\Logs\`, which is created on demand.
+
+## Modem (BUILD MODEM / BUILD FIX MODEM)
+
+Port of `..\VoLTE\modem_patcher\tool\qc_modem_volte.py` plus the CLI half of
+`build_all_in_one.py`, added as two more `volte-cli` subcommands (`volte-core/src/modem.rs`).
+They patch a Qualcomm NON-HLOS modem partition image (FAT16) so the Viettel VoLTE MBN config
+is first in `oem_sw.txt` / `mbn_sw.txt`, or inject that MBN from a donor image when the
+destination modem does not have one yet. Image size never changes.
+
+```bat
+:: BUILD MODEM: modem already has a Viettel MBN, move it to the front
+volte-cli.exe modem <modem.bin|modem.img> [--out <path>]
+
+:: BUILD FIX MODEM: modem is missing the Viettel MBN entirely
+volte-cli.exe fix-modem <modem.bin|modem.img> --donor <donor_modem.img> [--out <path>]
+volte-cli.exe fix-modem <modem.bin|modem.img> --mbn <viettel_mcfg_sw.mbn> [--out <path>]
+```
+
+Default output is `<name>_volte<ext>` / `<name>_volte_fix<ext>` next to the source, like the
+Python reference; `--out` overrides it. An `--out` that resolves to the same file as the
+source modem is a build error (same A01-class guard as the vendor builder's
+`path_id::same_file`), not a silent overwrite.
+
+Intentionally not ported — GUI-only conveniences, not needed for a CLI, not covered by any
+test here:
+- the Tk GUI itself (`build_all_in_one.py`'s two tabs);
+- zip-file input (a `.zip` containing `modem.bin`/`modem.img`);
+- the `%APPDATA%\HoangDucTool` MBN cache and the sibling-folder auto-discovery of a donor
+  modem (`find_mbn`) — pass `--donor` or `--mbn` explicitly instead;
+- `_viettel_line_from_texts`, `_nl_join`, `_rel_to_parts`: dead code in the Python reference
+  (defined, never called), not ported.
+
+`volte-cli` always requires one of three subcommands first — `vendor`, `modem` or
+`fix-modem` — so a vendor image can never be misread as the modem subcommands (or vice
+versa) no matter what it is named. Earlier builds of this tool took the vendor image as a
+bare positional argument with no subcommand (`volte-cli.exe <vendor.img> ...`); that form is
+no longer accepted and now exits 2 with a usage error, specifically to remove the
+name-collision risk this paragraph used to describe.
+
+This module has not been run against a real OEM modem image or a real device — the tests in
+`volte-core/src/modem.rs` build synthetic FAT16 images through the same public API the engine
+uses, the same caveat `docs/PORT_STATUS.md` records for the vendor builder's own test suite.
 
 ## External tools
 

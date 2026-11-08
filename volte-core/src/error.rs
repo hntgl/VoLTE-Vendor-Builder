@@ -13,6 +13,10 @@ pub enum ErrorKind {
     Build,
     /// Filesystem or stream error.
     Io,
+    /// Reading the image failed while applying a byte patch.
+    Read,
+    /// Writing the image failed while applying a byte patch.
+    Write,
     /// The image is not EXT4 (`rust-fs-ext4: bad magic number`).
     BadMagic,
     /// A required external tool or payload file is missing.

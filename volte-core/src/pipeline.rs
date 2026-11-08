@@ -12,7 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::avb;
 use crate::chip_detect;
 use crate::config;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::ext4_tools::{self, Ext4Ops, Fsck};
 use crate::flags;
 use crate::init_rc;
@@ -57,7 +57,7 @@ impl WorkDir {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let path =
-            std::env::temp_dir().join(format!("hd_hue_chuan_{}_{nanos}", std::process::id()));
+            std::env::temp_dir().join(format!("volte_patch_{}_{nanos}", std::process::id()));
         std::fs::create_dir_all(&path)?;
         Ok(WorkDir(path))
     }
@@ -170,7 +170,7 @@ fn probe_space(dir: &Path, needed: u64) -> std::io::Result<()> {
     if needed == 0 {
         return Ok(());
     }
-    let path = dir.join(format!(".hd_volte_space_probe_{}.tmp", std::process::id()));
+    let path = dir.join(format!(".volte_space_probe_{}.tmp", std::process::id()));
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -403,7 +403,7 @@ pub fn run(
     log.log("HD Vendor Fix VoLTE");
     log.log("Version: 2.9.2 / V298");
     log.log("Mode   : STANDARD - e2fsck + AVB signature, EDL-sized");
-    log.log("Engine : hoangduc");
+    log.log("Engine : HT");
     log.log(format!("Chip   : {}", if qc { "QUALCOMM" } else { "MTK" }));
     log.log(format!("Input  : {}", src.display()));
     log.log(format!("Output : {}", out_path.display()));
@@ -450,6 +450,27 @@ pub fn run(
 
     progress(30, "AVB info");
     let mut avb_info = avb::avb_info_fast(&work)?;
+    for tag in &avb_info.unsupported_descriptor_tags {
+        log.log(format!(
+            "[WARN] AVB vbmeta: unsupported descriptor tag {tag}"
+        ));
+    }
+    if avb_info.has_chain_descriptor {
+        return Err(Error::build(
+            "input image has a chain partition descriptor (Tag 4); the current rebuild does not preserve chain descriptors - refusing to rebuild to avoid breaking the AVB verification chain",
+        ));
+    }
+    if avb_info.descriptor_kind == avb::DescriptorKind::HashOnly {
+        log.log(
+            "[WARN] input is Tag 2 (whole-partition hash), rebuild converts it to a hashtree (Tag 1) descriptor — this is a format change, not a like-for-like rebuild.",
+        );
+    }
+    if avb_info.fec_roots > 0 {
+        log.log(format!(
+            "[WARN] original image has FEC (fec_roots={}) but rebuild always runs with --do_not_generate_fec — FEC will be dropped.",
+            avb_info.fec_roots
+        ));
+    }
     if avb_info.has_footer {
         log.log("[AVB] Existing AVB footer detected; original AVB parameters will be preserved.");
         for line in report::avb_lines(&avb_info) {
@@ -548,8 +569,18 @@ pub fn run(
     let nflag = match flags::patch_flags_keep_size(&work, &work, 0, log) {
         Ok(n) => n,
         Err(e) => {
-            log.log(format!("[WARN] FLAGS: {}", trunc(e.message(), 160)));
-            0
+            // A read/write failure means we do not know the flag state; it must
+            // not be reported as "0" and the build must not continue.
+            let phase = match e.kind() {
+                ErrorKind::Read => "reading",
+                ErrorKind::Write => "writing",
+                _ => "accessing",
+            };
+            let why = trunc(e.message(), 160);
+            log.log(format!("[ERROR] FLAGS {phase}: {why}"));
+            return Err(Error::build(format!(
+                "VoLTE flag patch failed while {phase} the image - refusing to continue: {why}"
+            )));
         }
     };
     let on: u8 = if nflag >= 1 || orig_bit >= 1 { 1 } else { 0 };
@@ -589,7 +620,9 @@ pub fn run(
     if payload_ok {
         log.log("[STEP] Overlay APK + RC are inside the image (VoLTE switch).");
     } else {
-        log.log("[WARN] Overlay payload is not fully verified - still exporting the file.");
+        return Err(Error::build(
+            "Overlay APK/RC not verified inside the image - refusing to export",
+        ));
     }
 
     log.log("e2fsck -fn");
@@ -615,43 +648,54 @@ pub fn run(
     let (pre_avb_size, pre_avb_sha) = take_pre_avb_backup(&work, &pre_avb)?;
     log.log("[STATUS] Pre-AVB snapshot verified (size + SHA-256).");
     progress(82, "AVB");
-    log.log("[STATUS] Generating hashtree and FEC for the image...");
-    let avb_ok = match avb::rebuild_hashtree(&work, &avb_info, orig_sz, deps.avb, log) {
-        Ok(rebuilt) => rebuilt.is_some(),
+    log.log("[STATUS] Generating hashtree for the image (FEC disabled)...");
+    let avb_reason = match avb::rebuild_hashtree(&work, &avb_info, orig_sz, deps.avb, log) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some("the rebuilt hashtree grew past the slot".to_string()),
         Err(e) => {
-            log.log(format!("[WARN] AVB hashtree: {}", trunc(e.message(), 200)));
-            false
+            let text = trunc(e.message(), 200);
+            log.log(format!("[WARN] AVB hashtree: {text}"));
+            Some(text)
         }
     };
     let cur = std::fs::metadata(&work).map(|m| m.len()).unwrap_or(0);
     let footer_ok = avb::avb_info_fast(&work)
         .map(|i| i.has_footer)
         .unwrap_or(false);
-    let boot_safe = avb_ok && footer_ok && slot_size > 0 && cur == slot_size;
-    let skip_avb;
+    let boot_safe = avb_reason.is_none() && footer_ok && slot_size > 0 && cur == slot_size;
     if !boot_safe {
-        log.log("[STEP] Dropping AVB + EDL size - no footer truncation when the hashtree grows.");
+        let reason = avb_reason.unwrap_or_else(|| {
+            if !footer_ok {
+                "the AVB backend produced no footer".to_string()
+            } else {
+                format!("the rebuilt image is {cur} bytes but the slot is {slot_size}")
+            }
+        });
+        log.log("[STEP] Dropping AVB + EDL size - the rebuilt footer cannot be exported safely.");
         restore_pre_avb(&work, &pre_avb, pre_avb_size, &pre_avb_sha)?;
         log.log("[OK] Restored the pre-AVB image (size + SHA-256 verified).");
         slot::force_slot_size(&work, slot_size, true, "BOOT-SAFE", log)?;
-        skip_avb = true;
-    } else {
-        skip_avb = false;
-        log.log("[OK] AVB hashtree + EDL size match - safe to boot.");
+        if let Err(e) = std::fs::remove_file(&work) {
+            log.log(format!(
+                "[WARN] Could not remove the unsafe output: {}",
+                trunc(&e.to_string(), 160)
+            ));
+        }
+        return Err(Error::build(format!(
+            "AVB rebuild failed: {reason}. The image still carries the original AVB footer while the filesystem content was modified, so it is not safe to boot or flash - no image was exported."
+        )));
     }
+    log.log("[OK] AVB hashtree + EDL size match - safe to boot.");
 
-    let mut out_sz = std::fs::metadata(&work).map(|m| m.len()).unwrap_or(0);
-    if skip_avb {
-        out_sz = slot::force_slot_size(&work, slot_size, true, "BUILD", log)?;
-    } else if slot_size > 0 && out_sz != slot_size {
+    let out_sz = std::fs::metadata(&work).map(|m| m.len()).unwrap_or(0);
+    if slot_size > 0 && out_sz != slot_size {
         return Err(Error::build(format!(
             "STANDARD build: AVB OK but the size is wrong ({out_sz} != {slot_size}) - refusing to truncate."
         )));
-    } else {
-        log.log(format!(
-            "[OK] STANDARD size matches the slot: {out_sz} (0x{out_sz:X})"
-        ));
     }
+    log.log(format!(
+        "[OK] STANDARD size matches the slot: {out_sz} (0x{out_sz:X})"
+    ));
 
     progress(96, "Done");
     let out_display = out_path.display().to_string();
@@ -663,7 +707,7 @@ pub fn run(
         )));
     }
 
-    let avb_token = if skip_avb { "SKIP" } else { "PASS" };
+    let avb_token = "PASS";
     let summary = report::Summary {
         out_path: &out_display,
         out_size: out_sz,
@@ -693,6 +737,7 @@ mod tests {
     use crate::logging::Sink;
     use crate::rustfs_ext4::RustFsExt4Backend;
     use std::cell::RefCell;
+    use std::io::{Seek, SeekFrom, Write};
     use std::process::Command;
     use std::rc::Rc;
 
@@ -740,6 +785,177 @@ mod tests {
         let status = cmd.status().expect("run mke2fs");
         assert!(status.success(), "mke2fs failed: {status}");
         img
+    }
+
+    /// 32 MiB filesystem padded to the 64 MiB slot, so AVB metadata can live
+    /// in the tail without overwriting filesystem blocks.
+    fn make_ext4_with_slack(dir: &Path, name: &str) -> PathBuf {
+        let img = dir.join(name);
+        let mut cmd = Command::new(tool_dir().join("mke2fs.exe"));
+        cmd.arg("-q")
+            .arg("-t")
+            .arg("ext4")
+            .arg("-b")
+            .arg("4096")
+            .arg("-O")
+            .arg("dir_index,^metadata_csum_seed,^orphan_file")
+            .arg("-F")
+            .arg(&img)
+            .arg("8192")
+            .current_dir(dir);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        let status = cmd.status().expect("run mke2fs");
+        assert!(status.success(), "mke2fs failed: {status}");
+        let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+        f.set_len(64 * 1024 * 1024).unwrap();
+        img
+    }
+
+    /// Test-local AOSP descriptor builders. They deliberately use literal
+    /// offsets instead of production helpers so a production bug cannot hide
+    /// behind the fixture.
+    fn pad8(n: usize) -> usize {
+        n.div_ceil(8) * 8
+    }
+
+    fn hashtree_descriptor(name: &str, fec_roots: u32) -> Vec<u8> {
+        let salt = [0x11u8, 0x22, 0x33, 0x44];
+        let digest = [0x55u8; 32];
+        let mut d = vec![0u8; 180];
+        d[0..8].copy_from_slice(&1u64.to_be_bytes());
+        d[16..20].copy_from_slice(&1u32.to_be_bytes());
+        d[20..28].copy_from_slice(&4096u64.to_be_bytes());
+        d[44..48].copy_from_slice(&4096u32.to_be_bytes());
+        d[48..52].copy_from_slice(&4096u32.to_be_bytes());
+        d[52..56].copy_from_slice(&fec_roots.to_be_bytes());
+        d[72..78].copy_from_slice(b"sha256");
+        d[104..108].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        d[108..112].copy_from_slice(&(salt.len() as u32).to_be_bytes());
+        d[112..116].copy_from_slice(&(digest.len() as u32).to_be_bytes());
+        d.extend_from_slice(name.as_bytes());
+        d.extend_from_slice(&salt);
+        d.extend_from_slice(&digest);
+        let nbf = pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
+    fn hash_descriptor(name: &str) -> Vec<u8> {
+        let salt = [0xaa, 0xbb, 0xcc, 0xdd];
+        let mut d = vec![0u8; 132];
+        d[0..8].copy_from_slice(&2u64.to_be_bytes());
+        d[16..24].copy_from_slice(&4096u64.to_be_bytes());
+        d[24..29].copy_from_slice(b"sha1\0");
+        d[56..60].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        d[60..64].copy_from_slice(&(salt.len() as u32).to_be_bytes());
+        d.extend_from_slice(name.as_bytes());
+        d.extend_from_slice(&salt);
+        let nbf = pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
+    fn chain_descriptor(name: &str) -> Vec<u8> {
+        let key = [0x42u8; 16];
+        let mut d = vec![0u8; 92];
+        d[0..8].copy_from_slice(&4u64.to_be_bytes());
+        d[16..20].copy_from_slice(&1u32.to_be_bytes());
+        d[20..24].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        d[24..28].copy_from_slice(&(key.len() as u32).to_be_bytes());
+        d.extend_from_slice(name.as_bytes());
+        d.extend_from_slice(&key);
+        let nbf = pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
+    fn vbmeta_with(descriptors: &[Vec<u8>]) -> Vec<u8> {
+        let mut vb = vec![0u8; 256];
+        vb[..4].copy_from_slice(b"AVB0");
+        let desc_size: usize = descriptors.iter().map(Vec::len).sum();
+        vb[20..28].copy_from_slice(&(desc_size as u64).to_be_bytes());
+        vb[104..112].copy_from_slice(&(desc_size as u64).to_be_bytes());
+        for d in descriptors {
+            vb.extend_from_slice(d);
+        }
+        vb
+    }
+
+    fn footer_bytes(orig: u64, voff: u64, vsz: u64) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[..4].copy_from_slice(&config::AVB_MAGIC);
+        b[4..8].copy_from_slice(&1u32.to_be_bytes());
+        b[12..20].copy_from_slice(&orig.to_be_bytes());
+        b[20..28].copy_from_slice(&voff.to_be_bytes());
+        b[28..36].copy_from_slice(&vsz.to_be_bytes());
+        b
+    }
+
+    /// Writes a valid vbmeta + footer ending at `end`, moving the file size to
+    /// `end`. Used both for an in-place rebuild and for a grown hashtree.
+    fn write_avb_tail(image: &Path, end: u64, name: &str, fec_roots: u32) -> Result<()> {
+        let vb = vbmeta_with(&[hashtree_descriptor(name, fec_roots)]);
+        let vb_off = end - 4096;
+        let footer_at = end - 64;
+        assert!(vb_off + vb.len() as u64 <= footer_at);
+        let mut f = std::fs::OpenOptions::new().write(true).open(image)?;
+        f.set_len(end)?;
+        f.seek(SeekFrom::Start(vb_off))?;
+        f.write_all(&vb)?;
+        f.write_all(&vec![0u8; (footer_at - vb_off - vb.len() as u64) as usize])?;
+        f.write_all(&footer_bytes(vb_off, vb_off, vb.len() as u64))?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    fn attach_avb_footer(img: &Path, descriptors: &[Vec<u8>]) {
+        let vb = vbmeta_with(descriptors);
+        let size = std::fs::metadata(img).unwrap().len();
+        let vb_off = size - 4096;
+        attach_avb_tail(img, &vb, vb_off, size);
+    }
+
+    fn attach_avb_tail(img: &Path, vb: &[u8], vb_off: u64, end: u64) {
+        let footer_at = end - 64;
+        assert!(vb_off + vb.len() as u64 <= footer_at);
+        let mut f = std::fs::OpenOptions::new().write(true).open(img).unwrap();
+        f.seek(SeekFrom::Start(vb_off)).unwrap();
+        f.write_all(vb).unwrap();
+        f.write_all(&vec![0u8; (footer_at - vb_off - vb.len() as u64) as usize])
+            .unwrap();
+        f.write_all(&footer_bytes(vb_off, vb_off, vb.len() as u64))
+            .unwrap();
+        f.sync_all().unwrap();
+    }
+
+    struct FooterAvb {
+        calls: usize,
+    }
+
+    impl avb::Avb for FooterAvb {
+        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+            self.calls += 1;
+            write_avb_tail(&req.image, req.partition_size, &req.partition_name, 0)
+        }
+    }
+
+    struct GrowingFooterAvb {
+        calls: usize,
+    }
+
+    impl avb::Avb for GrowingFooterAvb {
+        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+            self.calls += 1;
+            let grown = req.partition_size + 4096;
+            write_avb_tail(&req.image, grown, &req.partition_name, 0)
+        }
     }
 
     fn seed_payloads(root: &Path) {
@@ -1167,7 +1383,7 @@ mod tests {
     fn a_full_build_reaches_the_final_tokens_on_a_synthetic_image() {
         let dir = tmp("volte_pipeline_full");
         let tool = tool_dir();
-        let src = make_ext4(&dir, "vendor.img");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
         let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
         seed_payloads(&dir);
         let logs = dir.join("Logs");
@@ -1177,7 +1393,7 @@ mod tests {
             inner: E2fsck::new(&tool),
             calls: 0,
         };
-        let mut avb = NoFooterAvb { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
         let mut deps = Deps {
             ops: &mut ops,
             fsck: &mut fsck,
@@ -1214,7 +1430,7 @@ mod tests {
         for need in [
             "[CHIP] Forced MEDIATEK branch",
             "e2fsck=PASS",
-            "AVB_HASHTREE=SKIP",
+            "AVB_HASHTREE=PASS",
             "VOLTE_FLAGS=0",
             "AVB_ALGORITHM=NONE",
             "FLASH=NO",
@@ -1240,8 +1456,8 @@ mod tests {
             commands.contains("\n\n"),
             "clean and write blocks are separated"
         );
-        assert!(commands.starts_with("rm /overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk\n"));
-        assert!(commands.contains("\nmkdir /overlay/HDVoLTE\n"));
+        assert!(commands.starts_with("rm /overlay/OPPO_VoLTE_Overlay.apk\n"));
+        assert!(commands.contains("\ncd /overlay\n"));
         let report = std::fs::read_to_string(logs.join("vendor_VolLTE_report.txt")).unwrap();
         assert_eq!(report.lines().count(), 6, "{report}");
         assert!(report.starts_with("File="));
@@ -1261,7 +1477,7 @@ mod tests {
     fn an_explicit_out_path_that_differs_from_the_source_is_accepted() {
         let dir = tmp("volte_pipeline_explicit_out");
         let tool = tool_dir();
-        let src = make_ext4(&dir, "vendor.img");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
         let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
         seed_payloads(&dir);
         let logs = dir.join("Logs");
@@ -1275,7 +1491,7 @@ mod tests {
             inner: E2fsck::new(&tool),
             calls: 0,
         };
-        let mut avb = NoFooterAvb { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
         let mut deps = Deps {
             ops: &mut ops,
             fsck: &mut fsck,
@@ -1393,6 +1609,100 @@ mod tests {
             logs_dir: &logs,
         };
 
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert_eq!(avb.calls, 1);
+        assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
+        assert!(
+            !dir.join("vendor_VolLTE.img").exists(),
+            "no unsafe image may be exported"
+        );
+        assert!(
+            err.message().contains("simulated avbtool.py failure"),
+            "{err}"
+        );
+        assert!(err.message().contains("not safe to boot or flash"), "{err}");
+
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("[WARN] AVB hashtree:"), "{text}");
+        assert!(!text.contains("AVB_HASHTREE="), "{text}");
+        assert!(!text.contains("[OUTPUT] "), "{text}");
+        assert!(!text.contains("Rebuild hashtree completed."), "{text}");
+        assert!(
+            !text.contains("[OK] AVB hashtree + EDL size match"),
+            "{text}"
+        );
+        assert!(!logs.join("vendor_VolLTE_report.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hashtree_that_grows_past_the_slot_fails_the_build() {
+        let dir = tmp("volte_pipeline_avb_grow");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = GrowingFooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert_eq!(avb.calls, 1);
+        assert!(err.message().contains("grew past the slot"), "{err}");
+        assert!(err.message().contains("not safe to boot or flash"), "{err}");
+        assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
+        assert!(!dir.join("vendor_VolLTE.img").exists());
+        let text = lines.borrow().join("\n");
+        assert!(!text.contains("AVB_HASHTREE="), "{text}");
+        assert!(!text.contains("[OUTPUT] "), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_avb_rebuild_exports_the_image() {
+        let dir = tmp("volte_pipeline_avb_ok");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
         let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
         assert_eq!(avb.calls, 1);
         assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
@@ -1400,16 +1710,354 @@ mod tests {
             std::fs::metadata(&out).unwrap().len(),
             std::fs::metadata(&src).unwrap().len()
         );
-
         let text = lines.borrow().join("\n");
-        assert!(text.contains("[WARN] AVB hashtree:"), "{text}");
-        assert!(text.contains("AVB_HASHTREE=SKIP"), "{text}");
-        assert!(!text.contains("AVB_HASHTREE=PASS"), "{text}");
-        assert!(!text.contains("Rebuild hashtree completed."), "{text}");
+        assert!(text.contains("AVB_HASHTREE=PASS"), "{text}");
         assert!(
-            !text.contains("[OK] AVB hashtree + EDL size match"),
+            text.contains("[STATUS] Generating hashtree for the image (FEC disabled)..."),
             "{text}"
         );
+        assert!(!text.contains("Generating hashtree and FEC"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_with_a_chain_descriptor_is_refused_before_avb() {
+        let dir = tmp("volte_pipeline_chain");
+        let src = make_ext4(&dir, "vendor.img");
+        attach_avb_footer(&src, &[chain_descriptor("boot")]);
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert!(
+            err.message().contains("chain partition descriptor"),
+            "{err}"
+        );
+        assert_eq!(avb.calls, 0, "the AVB backend must not be reached");
+        assert_eq!(fsck.calls, 0, "the build must stop before e2fsck");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hash_only_input_warns_but_still_builds() {
+        let dir = tmp("volte_pipeline_tag2");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hash_descriptor("vendor")]);
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        assert_eq!(
+            avb::avb_info_fast(&src).unwrap().descriptor_kind,
+            avb::DescriptorKind::HashOnly
+        );
+        let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
+        assert!(out.is_file());
+        assert_eq!(avb.calls, 1);
+        let text = lines.borrow().join("\n");
+        assert!(
+            text.contains(
+                "[WARN] input is Tag 2 (whole-partition hash), rebuild converts it to a hashtree (Tag 1) descriptor — this is a format change, not a like-for-like rebuild."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("AVB_HASHTREE=PASS"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_with_fec_warns_that_fec_is_dropped() {
+        let dir = tmp("volte_pipeline_fec");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor("vendor", 2)]);
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        assert_eq!(avb::avb_info_fast(&src).unwrap().fec_roots, 2);
+        run(&opts, &mut deps, &mut log, &mut progress).unwrap();
+        let text = lines.borrow().join("\n");
+        assert!(
+            text.contains(
+                "[WARN] original image has FEC (fec_roots=2) but rebuild always runs with --do_not_generate_fec — FEC will be dropped."
+            ),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_without_fec_does_not_warn_about_fec() {
+        let dir = tmp("volte_pipeline_no_fec");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor("vendor", 0)]);
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        run(&opts, &mut deps, &mut log, &mut progress).unwrap();
+        let text = lines.borrow().join("\n");
+        assert!(!text.contains("FEC will be dropped"), "{text}");
+        assert!(!text.contains("Generating hashtree and FEC"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real backend, but it flips one byte of the overlay APK inside the
+    /// image immediately after the overlay write batch (A3). Verification then
+    /// has to notice the mismatch before the pipeline exports anything.
+    struct CorruptingApkOps {
+        inner: RustFsExt4Backend,
+        corrupted: bool,
+    }
+
+    impl Ext4Ops for CorruptingApkOps {
+        fn run(
+            &mut self,
+            image: &Path,
+            commands: &[String],
+            workdir: &Path,
+            log: &mut Logger,
+        ) -> Result<String> {
+            let out = self.inner.run(image, commands, workdir, log)?;
+            let wrote_apk = commands
+                .iter()
+                .any(|c| c.starts_with("write ") && c.ends_with(&format!(" {}", config::APK_NAME)));
+            if wrote_apk && !self.corrupted {
+                let host = workdir.join("a3_corrupt_dump.apk");
+                let dump = format!(
+                    "dump -p /overlay/{} {}",
+                    config::APK_NAME,
+                    crate::env::forward_slashes(&host)
+                );
+                self.inner
+                    .run(image, &[dump], workdir, &mut Logger::new())?;
+                let mut bytes = std::fs::read(&host)?;
+                assert!(!bytes.is_empty(), "the injected APK must not be empty");
+                bytes[0] ^= 0xFF;
+                std::fs::write(&host, &bytes)?;
+                let replace = format!(
+                    "write {} {}",
+                    crate::env::forward_slashes(&host),
+                    config::APK_NAME
+                );
+                self.inner.run(
+                    image,
+                    &["cd /overlay".to_owned(), replace],
+                    workdir,
+                    &mut Logger::new(),
+                )?;
+                self.corrupted = true;
+            }
+            Ok(out)
+        }
+
+        fn path_exists(&mut self, image: &Path, vpath: &str, workdir: &Path) -> Result<bool> {
+            self.inner.path_exists(image, vpath, workdir)
+        }
+    }
+
+    #[test]
+    fn a3_payload_mismatch_after_injection_aborts_build() {
+        let dir = tmp("volte_pipeline_a3_payload_mismatch");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = CorruptingApkOps {
+            inner: RustFsExt4Backend::new(),
+            corrupted: false,
+        };
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let result = run(&opts, &mut deps, &mut log, &mut progress);
+        assert!(
+            ops.corrupted,
+            "the test must corrupt the APK inside the image after injection"
+        );
+
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("content mismatch"), "{text}");
+        assert!(text.contains("APK_SHA256=UNVERIFIED"), "{text}");
+
+        match result {
+            Ok(out) => panic!(
+                "A3: the build exported {} even though the overlay APK was corrupted after injection\n{text}",
+                out.display()
+            ),
+            Err(err) => assert_eq!(
+                err.message(),
+                "Overlay APK/RC not verified inside the image - refusing to export"
+            ),
+        }
+        assert!(!text.contains("[OUTPUT] "), "{text}");
+        assert!(!logs.join("vendor_VolLTE_report.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real backend, but it removes the output image right after the flag
+    /// probe dump (A6). The flag patch then has to report a read failure
+    /// instead of silently treating it as "0 flags".
+    struct DroppingFlagProbeOps {
+        inner: RustFsExt4Backend,
+    }
+
+    impl Ext4Ops for DroppingFlagProbeOps {
+        fn run(
+            &mut self,
+            image: &Path,
+            commands: &[String],
+            workdir: &Path,
+            log: &mut Logger,
+        ) -> Result<String> {
+            let out = self.inner.run(image, commands, workdir, log);
+            if commands.iter().any(|c| c.ends_with("flg_build.prop")) {
+                let _ = std::fs::remove_file(image);
+            }
+            out
+        }
+
+        fn path_exists(&mut self, image: &Path, vpath: &str, workdir: &Path) -> Result<bool> {
+            self.inner.path_exists(image, vpath, workdir)
+        }
+    }
+
+    #[test]
+    fn a6_a_flag_patch_read_error_aborts_instead_of_reporting_zero() {
+        let dir = tmp("volte_pipeline_a6_flag_read");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = DroppingFlagProbeOps {
+            inner: RustFsExt4Backend::new(),
+        };
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let result = run(&opts, &mut deps, &mut log, &mut progress);
+        let text = lines.borrow().join("\n");
+        match result {
+            Ok(out) => panic!(
+                "A6: the build exported {} after the flag patch could not read the image\n{text}",
+                out.display()
+            ),
+            Err(err) => assert!(
+                err.message().contains("flag patch failed while reading"),
+                "A6: expected a flag read error, got: {}\n{text}",
+                err.message()
+            ),
+        }
+        assert!(!text.contains("[OUTPUT] "), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,5 +1,5 @@
-//! Post-patch verification: dump both copies of the overlay APK and the RC back
-//! out and compare them with the payload that was written.
+//! Post-patch verification: dump the overlay APK and both RC copies back out
+//! and compare them with the payload that was written.
 //!
 //! Python's `verify_payload` (`hd_vendor_build.py:1208`) probes a chain of
 //! legacy names into one shared host file and calls a payload verified when the
@@ -8,6 +8,12 @@
 //! keeps the canonical destinations that the injector writes, dumps each copy
 //! into its own host file after deleting it, and requires a SHA-256 match with
 //! `payload.apk` / `payload.rc` before anything is called verified.
+//!
+//! Divergence of 2026-11-08: the APK is now checked at a single destination,
+//! `/overlay/<apk_name>` — `overlay_commands` no longer writes a second copy
+//! under `/overlay/HDVoLTE/`, so there is nothing left to verify there (see
+//! `payload.rs`). The RC still has two destinations (`/etc/init/` and
+//! `/etc/init/hw/`) and is unaffected.
 
 use std::path::Path;
 
@@ -128,8 +134,8 @@ fn check_copy(
 fn verify_copies(
     image: &Path,
     td: &Path,
-    vpaths: [String; 2],
-    hosts: [std::path::PathBuf; 2],
+    vpaths: &[String],
+    hosts: &[std::path::PathBuf],
     source_sha256: Option<&str>,
     ops: &mut dyn Ext4Ops,
 ) -> Vec<CopyCheck> {
@@ -154,29 +160,23 @@ pub fn verify_payload(
 
     let apk_name = profile::apk_name(qc);
     let rc_name = profile::rc_name(qc);
-    // Exactly the two destinations `overlay_commands` writes for each payload.
+    // Exactly the destinations `overlay_commands` writes for each payload.
     let apk_copies = verify_copies(
         image,
         td,
-        [
-            format!("/overlay/HDVoLTE/{apk_name}"),
-            format!("/overlay/{apk_name}"),
-        ],
-        [
-            td.join("verify_overlay.apk"),
-            td.join("verify_overlay_root.apk"),
-        ],
+        &[format!("/overlay/{apk_name}")],
+        &[td.join("verify_overlay_root.apk")],
         apk_source.as_deref(),
         ops,
     );
     let rc_copies = verify_copies(
         image,
         td,
-        [
+        &[
             format!("/etc/init/{rc_name}"),
             format!("/etc/init/hw/{rc_name}"),
         ],
-        [td.join("verify_volte.rc"), td.join("verify_volte_hw.rc")],
+        &[td.join("verify_volte.rc"), td.join("verify_volte_hw.rc")],
         rc_source.as_deref(),
         ops,
     );
@@ -311,10 +311,9 @@ mod tests {
 
     fn qc_files() -> Vec<(&'static str, &'static [u8])> {
         vec![
-            ("/overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk", APK),
             ("/overlay/OPPO_VoLTE_Overlay.apk", APK),
-            ("/etc/init/hd_oppo_qc_volte.rc", RC),
-            ("/etc/init/hw/hd_oppo_qc_volte.rc", RC),
+            ("/etc/init/oppo_qc_volte.rc", RC),
+            ("/etc/init/hw/oppo_qc_volte.rc", RC),
         ]
     }
 
@@ -352,7 +351,7 @@ mod tests {
         assert!(got.rc_copies.iter().all(|c| c.state == CopyState::Verified));
         assert_eq!(
             ops.calls.len(),
-            4,
+            3,
             "one dump per copy, no candidate retries"
         );
         let hosts: Vec<&str> = ops.calls.iter().map(|(_, h)| h.as_str()).collect();
@@ -361,7 +360,7 @@ mod tests {
         unique.dedup();
         assert_eq!(
             unique.len(),
-            4,
+            3,
             "each copy has its own host file: {hosts:?}"
         );
 
@@ -380,10 +379,9 @@ mod tests {
         let dir = tmp("volte_verify_mtk");
         seed_sources(&dir);
         let mut ops = FakeFs::new(&[
-            ("/overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk", APK),
             ("/overlay/OPPO_VoLTE_Overlay.apk", APK),
-            ("/etc/init/hd_oppo_mtk_volte.rc", RC),
-            ("/etc/init/hw/hd_oppo_mtk_volte.rc", RC),
+            ("/etc/init/oppo_mtk_volte.rc", RC),
+            ("/etc/init/hw/oppo_mtk_volte.rc", RC),
         ]);
         let (mut log, _) = recording_log();
         let got = verify_payload(Path::new("img"), &dir, false, &mut ops, &mut log).unwrap();
@@ -391,7 +389,7 @@ mod tests {
         assert!(got
             .rc_copies
             .iter()
-            .any(|c| c.vpath == "/etc/init/hd_oppo_mtk_volte.rc"));
+            .any(|c| c.vpath == "/etc/init/oppo_mtk_volte.rc"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -399,7 +397,7 @@ mod tests {
     fn a_stale_host_file_is_deleted_before_the_dump_and_never_hashed() {
         let dir = tmp("volte_verify_stale");
         seed_sources(&dir);
-        std::fs::write(dir.join("verify_overlay.apk"), vec![b'S'; 6000]).unwrap();
+        std::fs::write(dir.join("verify_overlay_root.apk"), vec![b'S'; 6000]).unwrap();
         let mut ops = FakeFs::new(&qc_files());
         ops.silent = true;
         let (mut log, _) = recording_log();
@@ -408,7 +406,7 @@ mod tests {
         assert_eq!(got.apk_copies[0].sha256, UNVERIFIED);
         assert_eq!(got.apk, Verdict::NotVerified);
         assert!(
-            !dir.join("verify_overlay.apk").exists(),
+            !dir.join("verify_overlay_root.apk").exists(),
             "the stale file is gone"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -457,15 +455,13 @@ mod tests {
         let dir = tmp("volte_verify_mismatch");
         seed_sources(&dir);
         let mut ops = FakeFs::new(&[
-            ("/overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk", APK),
             ("/overlay/OPPO_VoLTE_Overlay.apk", b"PK\x03\x04truncated"),
-            ("/etc/init/hd_oppo_qc_volte.rc", RC),
-            ("/etc/init/hw/hd_oppo_qc_volte.rc", RC),
+            ("/etc/init/oppo_qc_volte.rc", RC),
+            ("/etc/init/hw/oppo_qc_volte.rc", RC),
         ]);
         let (mut log, lines) = recording_log();
         let got = verify_payload(Path::new("img"), &dir, true, &mut ops, &mut log).unwrap();
-        assert_eq!(got.apk_copies[0].state, CopyState::Verified);
-        assert_eq!(got.apk_copies[1].state, CopyState::Mismatch);
+        assert_eq!(got.apk_copies[0].state, CopyState::Mismatch);
         assert_eq!(got.apk, Verdict::NotVerified);
         assert_eq!(got.apk_sha256, UNVERIFIED);
         assert_eq!(got.rc, Verdict::Verified);
@@ -479,9 +475,8 @@ mod tests {
         let dir = tmp("volte_verify_missing_copy");
         seed_sources(&dir);
         let mut ops = FakeFs::new(&[
-            ("/overlay/HDVoLTE/OPPO_VoLTE_Overlay.apk", APK),
             ("/overlay/OPPO_VoLTE_Overlay.apk", APK),
-            ("/etc/init/hd_oppo_qc_volte.rc", RC),
+            ("/etc/init/oppo_qc_volte.rc", RC),
         ]);
         let (mut log, _) = recording_log();
         let got = verify_payload(Path::new("img"), &dir, true, &mut ops, &mut log).unwrap();
@@ -495,7 +490,7 @@ mod tests {
     fn without_a_source_payload_nothing_is_verified() {
         // Mirrors the audit harness: stale host files, no `payload.apk`.
         let dir = tmp("volte_verify_no_source");
-        std::fs::write(dir.join("verify_overlay.apk"), vec![b'S'; 600]).unwrap();
+        std::fs::write(dir.join("verify_overlay_root.apk"), vec![b'S'; 600]).unwrap();
         std::fs::write(dir.join("verify_volte.rc"), vec![b'R'; 20]).unwrap();
         let mut ops = FakeFs::new(&qc_files());
         ops.silent = true;

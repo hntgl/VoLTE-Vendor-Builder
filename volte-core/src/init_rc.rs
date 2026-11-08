@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use crate::config;
 use crate::env::forward_slashes;
 use crate::error::Result;
 use crate::ext4_tools::Ext4Ops;
@@ -17,10 +18,10 @@ use crate::profile;
 /// The 21 MTK / 8 QC candidates in Python's order (shared tail included).
 pub fn candidate_vpaths(needles: &[&str]) -> Vec<&'static str> {
     let mut vpaths: Vec<&'static str> = Vec::new();
-    if needles.iter().any(|n| n.contains("hd_oppo_mtk_volte.rc")) {
+    if needles.iter().any(|n| n.contains(config::RC_NAME_MTK)) {
         vpaths.extend(profile::INIT_VPATHS_MTK);
     }
-    if needles.iter().any(|n| n.contains("hd_oppo_qc_volte.rc")) {
+    if needles.iter().any(|n| n.contains(config::RC_NAME_QC)) {
         vpaths.extend(profile::INIT_VPATHS_QC);
     }
     vpaths.extend(profile::INIT_VPATHS_SHARED);
@@ -50,6 +51,15 @@ fn split_vpath(vpath: &str) -> Option<(String, String)> {
         Some((dir, name)) if !dir.is_empty() => (dir.to_owned(), name.to_owned()),
         _ => (".".to_owned(), vpath.to_owned()),
     })
+}
+
+/// True when an uncommented line is exactly the import command.
+///
+/// The old check used `str::contains`, so the text inside a `# import ...`
+/// comment also counted as present and the real import was never written.
+fn has_import(text: &str, needle: &str) -> bool {
+    text.lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.trim() == needle)
 }
 
 /// Returns `true` when an init file was dumped and now imports every needle,
@@ -100,7 +110,7 @@ pub fn link(
     let missing: Vec<&str> = needles
         .iter()
         .copied()
-        .filter(|n| !n.is_empty() && !text.contains(n))
+        .filter(|n| !n.is_empty() && !has_import(&text, n))
         .collect();
     if missing.is_empty() {
         log.log(format!("[OK] {found} already imports HD VoLTE."));
@@ -261,8 +271,8 @@ mod tests {
         assert_eq!(ops.written.len(), 1);
         let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
         assert!(text.starts_with("on boot\n    exec x\n"));
-        assert!(text.contains("\nimport /vendor/etc/init/hd_oppo_qc_volte.rc\n"));
-        assert!(text.contains("\nimport /vendor/etc/init/hw/hd_oppo_qc_volte.rc\n"));
+        assert!(text.contains("\nimport /vendor/etc/init/oppo_qc_volte.rc\n"));
+        assert!(text.contains("\nimport /vendor/etc/init/hw/oppo_qc_volte.rc\n"));
         assert_eq!(text.matches(profile::IMPORT_LINE).count(), 1);
         assert!(text.ends_with('\n'));
         assert!(!text.contains('\r'));
@@ -457,6 +467,69 @@ mod tests {
         assert_eq!(ops.written[0].0, "init.target.rc");
         assert!(ops.commands.iter().any(|c| c == "cd /etc/init/hw"));
         assert!(!ops.commands.iter().any(|c| c == "cd /"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a7_a_commented_import_does_not_count_as_present() {
+        let dir = tmp("volte_initrc_a7_commented_import");
+        std::fs::write(dir.join("config.bin"), b"label\0").unwrap();
+        let body = format!(
+            "on boot\n# {}\n    # {}\n    exec x\n",
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE_HW
+        );
+        let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", body.as_bytes())]);
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let cfg = dir.join("config.bin");
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            Some(&cfg),
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
+        assert_eq!(
+            ops.written.len(),
+            1,
+            "a commented import must not satisfy the check: {:?}",
+            ops.commands
+        );
+        let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
+        assert!(
+            text.contains(&format!("# {}\n", profile::IMPORT_LINE)),
+            "the comment must be preserved:\n{text}"
+        );
+        for needle in qc_needles() {
+            let exact = text.lines().filter(|l| l.trim() == needle).count();
+            assert_eq!(exact, 1, "expected exactly one real {needle:?} in:\n{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a7_a_real_import_plus_comments_stays_idempotent() {
+        let dir = tmp("volte_initrc_a7_idempotent");
+        let body = format!(
+            "on boot\n# {}\n{}\n{}\n",
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE_HW
+        );
+        let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", body.as_bytes())]);
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
+        assert!(ops.written.is_empty(), "a real import is already present");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -9,7 +9,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::config::{CHUNK, OVERLAP};
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
 use crate::logging::Logger;
 use crate::path_id;
 
@@ -218,15 +218,26 @@ fn read_chunk(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(done)
 }
 
+/// A failed read must stay a read failure: the pipeline uses it to tell an
+/// unreadable image from a scan that legitimately found zero flags.
+fn io_read(e: std::io::Error) -> Error {
+    Error::new(ErrorKind::Read, e.to_string())
+}
+
+/// A failed write must stay a write failure, never "0 flags patched".
+fn io_write(e: std::io::Error) -> Error {
+    Error::new(ErrorKind::Write, e.to_string())
+}
+
 /// `patch_flags_keep_size` (`:689`): copy `src` to `dst` when they differ, then
 /// apply every flag pair inside `limit` bytes (0 = whole file). Windows advance
 /// by `CHUNK - OVERLAP` so a pair straddling a boundary is still seen.
 pub fn patch_flags_keep_size(src: &Path, dst: &Path, limit: u64, _log: &mut Logger) -> Result<u64> {
     if !path_id::same_file(src, dst) {
-        std::fs::copy(src, dst)?;
+        std::fs::copy(src, dst).map_err(io_write)?;
     }
     let mut hits = 0u64;
-    let size = std::fs::metadata(dst)?.len();
+    let size = std::fs::metadata(dst).map_err(io_read)?.len();
     if size == 0 {
         return Ok(0);
     }
@@ -236,13 +247,17 @@ pub fn patch_flags_keep_size(src: &Path, dst: &Path, limit: u64, _log: &mut Logg
         .filter(|(a, b)| !a.is_empty() && a.len() == b.len())
         .map(|(a, b)| (*a, *b))
         .collect();
-    let mut f = OpenOptions::new().read(true).write(true).open(dst)?;
+    let mut f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dst)
+        .map_err(io_write)?;
     let mut buf = vec![0u8; CHUNK];
     let mut pos = 0u64;
     while pos < span {
         let n = (span - pos).min(CHUNK as u64) as usize;
-        f.seek(SeekFrom::Start(pos))?;
-        let got = read_chunk(&mut f, &mut buf[..n])?;
+        f.seek(SeekFrom::Start(pos)).map_err(io_read)?;
+        let got = read_chunk(&mut f, &mut buf[..n]).map_err(io_read)?;
         if got == 0 {
             break;
         }
@@ -258,14 +273,14 @@ pub fn patch_flags_keep_size(src: &Path, dst: &Path, limit: u64, _log: &mut Logg
                 start = i + b.len();
             }
         }
-        f.seek(SeekFrom::Start(pos))?;
-        f.write_all(&buf[..got])?;
+        f.seek(SeekFrom::Start(pos)).map_err(io_write)?;
+        f.write_all(&buf[..got]).map_err(io_write)?;
         if n < CHUNK {
             break;
         }
         pos += (n - OVERLAP) as u64;
     }
-    f.flush()?;
+    f.flush().map_err(io_write)?;
     Ok(hits)
 }
 
@@ -286,7 +301,7 @@ const ON_MARKERS: [&[u8]; 9] = [
 /// reports 1 when any "already on" marker is present.
 pub fn flag_bit_from_dumps(workdir: &Path) -> u8 {
     let mut blob: Vec<u8> = Vec::new();
-    for name in ["hd_flg_def.prop", "hd_flg_build.prop"] {
+    for name in ["flg_def.prop", "flg_build.prop"] {
         let p = workdir.join(name);
         if let Ok(meta) = std::fs::metadata(&p) {
             if meta.is_file() && meta.len() > 4 {
@@ -512,23 +527,68 @@ mod tests {
     fn flag_bit_reads_both_dumps_and_separates_them() {
         let dir = tmp("volte_flag_bit");
         assert_eq!(flag_bit_from_dumps(&dir), 0);
-        std::fs::write(dir.join("hd_flg_def.prop"), b"volte_support=").unwrap();
-        std::fs::write(dir.join("hd_flg_build.prop"), b"1xxxx").unwrap();
+        std::fs::write(dir.join("flg_def.prop"), b"volte_support=").unwrap();
+        std::fs::write(dir.join("flg_build.prop"), b"1xxxx").unwrap();
         assert_eq!(flag_bit_from_dumps(&dir), 0, "newline must split the files");
-        std::fs::write(dir.join("hd_flg_build.prop"), b"abc\nvolte_support=1\n").unwrap();
+        std::fs::write(dir.join("flg_build.prop"), b"abc\nvolte_support=1\n").unwrap();
         assert_eq!(flag_bit_from_dumps(&dir), 1);
-        std::fs::write(dir.join("hd_flg_def.prop"), b"abcd").unwrap();
-        std::fs::write(dir.join("hd_flg_build.prop"), b"\nvolte_support=1").unwrap();
+        std::fs::write(dir.join("flg_def.prop"), b"abcd").unwrap();
+        std::fs::write(dir.join("flg_build.prop"), b"\nvolte_support=1").unwrap();
         assert_eq!(
             flag_bit_from_dumps(&dir),
             1,
             "4-byte file is skipped, other one is read"
         );
-        std::fs::write(dir.join("hd_flg_build.prop"), b"1").unwrap();
+        std::fs::write(dir.join("flg_build.prop"), b"1").unwrap();
         assert_eq!(
             flag_bit_from_dumps(&dir),
             0,
             "both files <= 4 bytes -> empty blob"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a6_a_missing_image_is_a_read_error_not_a_zero_hit() {
+        let dir = tmp("volte_flags_a6_read");
+        let missing = dir.join("missing.img");
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let err = patch_flags_keep_size(&missing, &missing, 0, &mut log).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Read,
+            "an unreadable image must be reported as a read error, never as 0 hits: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a6_a_copy_failure_is_a_write_error_not_a_zero_hit() {
+        let dir = tmp("volte_flags_a6_write");
+        let src = dir.join("in.bin");
+        std::fs::write(&src, b"volte_support=0").unwrap();
+        let dst = dir.join("dest");
+        std::fs::create_dir(&dst).unwrap();
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let err = patch_flags_keep_size(&src, &dst, 0, &mut log).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Write,
+            "a failed write must be reported as a write error, never as 0 hits: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a6_no_pair_found_is_still_ok_zero() {
+        let dir = tmp("volte_flags_a6_not_found");
+        let p = dir.join("img.bin");
+        std::fs::write(&p, b"ro.keep=1\n").unwrap();
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        assert_eq!(
+            patch_flags_keep_size(&p, &p, 0, &mut log).unwrap(),
+            0,
+            "a complete scan with no matching pair is a valid zero, not an I/O error"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -135,27 +135,48 @@ pub fn output_size(src: &Path) -> Result<Option<u64>> {
     Ok(Some(parse_header(&head)?.expected))
 }
 
-/// Rejects a chunk whose declared payload size disagrees with its block count.
+/// Rejects a chunk whose declared `total_sz` disagrees with the format.
+///
+/// `total_sz` counts the 12-byte chunk header plus the chunk's real data, and
+/// the data differs per type: RAW carries `csize * blk_sz` bytes, FILL carries
+/// the fixed 4-byte pattern, DONT_CARE carries nothing, and CRC32 carries its
+/// 4-byte checksum with no blocks of its own.
 fn check_chunk_size(ctype: u16, csize: u64, blk_sz: u64, tsize: u64) -> Result<u64> {
     if ctype == CRC32 {
-        if csize != 0 || tsize != 4 {
+        if csize != 0 || tsize != CHUNK_HEADER_LEN + 4 {
             return Err(Error::build(format!(
-                "sparse CRC chunk declares {csize} blocks and {tsize} bytes (expected 0 and 4)"
+                "sparse CRC chunk declares {csize} blocks and {tsize} bytes (expected 0 and {})",
+                CHUNK_HEADER_LEN + 4
             )));
         }
         return Ok(0);
     }
-    let data_len = csize
-        .checked_mul(blk_sz)
-        .ok_or_else(|| Error::build("sparse chunk size overflows"))?;
     if csize == 0 {
         return Err(Error::build(format!(
             "sparse chunk 0x{ctype:X} declares no blocks"
         )));
     }
-    if tsize != data_len {
+    let data_len = csize
+        .checked_mul(blk_sz)
+        .ok_or_else(|| Error::build("sparse chunk size overflows"))?;
+    let expected = match ctype {
+        RAW => CHUNK_HEADER_LEN
+            .checked_add(data_len)
+            .ok_or_else(|| Error::build("sparse chunk size overflows"))?,
+        FILL => CHUNK_HEADER_LEN + 4,
+        DONT_CARE => CHUNK_HEADER_LEN,
+        other => {
+            return Err(Error::build(format!(
+                "bad sparse chunk type: 0x{other:X}"
+            )))
+        }
+    };
+    if tsize != expected {
         return Err(Error::build(format!(
-            "sparse chunk 0x{ctype:X} declares {tsize} bytes for {csize} blocks x {blk_sz}"
+            "sparse chunk 0x{ctype:X} declares {tsize} bytes but the format requires {expected} \
+             ({} header + {} data)",
+            CHUNK_HEADER_LEN,
+            expected - CHUNK_HEADER_LEN
         )));
     }
     Ok(data_len)
@@ -332,27 +353,27 @@ mod tests {
                     out.extend_from_slice(&RAW.to_le_bytes());
                     out.extend_from_slice(&0u16.to_le_bytes());
                     out.extend_from_slice(&((d.len() as u32) / BLK).to_le_bytes());
-                    out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&(12 + d.len() as u32).to_le_bytes());
                     out.extend_from_slice(d);
                 }
                 Chunk::Fill(pat, n) => {
                     out.extend_from_slice(&FILL.to_le_bytes());
                     out.extend_from_slice(&0u16.to_le_bytes());
                     out.extend_from_slice(&n.to_le_bytes());
-                    out.extend_from_slice(&(n * BLK).to_le_bytes());
+                    out.extend_from_slice(&(12u32 + 4).to_le_bytes());
                     out.extend_from_slice(pat);
                 }
                 Chunk::DontCare(n) => {
                     out.extend_from_slice(&DONT_CARE.to_le_bytes());
                     out.extend_from_slice(&0u16.to_le_bytes());
                     out.extend_from_slice(&n.to_le_bytes());
-                    out.extend_from_slice(&(n * BLK).to_le_bytes());
+                    out.extend_from_slice(&12u32.to_le_bytes());
                 }
                 Chunk::Crc(v) => {
                     out.extend_from_slice(&CRC32.to_le_bytes());
                     out.extend_from_slice(&0u16.to_le_bytes());
                     out.extend_from_slice(&0u32.to_le_bytes());
-                    out.extend_from_slice(&4u32.to_le_bytes());
+                    out.extend_from_slice(&(12u32 + 4).to_le_bytes());
                     out.extend_from_slice(&v.to_le_bytes());
                 }
             }
@@ -739,6 +760,112 @@ mod tests {
         let bad_path = dir.join("bad.sparse");
         std::fs::write(&bad_path, &bad).unwrap();
         assert!(output_size(&bad_path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn total_sz_at(sp: &[u8], chunk_at: usize) -> u32 {
+        u32::from_le_bytes(sp[chunk_at + 8..chunk_at + 12].try_into().unwrap())
+    }
+
+    #[test]
+    fn a1_fill_chunk_total_size_is_header_plus_four_bytes() {
+        let sp = build_sparse(&[Chunk::Fill([0xAA, 0xBB, 0xCC, 0xDD], 4)]);
+        assert_eq!(
+            total_sz_at(&sp, 28),
+            12 + 4,
+            "FILL total_sz is the 12-byte chunk header plus the 4-byte pattern, \
+             independent of how many blocks the chunk covers"
+        );
+    }
+
+    #[test]
+    fn a1_dont_care_chunk_total_size_is_only_the_header() {
+        let sp = build_sparse(&[Chunk::DontCare(5)]);
+        assert_eq!(
+            total_sz_at(&sp, 28),
+            12,
+            "DONT_CARE carries no data, so total_sz is only the chunk header"
+        );
+    }
+
+    #[test]
+    fn a1_raw_chunk_total_size_is_data_plus_the_header() {
+        let sp = build_sparse(&[Chunk::Raw(vec![7u8; 2 * BLK as usize])]);
+        assert_eq!(
+            total_sz_at(&sp, 28),
+            12 + 2 * BLK,
+            "RAW total_sz is the chunk header plus chunk_sz * blk_sz"
+        );
+    }
+
+    #[test]
+    fn a1_img2simg_style_sparse_image_is_accepted() {
+        fn file_header(total_blks: u32, total_chunks: u32) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&SPARSE_MAGIC.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&28u16.to_le_bytes());
+            out.extend_from_slice(&12u16.to_le_bytes());
+            out.extend_from_slice(&BLK.to_le_bytes());
+            out.extend_from_slice(&total_blks.to_le_bytes());
+            out.extend_from_slice(&total_chunks.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out
+        }
+
+        fn chunk(ctype: u16, csize: u32, total_sz: u32, data: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&ctype.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&csize.to_le_bytes());
+            out.extend_from_slice(&total_sz.to_le_bytes());
+            out.extend_from_slice(data);
+            out
+        }
+
+        let dir = tmp("volte_sparse_a1_img2simg");
+        let src = dir.join("image.sparse");
+        let dst = dir.join("image.raw");
+
+        let mut raw_block = vec![0u8; BLK as usize];
+        raw_block[0] = 0x5A;
+        let pattern = [0x11u8, 0x22, 0x33, 0x44];
+        let mut sp = file_header(5, 4);
+        sp.extend_from_slice(&chunk(RAW, 1, 12 + BLK, &raw_block));
+        sp.extend_from_slice(&chunk(FILL, 2, 12 + 4, &pattern));
+        sp.extend_from_slice(&chunk(DONT_CARE, 2, 12, &[]));
+        sp.extend_from_slice(&chunk(
+            CRC32,
+            0,
+            12 + 4,
+            &0xDEAD_BEEFu32.to_le_bytes(),
+        ));
+        std::fs::write(&src, &sp).unwrap();
+
+        assert_eq!(
+            unsparse(&src, &dst).unwrap(),
+            Unsparse::Converted {
+                written: 5 * BLK as u64
+            },
+            "a real img2simg image uses total_sz = header + per-type data"
+        );
+        let raw = std::fs::read(&dst).unwrap();
+        assert_eq!(raw.len(), 5 * BLK as usize);
+        assert_eq!(&raw[..BLK as usize], &raw_block[..]);
+        for i in 1..=2 {
+            let off = BLK as usize * i;
+            assert!(
+                (0..BLK as usize).all(|j| raw[off + j] == pattern[j % 4]),
+                "fill block {i}"
+            );
+        }
+        assert!(
+            raw[3 * BLK as usize..5 * BLK as usize]
+                .iter()
+                .all(|&b| b == 0),
+            "the DONT_CARE tail must stay zero"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

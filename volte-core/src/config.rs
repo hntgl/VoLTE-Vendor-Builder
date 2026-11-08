@@ -18,9 +18,9 @@ pub const OVERLAP: usize = 256;
 pub const APK_NAME: &str = "OPPO_VoLTE_Overlay.apk";
 pub const APK_NAME_MTK: &str = APK_NAME;
 pub const APK_NAME_QC: &str = APK_NAME;
-pub const RC_NAME_MTK: &str = "hd_oppo_mtk_volte.rc";
-pub const RC_NAME_QC: &str = "hd_oppo_qc_volte.rc";
-pub const FEATURES_XML: &str = "hd_volte_features.xml";
+pub const RC_NAME_MTK: &str = "oppo_mtk_volte.rc";
+pub const RC_NAME_QC: &str = "oppo_qc_volte.rc";
+pub const FEATURES_XML: &str = "volte_features.xml";
 
 /// Report/summary tokens. Their spelling is part of the product output and must
 /// stay byte-identical to the Python tool.

@@ -37,6 +37,18 @@ pub struct AvbFooter {
     pub vbmeta_size: u64,
 }
 
+/// Integrity scheme of the descriptor that named the image partition. `None`
+/// means no hashtree/hash descriptor was found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DescriptorKind {
+    #[default]
+    None,
+    /// Tag 2: a whole-partition hash.
+    HashOnly,
+    /// Tag 1: a dm-verity hashtree.
+    Hashtree,
+}
+
 /// Result of `avb_info_fast` (`:554`). Defaults are the Python dict defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvbInfo {
@@ -53,6 +65,13 @@ pub struct AvbInfo {
     pub footer_major: u32,
     pub footer_minor: u32,
     pub props: Vec<(String, String)>,
+    /// Descriptor tags this build does not know how to read. Recorded so the
+    /// pipeline can warn instead of pretending the vbmeta was fully parsed.
+    pub unsupported_descriptor_tags: Vec<u64>,
+    /// Tag 4 references another partition. The rebuild cannot reproduce it.
+    pub has_chain_descriptor: bool,
+    /// Which descriptor (Tag 1 or Tag 2) named the image partition.
+    pub descriptor_kind: DescriptorKind,
 }
 
 impl AvbInfo {
@@ -71,6 +90,9 @@ impl AvbInfo {
             footer_major: 0,
             footer_minor: 0,
             props: Vec::new(),
+            unsupported_descriptor_tags: Vec::new(),
+            has_chain_descriptor: false,
+            descriptor_kind: DescriptorKind::None,
         }
     }
 }
@@ -162,6 +184,9 @@ fn fill_from_vbmeta(path: &Path, footer: &AvbFooter) -> Result<AvbInfo> {
         info.fec_roots = roots;
     }
     info.props = meta.props;
+    info.unsupported_descriptor_tags = meta.unsupported_tags;
+    info.has_chain_descriptor = meta.has_chain_descriptor;
+    info.descriptor_kind = meta.descriptor_kind;
     Ok(info)
 }
 
@@ -173,10 +198,17 @@ const VBMETA_HEADER_LEN: usize = 256;
 const HASHTREE_DESCRIPTOR_LEN: usize = 180;
 /// `AvbPropertyDescriptor.SIZE`.
 const PROPERTY_DESCRIPTOR_LEN: usize = 32;
+/// `AvbHashDescriptor.SIZE` (16-byte header + 116 byte fixed body).
+const HASH_DESCRIPTOR_LEN: usize = 132;
+/// `AvbChainPartitionDescriptor.SIZE` (16-byte header + 76 byte fixed body).
+const CHAIN_PARTITION_DESCRIPTOR_LEN: usize = 92;
 
 /// Fields the rebuild needs from the vbmeta descriptors. `None` means the
 /// image has no descriptor that carries the field, not that the field was
-/// guessed.
+/// guessed. Only hashtree/hash descriptors (tags 1/2) name the image being
+/// rebuilt: the first one picks its partition and later descriptors of that
+/// same partition fill only the fields still `None`. Chain descriptors (tag 4)
+/// reference another partition and never select the image partition.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct VbmetaMeta {
     partition_name: Option<String>,
@@ -184,6 +216,9 @@ struct VbmetaMeta {
     salt: Option<String>,
     fec_roots: Option<u32>,
     props: Vec<(String, String)>,
+    unsupported_tags: Vec<u64>,
+    has_chain_descriptor: bool,
+    descriptor_kind: DescriptorKind,
 }
 
 fn be_u32(bytes: &[u8]) -> u32 {
@@ -215,11 +250,34 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Selects the first image descriptor's partition name and reports whether
+/// this descriptor belongs to the selected partition. Only tags 1/2 may call
+/// this: their `partition_name` is the image they describe. A descriptor from
+/// any other partition may not contribute metadata.
+fn select_image_partition(meta: &mut VbmetaMeta, name: &str) -> bool {
+    if let Some(chosen) = meta.partition_name.as_deref() {
+        return chosen == name;
+    }
+    meta.partition_name = Some(name.to_owned());
+    true
+}
+
+/// First non-empty algorithm and first salt win. Only descriptors of the
+/// selected partition reach this helper.
+fn merge_hash_fields(meta: &mut VbmetaMeta, algorithm: String, salt: String) {
+    if meta.hash_algorithm.is_none() && !algorithm.is_empty() {
+        meta.hash_algorithm = Some(algorithm);
+    }
+    if meta.salt.is_none() {
+        meta.salt = Some(salt);
+    }
+}
+
 /// Parses `AvbVBMetaImageHeader` plus its descriptor block. Tags are read from
-/// the descriptor header, never searched for as text; unknown tags are skipped
-/// the way `avbtool.py` skips them. Any length that does not match the
-/// descriptor's own size formula is an error, so a truncated image can never
-/// be read as metadata.
+/// the descriptor header, never searched for as text; tags this build does not
+/// understand are recorded in `unsupported_tags` rather than dropped silently.
+/// Any length that does not match the descriptor's own size formula is an
+/// error, so a truncated image can never be read as metadata.
 fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
     if vb.len() < VBMETA_HEADER_LEN {
         return Err(format!(
@@ -283,7 +341,9 @@ fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
                 }
             }
             1 => parse_hashtree(body, pos, &mut meta)?,
-            _ => {}
+            2 => parse_hash_descriptor(body, pos, &mut meta)?,
+            4 => parse_chain_partition_descriptor(body, pos, &mut meta)?,
+            _ => meta.unsupported_tags.push(tag),
         }
         pos = last;
     }
@@ -326,19 +386,105 @@ fn parse_hashtree(
     let name_at = HASHTREE_DESCRIPTOR_LEN;
     let salt_at = name_at + name_len;
     let salt = &body[salt_at..salt_at + salt_len];
+    let name = std::str::from_utf8(&body[name_at..name_at + name_len])
+        .map_err(|_| format!("partition name at {pos} is not UTF-8"))?;
 
-    if meta.partition_name.is_none() {
-        let name = std::str::from_utf8(&body[name_at..name_at + name_len])
-            .map_err(|_| format!("partition name at {pos} is not UTF-8"))?;
-        meta.partition_name = Some(name.to_owned());
-        meta.hash_algorithm = if algorithm.is_empty() {
-            None
-        } else {
-            Some(algorithm)
-        };
-        meta.salt = Some(hex_lower(salt));
-        meta.fec_roots = Some(fec_roots);
+    if select_image_partition(meta, name) {
+        merge_hash_fields(meta, algorithm, hex_lower(salt));
+        if meta.fec_roots.is_none() {
+            meta.fec_roots = Some(fec_roots);
+        }
+        meta.descriptor_kind = DescriptorKind::Hashtree;
     }
+    Ok(())
+}
+
+/// Tag 2, `AvbHashDescriptor`: a whole-partition hash. `digest_len == 0` is a
+/// persistent digest and therefore valid.
+fn parse_hash_descriptor(
+    body: &[u8],
+    pos: usize,
+    meta: &mut VbmetaMeta,
+) -> std::result::Result<(), String> {
+    if body.len() < HASH_DESCRIPTOR_LEN {
+        return Err(format!(
+            "hash descriptor at {pos} is shorter than {HASH_DESCRIPTOR_LEN} bytes"
+        ));
+    }
+    let nbf = be_u64(&body[8..16]) as usize;
+    let algorithm = fixed_string(&body[24..56], "hash algorithm")?;
+    let name_len = be_u32(&body[56..60]) as usize;
+    let salt_len = be_u32(&body[60..64]) as usize;
+    let digest_len = be_u32(&body[64..68]) as usize;
+    let dynamic = HASH_DESCRIPTOR_LEN
+        .checked_add(name_len)
+        .and_then(|n| n.checked_add(salt_len))
+        .and_then(|n| n.checked_add(digest_len))
+        .ok_or("hash descriptor lengths overflow")?;
+    if dynamic > body.len() {
+        return Err(format!(
+            "hash descriptor at {pos} declares {dynamic} bytes but carries {}",
+            body.len()
+        ));
+    }
+    let expected = round8(dynamic.saturating_sub(16));
+    if nbf != expected {
+        return Err(format!(
+            "hash descriptor at {pos} declares {nbf} following bytes, expected {expected}"
+        ));
+    }
+    let name_at = HASH_DESCRIPTOR_LEN;
+    let salt_at = name_at + name_len;
+    let salt = &body[salt_at..salt_at + salt_len];
+    let name = std::str::from_utf8(&body[name_at..name_at + name_len])
+        .map_err(|_| format!("partition name at {pos} is not UTF-8"))?;
+
+    if select_image_partition(meta, name) {
+        merge_hash_fields(meta, algorithm, hex_lower(salt));
+        if meta.descriptor_kind == DescriptorKind::None {
+            meta.descriptor_kind = DescriptorKind::HashOnly;
+        }
+    }
+    Ok(())
+}
+
+/// Tag 4, `AvbChainPartitionDescriptor`: names another partition signed by a
+/// public key. It carries no hash algorithm, salt or FEC roots, and its
+/// `partition_name` is not the image being rebuilt, so it selects nothing.
+/// The flag records that a rebuild would drop this chain reference.
+fn parse_chain_partition_descriptor(
+    body: &[u8],
+    pos: usize,
+    meta: &mut VbmetaMeta,
+) -> std::result::Result<(), String> {
+    if body.len() < CHAIN_PARTITION_DESCRIPTOR_LEN {
+        return Err(format!(
+            "chain partition descriptor at {pos} is shorter than {CHAIN_PARTITION_DESCRIPTOR_LEN} bytes"
+        ));
+    }
+    let nbf = be_u64(&body[8..16]) as usize;
+    let name_len = be_u32(&body[20..24]) as usize;
+    let public_key_len = be_u32(&body[24..28]) as usize;
+    let dynamic = CHAIN_PARTITION_DESCRIPTOR_LEN
+        .checked_add(name_len)
+        .and_then(|n| n.checked_add(public_key_len))
+        .ok_or("chain partition descriptor lengths overflow")?;
+    if dynamic > body.len() {
+        return Err(format!(
+            "chain partition descriptor at {pos} declares {dynamic} bytes but carries {}",
+            body.len()
+        ));
+    }
+    let expected = round8(dynamic.saturating_sub(16));
+    if nbf != expected {
+        return Err(format!(
+            "chain partition descriptor at {pos} declares {nbf} following bytes, expected {expected}"
+        ));
+    }
+    let name_at = CHAIN_PARTITION_DESCRIPTOR_LEN;
+    let _name = std::str::from_utf8(&body[name_at..name_at + name_len])
+        .map_err(|_| format!("partition name at {pos} is not UTF-8"))?;
+    meta.has_chain_descriptor = true;
     Ok(())
 }
 
@@ -596,6 +742,15 @@ pub fn rebuild_hashtree(
 
     log.log("[STATUS] Erasing old AVB footer...");
     let erased = erase_footer(image, info)?;
+    let tail = match truncate_to_original_size(image, info) {
+        Ok(tail) => tail,
+        Err(e) => {
+            if let Some((at, saved)) = &erased {
+                let _ = restore_footer(image, *at, saved);
+            }
+            return Err(e);
+        }
+    };
     log.log("[STATUS] Rebuilding AVB hashtree...");
     if lock > 0 {
         log.log(format!(
@@ -610,13 +765,14 @@ pub fn rebuild_hashtree(
         req.partition_size
     ));
     if let Err(e) = backend.add_hashtree_footer(&req) {
-        restore_or_report(image, &erased, e)?;
-        unreachable!("restore_or_report always returns");
+        restore_truncated_or_report(image, &tail, &erased, e)?;
+        unreachable!("restore_truncated_or_report always returns");
     }
 
     let after = match avb_info_fast(image) {
         Ok(after) => after,
         Err(e) => {
+            restore_truncated(image, &tail)?;
             if let Some((at, saved)) = &erased {
                 let _ = restore_footer(image, *at, saved);
             }
@@ -624,6 +780,7 @@ pub fn rebuild_hashtree(
         }
     };
     if !after.has_footer {
+        restore_truncated(image, &tail)?;
         if let Some((at, saved)) = &erased {
             restore_footer(image, *at, saved).map_err(|r| {
                 Error::build(format!(
@@ -687,6 +844,58 @@ fn restore_footer(image: &Path, at: u64, saved: &[u8; FOOTER_LEN]) -> Result<()>
     f.write_all(saved)?;
     f.sync_all()?;
     Ok(())
+}
+
+/// Drops the old hashtree/vbmeta tail so `avbtool` only sees real image data.
+/// The discarded bytes are returned so a failed rebuild can restore the file.
+fn truncate_to_original_size(image: &Path, info: &AvbInfo) -> Result<Option<(u64, Vec<u8>)>> {
+    let orig = info.original_image_size;
+    if orig == 0 {
+        return Ok(None);
+    }
+    let cur = std::fs::metadata(image)?.len();
+    if orig > cur {
+        return Err(Error::build(format!(
+            "AVB footer says the original image is {orig} bytes but the file is only {cur} bytes - refusing to rebuild from contradictory metadata"
+        )));
+    }
+    if orig == cur {
+        return Ok(None);
+    }
+    let mut f = OpenOptions::new().read(true).write(true).open(image)?;
+    f.seek(SeekFrom::Start(orig))?;
+    let mut tail = vec![0u8; (cur - orig) as usize];
+    f.read_exact(&mut tail)?;
+    f.set_len(orig)?;
+    f.sync_all()?;
+    Ok(Some((orig, tail)))
+}
+
+fn restore_truncated(image: &Path, tail: &Option<(u64, Vec<u8>)>) -> Result<()> {
+    if let Some((at, data)) = tail {
+        let mut f = OpenOptions::new().write(true).open(image)?;
+        f.seek(SeekFrom::Start(*at))?;
+        f.write_all(data)?;
+        f.set_len(*at + data.len() as u64)?;
+        f.sync_all()?;
+    }
+    Ok(())
+}
+
+fn restore_truncated_or_report(
+    image: &Path,
+    tail: &Option<(u64, Vec<u8>)>,
+    erased: &Option<(u64, [u8; FOOTER_LEN])>,
+    error: Error,
+) -> Result<()> {
+    if let Err(restore) = restore_truncated(image, tail) {
+        return Err(Error::build(format!(
+            "{} (and the truncated image could not be restored: {})",
+            error.message(),
+            restore.message()
+        )));
+    }
+    restore_or_report(image, erased, error)
 }
 
 /// Puts the erased footer back and returns the backend error. When the restore
@@ -1260,6 +1469,488 @@ mod tests {
         .unwrap();
         assert!(out.is_none());
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024 + 4096);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test-local 8-byte alignment. Deliberately not `round8`, so a bug in the
+    /// production helper cannot hide behind the fixture builder.
+    fn a2_pad8(n: usize) -> usize {
+        n.div_ceil(8) * 8
+    }
+
+    /// `AvbHashDescriptor` built from the AOSP layout alone: 16-byte header
+    /// (tag + num_bytes_following) then 116 fixed bytes then name/salt/digest.
+    fn a2_hash_descriptor(
+        image_size: u64,
+        algorithm: &str,
+        name: &str,
+        salt: &[u8],
+        digest: &[u8],
+    ) -> Vec<u8> {
+        let mut d = vec![0u8; 132];
+        d[0..8].copy_from_slice(&2u64.to_be_bytes());
+        d[16..24].copy_from_slice(&image_size.to_be_bytes());
+        let alg = algorithm.as_bytes();
+        assert!(alg.len() < 32, "hash_algorithm must fit in char[32]");
+        d[24..24 + alg.len()].copy_from_slice(alg);
+        d[56..60].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        d[60..64].copy_from_slice(&(salt.len() as u32).to_be_bytes());
+        d[64..68].copy_from_slice(&(digest.len() as u32).to_be_bytes());
+        d.extend_from_slice(name.as_bytes());
+        d.extend_from_slice(salt);
+        d.extend_from_slice(digest);
+        let nbf = a2_pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
+    /// `AvbChainPartitionDescriptor`: 16-byte header, 76 fixed bytes, then
+    /// partition name and public key.
+    fn a2_chain_descriptor(partition: &str, public_key: &[u8], rollback: u32) -> Vec<u8> {
+        let mut d = vec![0u8; 92];
+        d[0..8].copy_from_slice(&4u64.to_be_bytes());
+        d[16..20].copy_from_slice(&rollback.to_be_bytes());
+        d[20..24].copy_from_slice(&(partition.len() as u32).to_be_bytes());
+        d[24..28].copy_from_slice(&(public_key.len() as u32).to_be_bytes());
+        d.extend_from_slice(partition.as_bytes());
+        d.extend_from_slice(public_key);
+        let nbf = a2_pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
+    /// `AvbHashtreeDescriptor` from the AOSP field order: 16-byte header, then
+    /// 164 fixed bytes (`fec_num_roots` at 52, `hash_algorithm` at 72), then
+    /// partition name, salt and root digest.
+    fn a2_hashtree_descriptor(
+        image_size: u64,
+        algorithm: &str,
+        name: &str,
+        salt: &[u8],
+        digest: &[u8],
+        fec_roots: u32,
+    ) -> Vec<u8> {
+        let mut d = vec![0u8; 180];
+        d[0..8].copy_from_slice(&1u64.to_be_bytes());
+        d[16..20].copy_from_slice(&1u32.to_be_bytes()); // dm_verity_version
+        d[20..28].copy_from_slice(&image_size.to_be_bytes());
+        d[44..48].copy_from_slice(&4096u32.to_be_bytes()); // data_block_size
+        d[48..52].copy_from_slice(&4096u32.to_be_bytes()); // hash_block_size
+        d[52..56].copy_from_slice(&fec_roots.to_be_bytes());
+        let alg = algorithm.as_bytes();
+        assert!(alg.len() < 32, "hash_algorithm must fit in char[32]");
+        d[72..72 + alg.len()].copy_from_slice(alg);
+        d[104..108].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        d[108..112].copy_from_slice(&(salt.len() as u32).to_be_bytes());
+        d[112..116].copy_from_slice(&(digest.len() as u32).to_be_bytes());
+        d.extend_from_slice(name.as_bytes());
+        d.extend_from_slice(salt);
+        d.extend_from_slice(digest);
+        let nbf = a2_pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
+    /// Descriptor with an arbitrary tag and payload, used to prove unknown
+    /// tags are recorded instead of silently dropped.
+    fn a2_unknown_descriptor(tag: u64, payload: &[u8]) -> Vec<u8> {
+        let mut d = vec![0u8; 16];
+        d[0..8].copy_from_slice(&tag.to_be_bytes());
+        d.extend_from_slice(payload);
+        let nbf = a2_pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
+    /// Minimal `AvbVBMetaImageHeader` (256 bytes) with no auth/aux blocks and
+    /// the descriptors immediately after `desc_offset = 0`.
+    fn a2_vbmeta_with(descriptors: &[Vec<u8>]) -> Vec<u8> {
+        let mut vb = vec![0u8; 256];
+        vb[..4].copy_from_slice(b"AVB0");
+        let desc_size: usize = descriptors.iter().map(Vec::len).sum();
+        // The descriptor block lives inside the auxiliary data block, so the
+        // header's aux size must cover it (`parse_vbmeta` checks this bound).
+        vb[20..28].copy_from_slice(&(desc_size as u64).to_be_bytes());
+        vb[104..112].copy_from_slice(&(desc_size as u64).to_be_bytes());
+        for d in descriptors {
+            vb.extend_from_slice(d);
+        }
+        vb
+    }
+
+    /// 2 MiB image with `vb` at 1 MiB and a matching AVB footer at the end.
+    fn a2_image_with_vbmeta(dir: &Path, vb: &[u8]) -> PathBuf {
+        let path = dir.join("vendor.img");
+        let size: u64 = 2 * 1024 * 1024;
+        let mut data = vec![0u8; size as usize];
+        data[1024 * 1024..1024 * 1024 + vb.len()].copy_from_slice(vb);
+        let footer_at = size - 64;
+        data[footer_at as usize..footer_at as usize + 64].copy_from_slice(&footer_bytes(
+            1,
+            0,
+            1024 * 1024,
+            1024 * 1024,
+            vb.len() as u64,
+        ));
+        std::fs::write(&path, &data).unwrap();
+        path
+    }
+
+    #[test]
+    fn a2_hash_descriptor_sets_partition_name_and_algorithm() {
+        let dir = tmp("volte_avb_a2_hash");
+        let vb = a2_vbmeta_with(&[a2_hash_descriptor(
+            4096,
+            "sha1",
+            "vendor_dlkm",
+            &[0xde, 0xad, 0xbe, 0xef],
+            &[], // digest_len == 0 means a persistent digest, not an error
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.partition_name, "vendor_dlkm");
+        assert_eq!(info.hash_algorithm, "sha1");
+        assert_eq!(info.salt, "deadbeef");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_chain_only_does_not_override_image_partition_fallback() {
+        let dir = tmp("volte_avb_a2_chain");
+        let vb = a2_vbmeta_with(&[a2_chain_descriptor("boot", &[0x11, 0x22, 0x33, 0x44], 1)]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(
+            info.partition_name, "vendor",
+            "a chain reference names another partition, not the image being rebuilt"
+        );
+        assert_eq!(info.hash_algorithm, "sha256");
+        assert_eq!(info.salt, "");
+        assert_eq!(info.fec_roots, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_an_unknown_descriptor_tag_is_recorded_not_silently_dropped() {
+        let dir = tmp("volte_avb_a2_unknown");
+        let vb = a2_vbmeta_with(&[a2_unknown_descriptor(99, &[0xaa; 8])]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.unsupported_descriptor_tags, vec![99]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_chain_before_hash_same_partition_merges_fields() {
+        let dir = tmp("volte_avb_a2_merge_chain_hash");
+        let vb = a2_vbmeta_with(&[
+            a2_chain_descriptor("vendor_dlkm", &[0x01, 0x02, 0x03], 1),
+            a2_hash_descriptor(
+                4096,
+                "sha512",
+                "vendor_dlkm",
+                &[0xaa, 0xbb, 0xcc, 0xdd],
+                &[],
+            ),
+        ]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.partition_name, "vendor_dlkm");
+        assert_eq!(info.hash_algorithm, "sha512");
+        assert_eq!(info.salt, "aabbccdd");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_chain_before_hashtree_does_not_select_image_partition() {
+        let dir = tmp("volte_avb_a2_chain_before_tree");
+        let vb = a2_vbmeta_with(&[
+            a2_chain_descriptor("boot", &[0x01, 0x02, 0x03], 1),
+            a2_hashtree_descriptor(
+                4096,
+                "sha512",
+                "vendor",
+                &[0xaa, 0xbb, 0xcc, 0xdd],
+                &[0x55; 32],
+                2,
+            ),
+        ]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(
+            info.partition_name, "vendor",
+            "the hashtree descriptor names the image partition"
+        );
+        assert_eq!(info.hash_algorithm, "sha512");
+        assert_eq!(info.salt, "aabbccdd");
+        assert_eq!(info.fec_roots, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_chain_reference_does_not_mix_hash_metadata() {
+        let dir = tmp("volte_avb_a2_merge_mixed_partitions");
+        let vb = a2_vbmeta_with(&[
+            a2_chain_descriptor("boot", &[0x01, 0x02, 0x03], 1),
+            a2_hash_descriptor(4096, "sha1", "vendor_dlkm", &[0x11, 0x22, 0x33, 0x44], &[]),
+        ]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(
+            info.partition_name, "vendor_dlkm",
+            "the chain reference must not take over the image partition name"
+        );
+        assert_eq!(
+            info.hash_algorithm, "sha1",
+            "hash must come from the descriptor that names the image partition"
+        );
+        assert_eq!(info.salt, "11223344");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_multiple_chain_descriptors_are_handled_correctly() {
+        let dir = tmp("volte_avb_a2_chain_multiple");
+        let vb = a2_vbmeta_with(&[
+            a2_chain_descriptor("boot", &[0x01, 0x02, 0x03], 1),
+            a2_chain_descriptor("system", &[0x04, 0x05, 0x06], 2),
+            a2_hashtree_descriptor(
+                4096,
+                "sha256",
+                "vendor",
+                &[0xde, 0xad, 0xbe, 0xef],
+                &[0x77; 32],
+                1,
+            ),
+        ]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.partition_name, "vendor");
+        assert_eq!(info.hash_algorithm, "sha256");
+        assert_eq!(info.salt, "deadbeef");
+        assert_eq!(info.fec_roots, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_hash_before_hashtree_same_partition_fills_fec_only() {
+        let dir = tmp("volte_avb_a2_merge_hash_tree");
+        let vb = a2_vbmeta_with(&[
+            a2_hash_descriptor(4096, "sha512", "vendor", &[0xaa, 0xbb, 0xcc, 0xdd], &[]),
+            a2_hashtree_descriptor(
+                4096,
+                "sha256",
+                "vendor",
+                &[0x11, 0x22, 0x33, 0x44],
+                &[0x55; 32],
+                2,
+            ),
+        ]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.partition_name, "vendor");
+        assert_eq!(info.hash_algorithm, "sha512", "first algorithm wins");
+        assert_eq!(info.salt, "aabbccdd", "first salt wins");
+        assert_eq!(info.fec_roots, 2, "hashtree still fills the missing FEC");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_hashtree_before_hash_same_partition_keeps_first_values() {
+        let dir = tmp("volte_avb_a2_merge_tree_hash");
+        let vb = a2_vbmeta_with(&[
+            a2_hashtree_descriptor(
+                4096,
+                "sha256",
+                "vendor",
+                &[0x11, 0x22, 0x33, 0x44],
+                &[0x55; 32],
+                2,
+            ),
+            a2_hash_descriptor(4096, "sha512", "vendor", &[0xaa, 0xbb, 0xcc, 0xdd], &[]),
+        ]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.partition_name, "vendor");
+        assert_eq!(info.hash_algorithm, "sha256");
+        assert_eq!(info.salt, "11223344");
+        assert_eq!(info.fec_roots, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_hashtree_for_another_partition_does_not_fill_missing_fields() {
+        let dir = tmp("volte_avb_a2_merge_tree_other");
+        let vb = a2_vbmeta_with(&[
+            a2_hash_descriptor(4096, "sha512", "vendor", &[0xaa, 0xbb, 0xcc, 0xdd], &[]),
+            a2_hashtree_descriptor(
+                4096,
+                "sha256",
+                "vendor_dlkm",
+                &[0x11, 0x22, 0x33, 0x44],
+                &[0x55; 32],
+                4,
+            ),
+        ]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.partition_name, "vendor");
+        assert_eq!(
+            info.fec_roots, 0,
+            "FEC from another partition must be ignored"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_chain_descriptor_is_flagged_in_avb_info() {
+        let dir = tmp("volte_avb_a2_chain_flag");
+        let vb = a2_vbmeta_with(&[a2_chain_descriptor("boot", &[0x11, 0x22, 0x33], 1)]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert!(info.has_chain_descriptor);
+        assert_eq!(info.descriptor_kind, DescriptorKind::None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_descriptor_kind_distinguishes_hash_from_hashtree() {
+        let dir = tmp("volte_avb_a2_kind");
+        let hash = a2_image_with_vbmeta(
+            &dir,
+            &a2_vbmeta_with(&[a2_hash_descriptor(4096, "sha1", "vendor", &[0xaa], &[])]),
+        );
+        assert_eq!(
+            avb_info_fast(&hash).unwrap().descriptor_kind,
+            DescriptorKind::HashOnly
+        );
+
+        let tree = a2_image_with_vbmeta(
+            &dir,
+            &a2_vbmeta_with(&[a2_hashtree_descriptor(
+                4096,
+                "sha256",
+                "vendor",
+                &[0xbb],
+                &[0x55; 32],
+                2,
+            )]),
+        );
+        assert_eq!(
+            avb_info_fast(&tree).unwrap().descriptor_kind,
+            DescriptorKind::Hashtree
+        );
+
+        let mixed = a2_image_with_vbmeta(
+            &dir,
+            &a2_vbmeta_with(&[
+                a2_hash_descriptor(4096, "sha1", "vendor", &[0xcc], &[]),
+                a2_hashtree_descriptor(4096, "sha256", "vendor", &[0xdd], &[0x66; 32], 2),
+            ]),
+        );
+        assert_eq!(
+            avb_info_fast(&mixed).unwrap().descriptor_kind,
+            DescriptorKind::Hashtree,
+            "a hashtree descriptor wins over a hash descriptor"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tool_dir_for_avbtool() -> PathBuf {
+        let dir = match std::env::var("VOLTE_TOOL_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tool"),
+        };
+        assert!(
+            dir.join("avbtool.py").is_file(),
+            "bundled avbtool missing at {} (set VOLTE_TOOL_DIR)",
+            dir.display()
+        );
+        assert!(
+            dir.join("python").join("python.exe").is_file(),
+            "bundled python missing at {} (set VOLTE_TOOL_DIR)",
+            dir.display()
+        );
+        dir
+    }
+
+    /// Padded image with a valid old footer: original 2 MiB, slot 4 MiB, and a
+    /// fake old hashtree/vbmeta tail that avbtool must not count as data.
+    fn padded_image_with_old_tail(dir: &Path) -> PathBuf {
+        let p = dir.join("vendor.img");
+        let orig: u64 = 2 * 1024 * 1024;
+        let part: u64 = 4 * 1024 * 1024;
+        let mut data = vec![0xABu8; part as usize];
+        data[..orig as usize].fill(0x5A);
+        let mut vb = vec![0u8; 256];
+        vb[..4].copy_from_slice(b"AVB0");
+        data[orig as usize..orig as usize + vb.len()].copy_from_slice(&vb);
+        let at = part as usize - 64;
+        data[at..at + 64].copy_from_slice(&footer_bytes(1, 0, orig, orig, vb.len() as u64));
+        std::fs::write(&p, &data).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_padded_image_is_truncated_before_the_real_avbtool_rebuild() {
+        let dir = tmp("volte_avb_real_avbtool_truncate");
+        let p = padded_image_with_old_tail(&dir);
+        let tool = tool_dir_for_avbtool();
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.original_image_size, 2 * 1024 * 1024);
+        assert_eq!(info.partition_size, 4 * 1024 * 1024);
+
+        let mut backend = PythonAvbtool::new(
+            tool.join("python").join("python.exe"),
+            tool.join("avbtool.py"),
+        )
+        .unwrap();
+        let (mut log, lines) = catching_logger();
+        let out = rebuild_hashtree(&p, &info, info.partition_size, &mut backend, &mut log)
+            .unwrap_or_else(|e| panic!("real avbtool rebuild failed: {}", e.message()))
+            .expect("footer rebuilt");
+        assert!(out.has_footer);
+        assert_eq!(out.original_image_size, 2 * 1024 * 1024);
+        assert_eq!(out.partition_size, 4 * 1024 * 1024);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 4 * 1024 * 1024);
+        let text = lines.borrow().join("\n");
+        assert!(!text.contains("exceeds maximum image size"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct CountingBackend {
+        calls: usize,
+    }
+
+    impl Avb for CountingBackend {
+        fn add_hashtree_footer(&mut self, _req: &HashtreeRequest) -> Result<()> {
+            self.calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn original_size_larger_than_the_file_is_refused_before_the_backend() {
+        let dir = tmp("volte_avb_orig_too_big");
+        let p = plain_image(&dir, 2 * 1024 * 1024);
+        let before = std::fs::read(&p).unwrap();
+        let mut info = AvbInfo::empty(2 * 1024 * 1024);
+        info.partition_size = 2 * 1024 * 1024;
+        info.original_image_size = 3 * 1024 * 1024;
+        let mut backend = CountingBackend { calls: 0 };
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let err = rebuild_hashtree(&p, &info, 0, &mut backend, &mut log).unwrap_err();
+        assert_eq!(backend.calls, 0, "the backend must not be reached");
+        let msg = err.message();
+        assert!(msg.contains("3145728"), "{msg}");
+        assert!(msg.contains("2097152"), "{msg}");
+        assert_eq!(std::fs::read(&p).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

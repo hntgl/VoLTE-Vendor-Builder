@@ -1,7 +1,7 @@
 //! VoLTE property injection and device identification.
 //!
 //! Port of `inject_volte_show_props` (`hd_vendor_build.py:1055`) and
-//! `dump_device_props` (`:1167`). `HD_VOLTE_SHOW_PROPS` is byte-identical to the
+//! `dump_device_props` (`:1167`). `VOLTE_PROP_OVERRIDES` is byte-identical to the
 //! Python tuple: 75 lines, 75 distinct keys, values copied verbatim.
 
 use std::path::Path;
@@ -11,8 +11,8 @@ use crate::error::Result;
 use crate::ext4_tools::Ext4Ops;
 use crate::logging::Logger;
 
-/// `HD_VOLTE_SHOW_PROPS` (`:99-175`).
-pub const HD_VOLTE_SHOW_PROPS: [&str; 75] = [
+/// `VOLTE_PROP_OVERRIDES` (`:99-175`).
+pub const VOLTE_PROP_OVERRIDES: [&str; 75] = [
     "persist.dbg.ims_volte_enable=1",
     "persist.dbg.volte_avail_ovr=1",
     "persist.dbg.vt_avail_ovr=1",
@@ -92,12 +92,12 @@ pub const HD_VOLTE_SHOW_PROPS: [&str; 75] = [
 
 /// The six property files, in Python's order (`:1067-1074`).
 pub const PROP_FILES: [(&str, &str); 6] = [
-    ("/build.prop", "hd_volte_build.prop"),
-    ("/default.prop", "hd_volte_default.prop"),
-    ("/etc/build.prop", "hd_volte_etc_build.prop"),
-    ("/odm/etc/build.prop", "hd_volte_odm_build.prop"),
-    ("/euclid_build.prop", "hd_volte_euclid.prop"),
-    ("/vendor_build.prop", "hd_volte_vendor_build.prop"),
+    ("/build.prop", "volte_build.prop"),
+    ("/default.prop", "volte_default.prop"),
+    ("/etc/build.prop", "volte_etc_build.prop"),
+    ("/odm/etc/build.prop", "volte_odm_build.prop"),
+    ("/euclid_build.prop", "volte_euclid.prop"),
+    ("/vendor_build.prop", "volte_vendor_build.prop"),
 ];
 
 /// Keys whose device identity may be logged (`:1189-1192`), never widened.
@@ -141,7 +141,7 @@ fn wanted(line: &[u8]) -> Option<&'static str> {
     if key.is_empty() {
         return None;
     }
-    HD_VOLTE_SHOW_PROPS
+    VOLTE_PROP_OVERRIDES
         .iter()
         .rev()
         .find(|w| key_bytes(w.as_bytes()) == key)
@@ -253,7 +253,7 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
         }
 
         let mut add: Vec<&str> = Vec::new();
-        for line in HD_VOLTE_SHOW_PROPS {
+        for line in VOLTE_PROP_OVERRIDES {
             let key = key_bytes(line.as_bytes());
             if key.is_empty() || seen.contains(&key) {
                 continue;
@@ -323,8 +323,8 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
 /// identity lines and returns the raw text (used by chip refinement).
 pub fn identify(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) -> String {
     let dumps = [
-        ("/build.prop", "hd_id_build.prop"),
-        ("/default.prop", "hd_id_default.prop"),
+        ("/build.prop", "id_build.prop"),
+        ("/default.prop", "id_default.prop"),
     ];
     let cmds: Vec<String> = dumps
         .iter()
@@ -448,8 +448,8 @@ mod tests {
 
     #[test]
     fn show_props_has_75_unique_keys_and_python_values() {
-        assert_eq!(HD_VOLTE_SHOW_PROPS.len(), 75);
-        let keys: Vec<String> = HD_VOLTE_SHOW_PROPS
+        assert_eq!(VOLTE_PROP_OVERRIDES.len(), 75);
+        let keys: Vec<String> = VOLTE_PROP_OVERRIDES
             .iter()
             .map(|l| String::from_utf8(key_bytes(l.as_bytes())).unwrap())
             .collect();
@@ -457,11 +457,11 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), 75);
-        assert_eq!(HD_VOLTE_SHOW_PROPS[0], "persist.dbg.ims_volte_enable=1");
-        assert_eq!(HD_VOLTE_SHOW_PROPS[5], "persist.radio.calls.on.ims=1");
-        assert_eq!(HD_VOLTE_SHOW_PROPS[74], "ro.vivo.volte.support=1");
-        assert_eq!(HD_VOLTE_SHOW_PROPS[37], "persist.sys.oppo.region=VN");
-        assert_eq!(HD_VOLTE_SHOW_PROPS[68], "persist.radio.VT_ENABLE=1");
+        assert_eq!(VOLTE_PROP_OVERRIDES[0], "persist.dbg.ims_volte_enable=1");
+        assert_eq!(VOLTE_PROP_OVERRIDES[5], "persist.radio.calls.on.ims=1");
+        assert_eq!(VOLTE_PROP_OVERRIDES[74], "ro.vivo.volte.support=1");
+        assert_eq!(VOLTE_PROP_OVERRIDES[37], "persist.sys.oppo.region=VN");
+        assert_eq!(VOLTE_PROP_OVERRIDES[68], "persist.radio.VT_ENABLE=1");
     }
 
     #[test]
@@ -477,7 +477,7 @@ mod tests {
         let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
         assert!(text.starts_with("# comment\n\nro.unknown=keep\nro.product.model=X\n"));
         assert!(text.contains("\n# HD VoLTE show switch\n"));
-        for line in HD_VOLTE_SHOW_PROPS {
+        for line in VOLTE_PROP_OVERRIDES {
             assert_eq!(text.matches(line).count(), 1, "{line}");
         }
         assert!(ops

@@ -186,8 +186,8 @@ impl Fsck for E2fsck {
 /// Python `try/except`.
 pub fn read_vendor_flag_bit(image: &Path, workdir: &Path, ops: &mut dyn Ext4Ops) -> u8 {
     let commands = vec![
-        "dump /default.prop hd_flg_def.prop".to_owned(),
-        "dump /build.prop hd_flg_build.prop".to_owned(),
+        "dump /default.prop flg_def.prop".to_owned(),
+        "dump /build.prop flg_build.prop".to_owned(),
     ];
     let mut sink = Logger::new();
     let _ = ops.run_best_effort(image, &commands, workdir, &mut sink);
