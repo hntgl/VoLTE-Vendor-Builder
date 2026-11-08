@@ -313,7 +313,6 @@ impl Entry {
 pub struct Fat16Image {
     pub data: Vec<u8>,
     bps: u32,
-    spc: u32,
     nfats: u32,
     rootent: u32,
     spf: u32,
@@ -391,7 +390,6 @@ impl Fat16Image {
         Ok(Fat16Image {
             data,
             bps,
-            spc,
             nfats,
             rootent,
             spf,
@@ -411,7 +409,7 @@ impl Fat16Image {
     /// The 8-byte OEM id in the boot sector, trimmed of spaces/NUL.
     pub fn oem_label(&self) -> String {
         latin1_decode(&self.oem)
-            .trim_end_matches(|c: char| c == '\u{0}' || c == ' ')
+            .trim_end_matches(['\u{0}', ' '])
             .to_string()
     }
 
@@ -743,7 +741,7 @@ impl Fat16Image {
         let need = if blob.is_empty() {
             0
         } else {
-            (blob.len() + self.cluster_size as usize - 1) / self.cluster_size as usize
+            blob.len().div_ceil(self.cluster_size as usize)
         };
         let mut cur = self.chain(entry.cluster);
         if need == 0 {
