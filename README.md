@@ -13,7 +13,6 @@ VoLTE-Vendor-Builder/
 ├── Cargo.toml            workspace (volte-core + volte-cli)
 ├── volte-core/           pure logic, no console output
 ├── volte-cli/            thin CLI: parse args -> call volte-core
-├── docs/PORT_STATUS.md   port status of every mapping ID
 ├── profiles/             per-chip documentation (Qualcomm / MediaTek)
 ├── fixtures/             generated test fixtures (no vendor data)
 ├── tests/                reserved for gate evidence (currently empty)
@@ -34,10 +33,10 @@ The two `.rc` payload files and the features XML were renamed on 2026-11-08, dro
 `hd_oppo_qc_volte.rc` → `oppo_qc_volte.rc`, `hd_volte_features.xml` → `volte_features.xml`).
 This is a deliberate, user-requested rename, not a port divergence: the new names are what
 `volte-core` now writes into the vendor partition and imports from `init.target.rc`, and
-`docs/PORT_STATUS.md` (ID 30) and `volte-core/src/profile.rs` record it. `config.bin` and
+`volte-core/src/config.rs` and `volte-core/src/profile.rs` record it. `config.bin` and
 `overlay.bin` were intentionally left unrenamed — they are host-side SELinux-label source
-files, never written into the vendor image under those names. The historical fix reports
-under `reports/fixes/` describe the pre-rename state and were left as-is; they are an audit
+files, never written into the vendor image under those names. The historical reports
+under `..\reports\` describe the pre-rename state and were left as-is; they are an audit
 trail, not current documentation.
 
 ## Build and test
@@ -70,7 +69,8 @@ volte-cli.exe vendor <vendor.img> [--mtk | --qc] [--out <path>]
 Exit code `0` on success and for `--help`; `2` for a usage error, the GUI divergence and any
 pipeline error, matching the Python tool. A failed mandatory step fails the build: when
 `e2fsck -fn` reports an error the CLI exits `2` without printing any flashable line, and an
-AVB backend error degrades to the documented `AVB_HASHTREE=SKIP` path, never to a PASS claim.
+AVB backend error is fatal: the pre-AVB image is restored (size + SHA-256 verified), no image
+is exported, and the CLI exits `2` without claiming a PASS.
 Logs, the command list and the report go to `.\Logs\`, which is created on demand.
 
 ## Modem (BUILD MODEM / BUILD FIX MODEM)
@@ -113,7 +113,7 @@ name-collision risk this paragraph used to describe.
 
 This module has not been run against a real OEM modem image or a real device — the tests in
 `volte-core/src/modem.rs` build synthetic FAT16 images through the same public API the engine
-uses, the same caveat `docs/PORT_STATUS.md` records for the vendor builder's own test suite.
+uses; the vendor builder's own suite carries the same caveat.
 
 ## External tools
 
