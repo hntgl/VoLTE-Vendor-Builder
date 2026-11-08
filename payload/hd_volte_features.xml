@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<permissions>
-    <feature name="android.software.volte" />
-    <feature name="android.hardware.telephony.ims" />
-    <feature name="oppo.phone.volte" />
-    <feature name="oppo.phone.volte.default.on" />
-</permissions>
