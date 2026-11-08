@@ -6,30 +6,16 @@
 //! for what this integration intentionally does not port (GUI, zip
 //! input, the `%APPDATA%` MBN cache/auto-discovery).
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use volte_core::logging::{Logger, Sink};
+use volte_core::logging::Logger;
 use volte_core::modem;
 
-struct Console;
-
-impl Sink for Console {
-    fn emit(&mut self, line: &str) {
-        let mut out = std::io::stdout().lock();
-        let _ = out.write_all(line.as_bytes());
-        let _ = out.write_all(b"\n");
-        let _ = out.flush();
-    }
-}
+use crate::{is_option, Console};
 
 const MODEM_USAGE: &str = "usage: volte-cli modem <modem.bin|modem.img> [--out OUT]";
 const FIX_MODEM_USAGE: &str =
     "usage: volte-cli fix-modem <modem.bin|modem.img> (--donor DONOR | --mbn MBN_FILE) [--out OUT]";
-
-fn is_option(arg: &str) -> bool {
-    arg.starts_with('-') && arg != "-"
-}
 
 /// Reads the value for a `--flag VALUE` pair; `argv[*i]` is the value slot.
 fn take_value(argv: &[String], i: &mut usize, flag: &str) -> Result<String, String> {

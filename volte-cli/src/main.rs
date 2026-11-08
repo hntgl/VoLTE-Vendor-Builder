@@ -74,7 +74,7 @@ enum Command {
     Usage(String),
 }
 
-fn is_option(arg: &str) -> bool {
+pub(crate) fn is_option(arg: &str) -> bool {
     arg.starts_with('-') && arg != "-"
 }
 
@@ -145,7 +145,7 @@ fn opens_gui(a: &Args) -> bool {
 }
 
 /// Writes log lines to stdout, the console half of `BuildLog` (`:346`).
-struct Console;
+pub(crate) struct Console;
 
 impl Sink for Console {
     fn emit(&mut self, line: &str) {
