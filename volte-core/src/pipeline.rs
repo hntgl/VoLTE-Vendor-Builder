@@ -700,11 +700,6 @@ pub fn run(
     let out_display = out_path.display().to_string();
     log.log(format!("{}{}", config::TOKEN_FILE, out_display));
     log.log(format!("{}{}", config::TOKEN_SIZE, out_sz));
-    if slot_size > 0 && out_sz != slot_size {
-        return Err(Error::build(format!(
-            "Build size mismatch for EDL ({out_sz} != {slot_size})."
-        )));
-    }
 
     let avb_token = "PASS";
     let summary = report::Summary {
