@@ -297,10 +297,7 @@ mod tests {
 
     #[test]
     fn modem_rejects_a_second_positional() {
-        assert!(matches!(
-            parse_modem(&argv(&["a.bin", "b.bin"])),
-            Err(2)
-        ));
+        assert!(matches!(parse_modem(&argv(&["a.bin", "b.bin"])), Err(2)));
     }
 
     #[test]

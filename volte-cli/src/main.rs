@@ -28,8 +28,7 @@ use volte_core::logging::{Logger, Sink};
 use volte_core::pipeline::{self, Deps, Options};
 use volte_core::rustfs_ext4::RustFsExt4Backend;
 
-const TOP_USAGE: &str =
-    "usage: volte-cli <vendor|modem|fix-modem> ... (see 'volte-cli --help')";
+const TOP_USAGE: &str = "usage: volte-cli <vendor|modem|fix-modem> ... (see 'volte-cli --help')";
 
 const USAGE: &str = "usage: volte-cli vendor [-h] [--qc] [--mtk] [--out OUT] [--gui] <image>";
 

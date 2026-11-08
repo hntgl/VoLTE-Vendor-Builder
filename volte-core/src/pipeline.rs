@@ -56,8 +56,7 @@ impl WorkDir {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let path =
-            std::env::temp_dir().join(format!("volte_patch_{}_{nanos}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("volte_patch_{}_{nanos}", std::process::id()));
         std::fs::create_dir_all(&path)?;
         Ok(WorkDir(path))
     }

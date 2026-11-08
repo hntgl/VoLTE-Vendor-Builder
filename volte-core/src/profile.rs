@@ -132,10 +132,7 @@ mod tests {
             IMPORT_LINE_HW,
             "import /vendor/etc/init/hw/oppo_qc_volte.rc"
         );
-        assert_eq!(
-            IMPORT_LINE_MTK,
-            "import /vendor/etc/init/oppo_mtk_volte.rc"
-        );
+        assert_eq!(IMPORT_LINE_MTK, "import /vendor/etc/init/oppo_mtk_volte.rc");
         assert_eq!(
             IMPORT_LINE_MTK_HW,
             "import /vendor/etc/init/hw/oppo_mtk_volte.rc"

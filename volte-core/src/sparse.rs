@@ -165,11 +165,7 @@ fn check_chunk_size(ctype: u16, csize: u64, blk_sz: u64, tsize: u64) -> Result<u
             .ok_or_else(|| Error::build("sparse chunk size overflows"))?,
         FILL => CHUNK_HEADER_LEN + 4,
         DONT_CARE => CHUNK_HEADER_LEN,
-        other => {
-            return Err(Error::build(format!(
-                "bad sparse chunk type: 0x{other:X}"
-            )))
-        }
+        other => return Err(Error::build(format!("bad sparse chunk type: 0x{other:X}"))),
     };
     if tsize != expected {
         return Err(Error::build(format!(
@@ -835,12 +831,7 @@ mod tests {
         sp.extend_from_slice(&chunk(RAW, 1, 12 + BLK, &raw_block));
         sp.extend_from_slice(&chunk(FILL, 2, 12 + 4, &pattern));
         sp.extend_from_slice(&chunk(DONT_CARE, 2, 12, &[]));
-        sp.extend_from_slice(&chunk(
-            CRC32,
-            0,
-            12 + 4,
-            &0xDEAD_BEEFu32.to_le_bytes(),
-        ));
+        sp.extend_from_slice(&chunk(CRC32, 0, 12 + 4, &0xDEAD_BEEFu32.to_le_bytes()));
         std::fs::write(&src, &sp).unwrap();
 
         assert_eq!(

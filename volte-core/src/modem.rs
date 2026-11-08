@@ -53,14 +53,38 @@ pub const MBN_MIN_SIZE: usize = 1000;
 pub const VIETTEL_REL: &str = "mcfg_sw/generic/sea/viettel/commerci/vietnam/mcfg_sw.mbn";
 
 const BASE_PARTS: [&str; 5] = ["image", "modem_pr", "mcfg", "configs", "mcfg_sw"];
-const OEM_SW_PARTS: [&str; 6] = ["image", "modem_pr", "mcfg", "configs", "mcfg_sw", "oem_sw.txt"];
-const MBN_SW_PARTS: [&str; 6] = ["image", "modem_pr", "mcfg", "configs", "mcfg_sw", "mbn_sw.txt"];
+const OEM_SW_PARTS: [&str; 6] = [
+    "image",
+    "modem_pr",
+    "mcfg",
+    "configs",
+    "mcfg_sw",
+    "oem_sw.txt",
+];
+const MBN_SW_PARTS: [&str; 6] = [
+    "image",
+    "modem_pr",
+    "mcfg",
+    "configs",
+    "mcfg_sw",
+    "mbn_sw.txt",
+];
 const VIETTEL_PARTS: [&str; 11] = [
-    "image", "modem_pr", "mcfg", "configs", "mcfg_sw", "generic", "sea", "viettel", "commerci",
-    "vietnam", "mcfg_sw.mbn",
+    "image",
+    "modem_pr",
+    "mcfg",
+    "configs",
+    "mcfg_sw",
+    "generic",
+    "sea",
+    "viettel",
+    "commerci",
+    "vietnam",
+    "mcfg_sw.mbn",
 ];
 
-const BAD_FAT_MSG: &str = "Not a Qualcomm NON-HLOS FAT16 modem image. Select modem.bin / modem.img - not vendor/md1img.";
+const BAD_FAT_MSG: &str =
+    "Not a Qualcomm NON-HLOS FAT16 modem image. Select modem.bin / modem.img - not vendor/md1img.";
 
 // ---------------------------------------------------------------------
 // Small text helpers (Latin-1 in, Latin-1 out, like the Python reference)
@@ -656,9 +680,18 @@ impl Fat16Image {
         self.grow_dir(dir_cluster)
     }
 
-    fn put_ent(&mut self, off: usize, name83: &[u8; 11], attr: u8, cluster: u32, size: u32) -> Result<()> {
+    fn put_ent(
+        &mut self,
+        off: usize,
+        name83: &[u8; 11],
+        attr: u8,
+        cluster: u32,
+        size: u32,
+    ) -> Result<()> {
         if off + 32 > self.data.len() {
-            return Err(Error::build("Directory entry position is outside the image."));
+            return Err(Error::build(
+                "Directory entry position is outside the image.",
+            ));
         }
         let mut e = [0u8; 32];
         e[0..11].copy_from_slice(name83);
@@ -901,7 +934,8 @@ fn inject_mbn(fat: &mut Fat16Image, blob: &[u8]) -> Result<Entry> {
     }
     let parent = ensure_dir(fat, &VIETTEL_PARTS[..VIETTEL_PARTS.len() - 1])?;
     let name = VIETTEL_PARTS[VIETTEL_PARTS.len() - 1];
-    let need = ((blob.len() + fat.cluster_size() as usize - 1) / fat.cluster_size() as usize).max(1);
+    let need =
+        ((blob.len() + fat.cluster_size() as usize - 1) / fat.cluster_size() as usize).max(1);
     let clusters = fat.alloc(need)?;
     fat.link_chain(&clusters);
     fat.write_clusters(&clusters, blob);
@@ -909,7 +943,13 @@ fn inject_mbn(fat: &mut Fat16Image, blob: &[u8]) -> Result<Entry> {
     let off = fat
         .slot_abs(parent, idx)
         .ok_or_else(|| Error::build("Directory slot is outside the image."))?;
-    fat.put_ent(off, &encode_83(name), ATTR_ARC, clusters[0], blob.len() as u32)?;
+    fat.put_ent(
+        off,
+        &encode_83(name),
+        ATTR_ARC,
+        clusters[0],
+        blob.len() as u32,
+    )?;
     Ok(Entry {
         name: name.to_uppercase(),
         attr: ATTR_ARC,
@@ -978,10 +1018,16 @@ fn log_post_build_notes(log: &mut Logger, is_fix: bool) {
     log.log("-- AFTER BUILD --");
     log.log(format!(
         "1) Flash the {} file into the modem partition",
-        if is_fix { "modem_volte_fix" } else { "modem_volte" }
+        if is_fix {
+            "modem_volte_fix"
+        } else {
+            "modem_volte"
+        }
     ));
     log.log("2) Flash the vendor image already BUILD VoLTE'd");
-    log.log("3) NOTE: if there is no signal after flashing, wipe modemst1 and modemst2, then reboot");
+    log.log(
+        "3) NOTE: if there is no signal after flashing, wipe modemst1 and modemst2, then reboot",
+    );
     log.log("4) Viettel SIM + 4G");
 }
 
@@ -992,7 +1038,11 @@ pub fn scan_modem_profiles(src: &Path, log: &mut Logger) -> Result<ScanReport> {
     let data_len = data.len();
     let fat = Fat16Image::new(data).map_err(|_| Error::bad_magic(BAD_FAT_MSG))?;
     log.log("-- SCAN MODEM PROFILES --");
-    log.log(format!("Size: {:.1} MB | OEM: {}", mb(data_len), fat.oem_label()));
+    log.log(format!(
+        "Size: {:.1} MB | OEM: {}",
+        mb(data_len),
+        fat.oem_label()
+    ));
     let carriers = fat.list_sea_carriers();
     log.log(format!(
         "SEA carriers ({}): {}",
@@ -1200,7 +1250,8 @@ mod tests {
         let rootent: u16 = 16;
         let spf: u16 = 1;
         let root_sectors = (rootent as u32 * 32) / bps as u32;
-        let total_sectors = reserved as u32 + nfats as u32 * spf as u32 + root_sectors + data_clusters;
+        let total_sectors =
+            reserved as u32 + nfats as u32 * spf as u32 + root_sectors + data_clusters;
         let mut data = vec![0u8; total_sectors as usize * bps as usize];
         data[3..11].copy_from_slice(b"TESTOEM1");
         data[11..13].copy_from_slice(&bps.to_le_bytes());
@@ -1234,11 +1285,21 @@ mod tests {
         let idx = fat.alloc_dirent(cur, 1).unwrap();
         let off = fat.slot_abs(cur, idx).unwrap();
         let blob = vec![0xABu8; mbn_len];
-        let clusters = fat.alloc(((mbn_len + fat.cluster_size() as usize - 1) / fat.cluster_size() as usize).max(1)).unwrap();
+        let clusters = fat
+            .alloc(
+                ((mbn_len + fat.cluster_size() as usize - 1) / fat.cluster_size() as usize).max(1),
+            )
+            .unwrap();
         fat.link_chain(&clusters);
         fat.write_clusters(&clusters, &blob);
-        fat.put_ent(off, &encode_83("mcfg_sw.mbn"), ATTR_ARC, clusters[0], blob.len() as u32)
-            .unwrap();
+        fat.put_ent(
+            off,
+            &encode_83("mcfg_sw.mbn"),
+            ATTR_ARC,
+            clusters[0],
+            blob.len() as u32,
+        )
+        .unwrap();
 
         // oem_sw.txt / mbn_sw.txt at BASE_PARTS, listing a couple of other
         // carriers ahead of Viettel, like a real whitelist would.
@@ -1255,8 +1316,11 @@ mod tests {
                 dir_cluster: base.cluster,
                 ent_index: idx,
             };
-            fat.write_file(&entry, b"mcfg_sw/generic/row/other/commerci/thailand/mcfg_sw.mbn\r\n")
-                .unwrap();
+            fat.write_file(
+                &entry,
+                b"mcfg_sw/generic/row/other/commerci/thailand/mcfg_sw.mbn\r\n",
+            )
+            .unwrap();
         }
         fat
     }
@@ -1438,7 +1502,11 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         let text = latin1_decode(&out);
         let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
         assert_eq!(lines[0], VIETTEL_REL);
-        assert_eq!(lines.len(), 3, "the duplicate Viettel line must not survive");
+        assert_eq!(
+            lines.len(),
+            3,
+            "the duplicate Viettel line must not survive"
+        );
     }
 
     #[test]
@@ -1448,7 +1516,10 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         assert!(!had);
         let text = latin1_decode(&out);
         assert!(text.starts_with(VIETTEL_REL));
-        assert!(!text.contains("\r\n"), "LF input must stay LF, not become CRLF");
+        assert!(
+            !text.contains("\r\n"),
+            "LF input must stay LF, not become CRLF"
+        );
     }
 
     #[test]
@@ -1481,7 +1552,8 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         let base = fat.mkdir(0, "oem_sw.txt_holder").unwrap();
         let idx = fat.alloc_dirent(base.cluster, 1).unwrap();
         let off = fat.slot_abs(base.cluster, idx).unwrap();
-        fat.put_ent(off, &encode_83("file.txt"), ATTR_ARC, 0, 0).unwrap();
+        fat.put_ent(off, &encode_83("file.txt"), ATTR_ARC, 0, 0)
+            .unwrap();
         let entry = Entry {
             name: "FILE.TXT".to_string(),
             attr: ATTR_ARC,
@@ -1509,7 +1581,8 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         let base = fat.mkdir(0, "d").unwrap();
         let idx = fat.alloc_dirent(base.cluster, 1).unwrap();
         let off = fat.slot_abs(base.cluster, idx).unwrap();
-        fat.put_ent(off, &encode_83("f.bin"), ATTR_ARC, 0, 0).unwrap();
+        fat.put_ent(off, &encode_83("f.bin"), ATTR_ARC, 0, 0)
+            .unwrap();
         let entry = Entry {
             name: "F.BIN".into(),
             attr: ATTR_ARC,
@@ -1520,7 +1593,11 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         };
         let big = vec![7u8; fat.cluster_size() as usize * 4];
         fat.write_file(&entry, &big).unwrap();
-        assert_eq!(fat.data.len(), before, "write_file must not resize the image");
+        assert_eq!(
+            fat.data.len(),
+            before,
+            "write_file must not resize the image"
+        );
     }
 
     // -- Viettel discovery -----------------------------------------------
@@ -1538,7 +1615,10 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
     fn find_viettel_mbn_rejects_an_entry_at_or_below_the_minimum_size() {
         let fat = image_with_viettel("sea", MBN_MIN_SIZE);
         let (entry, _rel) = fat.find_viettel_mbn();
-        assert!(entry.is_none(), "exactly MBN_MIN_SIZE must still count as missing");
+        assert!(
+            entry.is_none(),
+            "exactly MBN_MIN_SIZE must still count as missing"
+        );
     }
 
     #[test]
@@ -1611,7 +1691,8 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         }
         let idx = fat.alloc_dirent(cur, 1).unwrap();
         let off = fat.slot_abs(cur, idx).unwrap();
-        fat.put_ent(off, &encode_83("oem_sw.txt"), ATTR_ARC, 0, 0).unwrap();
+        fat.put_ent(off, &encode_83("oem_sw.txt"), ATTR_ARC, 0, 0)
+            .unwrap();
         let oem_entry = Entry {
             name: "OEM_SW.TXT".into(),
             attr: ATTR_ARC,
@@ -1620,8 +1701,11 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
             dir_cluster: cur,
             ent_index: idx,
         };
-        fat.write_file(&oem_entry, b"mcfg_sw/generic/row/a/commerci/x/mcfg_sw.mbn\r\n")
-            .unwrap();
+        fat.write_file(
+            &oem_entry,
+            b"mcfg_sw/generic/row/a/commerci/x/mcfg_sw.mbn\r\n",
+        )
+        .unwrap();
 
         let dest = write_temp("missing_viettel.bin", &fat.data);
         let dest_len = fat.data.len();
@@ -1659,7 +1743,9 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         }
         let idx = dest_fat.alloc_dirent(cur, 1).unwrap();
         let off = dest_fat.slot_abs(cur, idx).unwrap();
-        dest_fat.put_ent(off, &encode_83("oem_sw.txt"), ATTR_ARC, 0, 0).unwrap();
+        dest_fat
+            .put_ent(off, &encode_83("oem_sw.txt"), ATTR_ARC, 0, 0)
+            .unwrap();
         let oem_entry = Entry {
             name: "OEM_SW.TXT".into(),
             attr: ATTR_ARC,
@@ -1669,12 +1755,16 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
             ent_index: idx,
         };
         dest_fat
-            .write_file(&oem_entry, b"mcfg_sw/generic/row/a/commerci/x/mcfg_sw.mbn\r\n")
+            .write_file(
+                &oem_entry,
+                b"mcfg_sw/generic/row/a/commerci/x/mcfg_sw.mbn\r\n",
+            )
             .unwrap();
         let dest = write_temp("fix_target.bin", &dest_fat.data);
         let mut log = Logger::new();
 
-        let report = build_modem_fix_viettel(&dest, &donor, None, &mut log).expect("fix from donor");
+        let report =
+            build_modem_fix_viettel(&dest, &donor, None, &mut log).expect("fix from donor");
         let out_bytes = std::fs::read(&report.dst).unwrap();
         let out_fat = Fat16Image::new(out_bytes).unwrap();
         assert!(out_fat.find_viettel_mbn().0.is_some());
@@ -1706,7 +1796,10 @@ mcfg_sw/generic/row/b/commerci/y/mcfg_sw.mbn\r\n";
         let report = scan_modem_profiles(&src, &mut log).expect("scan");
         assert!(report.has_viettel_mbn);
         assert_eq!(report.viettel_size, (MBN_MIN_SIZE + 5) as u64);
-        assert!(report.carriers.iter().any(|c| c.eq_ignore_ascii_case("viettel")));
+        assert!(report
+            .carriers
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("viettel")));
     }
 
     #[test]
