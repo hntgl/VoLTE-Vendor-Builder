@@ -15,6 +15,8 @@ use crate::config::{AVB_MAGIC, BLOCK};
 use crate::error::{Error, Result};
 use crate::ext4_tools::capture;
 use crate::logging::Logger;
+use crate::sha1::Sha1;
+use crate::sha256::Sha256;
 use crate::slot::force_slot_size;
 
 const DIGEST_LEN: u64 = 32;
@@ -695,6 +697,399 @@ impl Avb for PythonAvbtool {
         }
         Ok(())
     }
+}
+
+const AVBTOOL_RELEASE: &str = "avbtool 1.3.0";
+const FOOTER_BLOCK: u64 = 4096;
+const DEFAULT_SALT_LEN: usize = 32;
+
+/// Hash algorithms `avbtool.py` accepts for the hashtree. Digest bytes are
+/// padded to a 32-byte slot (`avbtool.py:3692-3693`), so `tree_size` and the
+/// level geometry stay the same for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashKind {
+    Sha1,
+    Sha256,
+}
+
+impl HashKind {
+    fn from_name(name: &str) -> Result<Self> {
+        if name.eq_ignore_ascii_case("sha1") {
+            Ok(HashKind::Sha1)
+        } else if name.eq_ignore_ascii_case("sha256") {
+            Ok(HashKind::Sha256)
+        } else {
+            Err(Error::build(format!(
+                "unsupported AVB hash algorithm \"{name}\" (supported: sha1, sha256)"
+            )))
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            HashKind::Sha1 => "sha1",
+            HashKind::Sha256 => "sha256",
+        }
+    }
+
+    fn digest_len(self) -> usize {
+        match self {
+            HashKind::Sha1 => 20,
+            HashKind::Sha256 => 32,
+        }
+    }
+}
+
+/// Native `add_hashtree_footer` for the frozen parameter set in
+/// `HashtreeRequest`: algorithm NONE, sha1 or sha256, no FEC, no chained
+/// partitions. It writes the same bytes as the bundled `avbtool.py` 1.3.0,
+/// including the 64-byte footer in the last block of the partition.
+#[derive(Debug, Default)]
+pub struct NativeAvb;
+
+impl Avb for NativeAvb {
+    fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+        native_add_hashtree_footer(req)
+    }
+}
+
+/// The footer only counts when it is the last 64 bytes of the file, exactly
+/// like `avbtool.py:3730-3744`; a displaced footer is left to the pipeline's
+/// state-C gate instead of being searched for here.
+fn original_image_size(f: &mut File, size: u64) -> Result<u64> {
+    if size < FOOTER_LEN as u64 {
+        return Ok(size);
+    }
+    f.seek(SeekFrom::Start(size - FOOTER_LEN as u64))?;
+    let mut blob = [0u8; FOOTER_LEN];
+    f.read_exact(&mut blob)?;
+    Ok(parse_footer(&blob, size).map_or(size, |footer| footer.original_image_size))
+}
+
+fn decode_salt(salt: &str) -> Result<Vec<u8>> {
+    if salt.is_empty() {
+        let mut out = [0u8; DEFAULT_SALT_LEN];
+        getrandom::fill(&mut out)
+            .map_err(|e| Error::build(format!("cannot read the OS random source: {e}")))?;
+        return Ok(out.to_vec());
+    }
+    if !salt.len().is_multiple_of(2) {
+        return Err(Error::build(format!(
+            "AVB salt has an odd number of hex digits ({})",
+            salt.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(salt.len() / 2);
+    for pair in salt.as_bytes().as_chunks::<2>().0 {
+        out.push((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?);
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(Error::build(format!(
+            "AVB salt is not hexadecimal (invalid byte 0x{b:02x})"
+        ))),
+    }
+}
+
+/// Level sizes of the Merkle tree, smallest level first. Matches
+/// `calc_hash_level_offsets`: every digest occupies a 32-byte slot, even
+/// sha1 whose 20 bytes are padded with 12 zero bytes.
+fn hash_level_sizes(mut size: u64) -> Vec<u64> {
+    let mut sizes = Vec::new();
+    while size > BLOCK {
+        let blocks = size.div_ceil(BLOCK);
+        let level = (blocks * DIGEST_LEN).div_ceil(BLOCK) * BLOCK;
+        sizes.push(level);
+        size = level;
+    }
+    sizes
+}
+
+fn salted_digest(kind: HashKind, salt: &[u8], data: &[u8]) -> Vec<u8> {
+    match kind {
+        HashKind::Sha1 => {
+            let mut h = Sha1::new();
+            h.update(salt);
+            h.update(data);
+            h.finish().to_vec()
+        }
+        HashKind::Sha256 => {
+            let mut h = Sha256::new();
+            h.update(salt);
+            h.update(data);
+            h.finish().to_vec()
+        }
+    }
+}
+
+/// Reads `[0, original)` from `f`, treats the padding up to `rounded` as
+/// zeroes, and returns the root digest plus the tree bytes. Level 0 sits at
+/// the end of the tree region, as in `generate_hash_tree` ("hashes are stored
+/// upside down").
+fn build_merkle(
+    f: &mut File,
+    original: u64,
+    rounded: u64,
+    salt: &[u8],
+    kind: HashKind,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let digest_len = kind.digest_len();
+    let sizes = hash_level_sizes(rounded);
+    let total: u64 = sizes.iter().sum();
+    let total_len = usize::try_from(total)
+        .map_err(|_| Error::build(format!("AVB hashtree of {total} bytes is too large")))?;
+    let mut tree = vec![0u8; total_len];
+
+    if sizes.is_empty() {
+        if rounded == 0 {
+            return Ok((salted_digest(kind, salt, &[]), tree));
+        }
+        let mut block = vec![0u8; BLOCK as usize];
+        f.seek(SeekFrom::Start(0))?;
+        let take = original.min(rounded).min(BLOCK) as usize;
+        if take > 0 {
+            f.read_exact(&mut block[..take])?;
+        }
+        return Ok((salted_digest(kind, salt, &block), tree));
+    }
+
+    let mut offsets = Vec::with_capacity(sizes.len());
+    for n in 0..sizes.len() {
+        offsets.push(sizes[n + 1..].iter().sum::<u64>());
+    }
+
+    let mut block = vec![0u8; BLOCK as usize];
+    let mut remaining = original;
+    f.seek(SeekFrom::Start(0))?;
+    for i in 0..rounded / BLOCK {
+        block.fill(0);
+        let take = remaining.min(BLOCK) as usize;
+        if take > 0 {
+            f.read_exact(&mut block[..take])?;
+            remaining -= take as u64;
+        }
+        let digest = salted_digest(kind, salt, &block);
+        let at = offsets[0] as usize + i as usize * DIGEST_LEN as usize;
+        tree[at..at + digest_len].copy_from_slice(&digest);
+    }
+
+    for n in 1..sizes.len() {
+        let src = offsets[n - 1] as usize;
+        let dst = offsets[n] as usize;
+        for i in 0..sizes[n - 1] / BLOCK {
+            let at = src + i as usize * BLOCK as usize;
+            let digest = salted_digest(kind, salt, &tree[at..at + BLOCK as usize]);
+            let out = dst + i as usize * DIGEST_LEN as usize;
+            tree[out..out + digest_len].copy_from_slice(&digest);
+        }
+    }
+
+    let last_size = *sizes.last().expect("sizes is non-empty");
+    let last_off = *offsets.last().expect("offsets mirror sizes") as usize;
+    let root = salted_digest(kind, salt, &tree[last_off..last_off + last_size as usize]);
+    Ok((root, tree))
+}
+
+fn encode_hashtree_descriptor(
+    image_size: u64,
+    tree_size: u64,
+    partition_name: &str,
+    salt: &[u8],
+    algorithm: &str,
+    root: &[u8],
+) -> Vec<u8> {
+    let name = partition_name.as_bytes();
+    let total = round8(HASHTREE_DESCRIPTOR_LEN + name.len() + salt.len() + root.len());
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&1u64.to_be_bytes());
+    out.extend_from_slice(&((total - 16) as u64).to_be_bytes());
+    out.extend_from_slice(&1u32.to_be_bytes()); // dm-verity version
+    out.extend_from_slice(&image_size.to_be_bytes());
+    out.extend_from_slice(&image_size.to_be_bytes()); // tree offset
+    out.extend_from_slice(&tree_size.to_be_bytes());
+    out.extend_from_slice(&(BLOCK as u32).to_be_bytes()); // data block size
+    out.extend_from_slice(&(BLOCK as u32).to_be_bytes()); // hash block size
+    out.extend_from_slice(&0u32.to_be_bytes()); // fec_num_roots
+    out.extend_from_slice(&0u64.to_be_bytes()); // fec_offset
+    out.extend_from_slice(&0u64.to_be_bytes()); // fec_size
+    let mut algorithm_field = [0u8; 32];
+    algorithm_field[..algorithm.len()].copy_from_slice(algorithm.as_bytes());
+    out.extend_from_slice(&algorithm_field);
+    out.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(salt.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(root.len() as u32).to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // flags
+    out.extend_from_slice(&[0u8; 60]); // reserved
+    out.extend_from_slice(name);
+    out.extend_from_slice(salt);
+    out.extend_from_slice(root);
+    out.resize(total, 0);
+    out
+}
+
+fn encode_property(key: &str, value: &str) -> Vec<u8> {
+    let k = key.as_bytes();
+    let v = value.as_bytes();
+    let nbf = round8(PROPERTY_DESCRIPTOR_LEN - 16 + k.len() + 1 + v.len() + 1);
+    let total = 16 + nbf;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&0u64.to_be_bytes());
+    out.extend_from_slice(&(nbf as u64).to_be_bytes());
+    out.extend_from_slice(&(k.len() as u64).to_be_bytes());
+    out.extend_from_slice(&(v.len() as u64).to_be_bytes());
+    out.extend_from_slice(k);
+    out.push(0);
+    out.extend_from_slice(v);
+    out.push(0);
+    out.resize(total, 0);
+    out
+}
+
+fn round64(n: usize) -> usize {
+    n.div_ceil(64) * 64
+}
+
+fn round_block(n: u64) -> u64 {
+    n.div_ceil(BLOCK) * BLOCK
+}
+
+fn encode_vbmeta(descriptors: &[u8]) -> Vec<u8> {
+    let aux = round64(descriptors.len());
+    let mut out = vec![0u8; VBMETA_HEADER_LEN];
+    out[..4].copy_from_slice(b"AVB0");
+    out[4..8].copy_from_slice(&1u32.to_be_bytes()); // required major
+    out[8..12].copy_from_slice(&0u32.to_be_bytes()); // required minor
+    out[20..28].copy_from_slice(&(aux as u64).to_be_bytes());
+    out[64..72].copy_from_slice(&(descriptors.len() as u64).to_be_bytes());
+    out[80..88].copy_from_slice(&(descriptors.len() as u64).to_be_bytes());
+    out[104..112].copy_from_slice(&(descriptors.len() as u64).to_be_bytes());
+    let release = AVBTOOL_RELEASE.as_bytes();
+    out[128..128 + release.len()].copy_from_slice(release);
+    out.extend_from_slice(descriptors);
+    out.resize(VBMETA_HEADER_LEN + aux, 0);
+    out
+}
+
+fn encode_footer(original: u64, vbmeta_offset: u64, vbmeta_size: u64) -> [u8; FOOTER_LEN] {
+    let mut out = [0u8; FOOTER_LEN];
+    out[..4].copy_from_slice(&AVB_MAGIC);
+    out[4..8].copy_from_slice(&1u32.to_be_bytes());
+    out[8..12].copy_from_slice(&0u32.to_be_bytes());
+    out[12..20].copy_from_slice(&original.to_be_bytes());
+    out[20..28].copy_from_slice(&vbmeta_offset.to_be_bytes());
+    out[28..36].copy_from_slice(&vbmeta_size.to_be_bytes());
+    out
+}
+
+fn write_zeros(f: &mut File, mut n: u64) -> Result<()> {
+    let zeros = [0u8; 65536];
+    while n > 0 {
+        let take = n.min(zeros.len() as u64) as usize;
+        f.write_all(&zeros[..take])?;
+        n -= take as u64;
+    }
+    Ok(())
+}
+
+fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
+    let mut f = OpenOptions::new().read(true).write(true).open(&req.image)?;
+    let size = f.metadata()?.len();
+
+    if size >= 4 {
+        let mut magic = [0u8; 4];
+        f.seek(SeekFrom::Start(0))?;
+        f.read_exact(&mut magic)?;
+        if magic == [0x3a, 0xff, 0x26, 0xed] {
+            return Err(Error::build(
+                "NativeAvb does not support Android sparse images",
+            ));
+        }
+    }
+
+    let original = original_image_size(&mut f, size)?;
+    if original > size {
+        return Err(Error::build(format!(
+            "AVB footer says the original image is {original} bytes but the file is only {size} bytes"
+        )));
+    }
+
+    let partition_size = req.partition_size;
+    if partition_size == 0 || !partition_size.is_multiple_of(BLOCK) {
+        return Err(Error::build(format!(
+            "partition size {partition_size} is not a positive multiple of the {BLOCK}-byte block size"
+        )));
+    }
+    let rounded = original.div_ceil(BLOCK) * BLOCK;
+    let max_image_size = partition_size
+        .checked_sub(tree_size(partition_size))
+        .and_then(|n| n.checked_sub(MAX_VBMETA))
+        .and_then(|n| n.checked_sub(FOOTER_BLOCK))
+        .ok_or_else(|| {
+            Error::build(format!(
+                "partition size {partition_size} is too small for the AVB metadata"
+            ))
+        })?;
+    if rounded > max_image_size {
+        return Err(Error::build(format!(
+            "Image size of {rounded} exceeds maximum image size of {max_image_size} in order to fit in a partition size of {partition_size}."
+        )));
+    }
+
+    let kind = HashKind::from_name(&req.hash_algorithm)?;
+    let salt = decode_salt(&req.salt)?;
+
+    let (root, tree) = build_merkle(&mut f, original, rounded, &salt, kind)?;
+    let tree_len = tree.len() as u64;
+
+    let mut descriptors = encode_hashtree_descriptor(
+        rounded,
+        tree_len,
+        &req.partition_name,
+        &salt,
+        kind.name(),
+        &root,
+    );
+    for (key, value) in &req.props {
+        descriptors.extend_from_slice(&encode_property(key, value));
+    }
+    let vbmeta = encode_vbmeta(&descriptors);
+    if vbmeta.len() as u64 > MAX_VBMETA {
+        return Err(Error::build(format!(
+            "AVB vbmeta is {} bytes, above the {MAX_VBMETA}-byte limit",
+            vbmeta.len()
+        )));
+    }
+    let vbmeta_offset = rounded
+        .checked_add(tree_len)
+        .ok_or_else(|| Error::build("AVB vbmeta offset overflows"))?;
+    let vbmeta_padded = round_block(vbmeta.len() as u64);
+    let end = vbmeta_offset
+        .checked_add(vbmeta_padded)
+        .and_then(|n| n.checked_add(FOOTER_BLOCK))
+        .ok_or_else(|| Error::build("AVB image layout overflows"))?;
+    if end > partition_size {
+        return Err(Error::build(format!(
+            "AVB metadata ends at {end}, past the {partition_size}-byte partition"
+        )));
+    }
+
+    f.set_len(original)?;
+    f.seek(SeekFrom::End(0))?;
+    write_zeros(&mut f, rounded - original)?;
+    f.write_all(&tree)?;
+    f.write_all(&vbmeta)?;
+    write_zeros(&mut f, vbmeta_padded - vbmeta.len() as u64)?;
+    write_zeros(&mut f, partition_size - end)?;
+    write_zeros(&mut f, FOOTER_BLOCK - FOOTER_LEN as u64)?;
+    f.write_all(&encode_footer(original, vbmeta_offset, vbmeta.len() as u64))?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// `rebuild_hashtree` (`:1271`).
@@ -1813,6 +2208,562 @@ mod tests {
         assert!(msg.contains("3145728"), "{msg}");
         assert!(msg.contains("2097152"), "{msg}");
         assert_eq!(std::fs::read(&p).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const NATIVE_SALT: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const SHA1_SALT: &str = "00112233445566778899aabbccddeeff00112233";
+
+    fn native_request(image: &Path, partition_size: u64) -> HashtreeRequest {
+        HashtreeRequest {
+            image: image.to_path_buf(),
+            partition_size,
+            partition_name: "vendor".to_string(),
+            hash_algorithm: "sha256".to_string(),
+            salt: NATIVE_SALT.to_string(),
+            props: Vec::new(),
+        }
+    }
+
+    fn native_sha1_request(image: &Path, partition_size: u64) -> HashtreeRequest {
+        let mut req = native_request(image, partition_size);
+        req.hash_algorithm = "sha1".to_string();
+        req.salt = SHA1_SALT.to_string();
+        req
+    }
+
+    fn pattern_image(dir: &Path, name: &str, len: usize) -> PathBuf {
+        let path = dir.join(name);
+        let data: Vec<u8> = (0..len).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    fn file_sha(path: &Path) -> String {
+        crate::sha256::file_hex_upper(path).unwrap()
+    }
+
+    fn native_footer(path: &Path) -> AvbInfo {
+        let info = avb_info_fast(path).unwrap();
+        assert!(info.has_footer, "{} has no footer", path.display());
+        assert!(info.footer_at_exact_tail, "footer is not at the tail");
+        info
+    }
+
+    #[test]
+    fn native_vbmeta_matches_the_golden_fixture() {
+        let salt = decode_salt(NATIVE_SALT).unwrap();
+        let root = decode_salt("ed31474c9a630faa3981531d8b443d325734e82b7e4a360ac60d1b4b416ad0ca")
+            .unwrap();
+        let mut descriptors =
+            encode_hashtree_descriptor(1024 * 1024, 12288, "vendor", &salt, "sha256", &root);
+        descriptors.extend_from_slice(&encode_property("com.android.build.vendor", "v2"));
+        descriptors.extend_from_slice(&encode_property("com.android.build.vendor.extra", "hello"));
+        let vbmeta = encode_vbmeta(&descriptors);
+        assert_eq!(vbmeta.as_slice(), GOLDEN_VBMETA);
+    }
+
+    #[test]
+    fn native_merkle_root_matches_the_golden_fixture() {
+        let dir = tmp("volte_avb_native_golden_root");
+        let p = plain_image(&dir, 1024 * 1024);
+        let salt = decode_salt(NATIVE_SALT).unwrap();
+        let mut f = File::open(&p).unwrap();
+        let (root, tree) =
+            build_merkle(&mut f, 1024 * 1024, 1024 * 1024, &salt, HashKind::Sha256).unwrap();
+        assert_eq!(
+            hex_lower(&root),
+            "ed31474c9a630faa3981531d8b443d325734e82b7e4a360ac60d1b4b416ad0ca"
+        );
+        assert_eq!(tree.len(), 12288);
+        assert_eq!(tree, {
+            let mut f = File::open(&p).unwrap();
+            let (_, again) =
+                build_merkle(&mut f, 1024 * 1024, 1024 * 1024, &salt, HashKind::Sha256).unwrap();
+            again
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_full_image_matches_the_recorded_oracle() {
+        let dir = tmp("volte_avb_native_oracle");
+        let p = pattern_image(&dir, "vendor.img", 12 * 1024 * 1024);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_request(&p, 16 * 1024 * 1024))
+            .unwrap();
+
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 16 * 1024 * 1024);
+        assert_eq!(
+            file_sha(&p),
+            "4443FE9D0CD72B1D02AEE5E7D39D454B4EAD30A511CDC47AF8109B99C4D66E7B"
+        );
+        let info = native_footer(&p);
+        assert_eq!(info.original_image_size, 12 * 1024 * 1024);
+        assert_eq!(info.partition_size, 16 * 1024 * 1024);
+        assert_eq!(info.vbmeta_offset, 12685312);
+        assert_eq!(info.vbmeta_size, 512);
+
+        let first = file_sha(&p);
+        backend
+            .add_hashtree_footer(&native_request(&p, 16 * 1024 * 1024))
+            .unwrap();
+        assert_eq!(file_sha(&p), first, "the second call must be idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_second_call_is_idempotent() {
+        let dir = tmp("volte_avb_native_idempotent");
+        let p = pattern_image(&dir, "vendor.img", 1024 * 1024);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+        let first = std::fs::read(&p).unwrap();
+        backend
+            .add_hashtree_footer(&native_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), first);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
+        assert_eq!(native_footer(&p).original_image_size, 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_sha1_full_image_matches_the_recorded_oracle() {
+        let dir = tmp("volte_avb_native_sha1_oracle");
+        let p = plain_image(&dir, 1024 * 1024);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_sha1_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
+        // Recorded once from the bundled avbtool.py 1.3.0 with the same
+        // inputs (1 MiB zeroes, 2 MiB partition, 20-byte salt).
+        assert_eq!(
+            file_sha(&p),
+            "787864A333F030FD58FE41FCE759F8E28DCD9A200CC638555DD5ED5E2A57B62A"
+        );
+        let info = native_footer(&p);
+        assert_eq!(info.original_image_size, 1024 * 1024);
+        assert_eq!(info.partition_size, 2 * 1024 * 1024);
+        assert_eq!(info.vbmeta_offset, 1060864);
+        assert_eq!(info.vbmeta_size, 512);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_sha1_descriptor_reads_back_with_the_sha1_algorithm() {
+        let dir = tmp("volte_avb_native_sha1_parse");
+        let p = plain_image(&dir, 1024 * 1024);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_sha1_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+
+        let info = native_footer(&p);
+        assert_eq!(info.hash_algorithm, "sha1");
+        assert_eq!(info.salt, SHA1_SALT);
+        assert_eq!(info.partition_name, "vendor");
+        assert_eq!(info.fec_roots, 0);
+        assert_eq!(info.vbmeta_offset, 1024 * 1024 + 12288);
+        assert_eq!(info.vbmeta_size, 512);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_sha1_second_call_is_idempotent() {
+        let dir = tmp("volte_avb_native_sha1_idempotent");
+        let p = pattern_image(&dir, "vendor.img", 1024 * 1024);
+        let mut backend = NativeAvb;
+        let req = native_sha1_request(&p, 2 * 1024 * 1024);
+        backend.add_hashtree_footer(&req).unwrap();
+        let first = std::fs::read(&p).unwrap();
+        backend.add_hashtree_footer(&req).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), first);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
+        assert_eq!(native_footer(&p).original_image_size, 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_sha1_keeps_the_unrounded_original_size() {
+        let dir = tmp("volte_avb_native_sha1_unaligned");
+        let p = plain_image(&dir, 1024 * 1024 + 1234);
+        let mut backend = NativeAvb;
+        let req = native_sha1_request(&p, 2 * 1024 * 1024);
+        backend.add_hashtree_footer(&req).unwrap();
+        let info = native_footer(&p);
+        assert_eq!(info.original_image_size, 1024 * 1024 + 1234);
+        assert_eq!(info.vbmeta_offset, 1052672 + 16384);
+
+        let first = std::fs::read(&p).unwrap();
+        backend.add_hashtree_footer(&req).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), first);
+        assert_eq!(native_footer(&p).original_image_size, 1024 * 1024 + 1234);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_reads_the_original_size_only_from_the_last_64_bytes() {
+        let dir = tmp("volte_avb_native_p0");
+        let p = image_with_footer(&dir, 0);
+        let size = std::fs::metadata(&p).unwrap().len();
+        assert_eq!(
+            super::original_image_size(&mut File::open(&p).unwrap(), size).unwrap(),
+            1024 * 1024
+        );
+
+        let with_footer = {
+            let mut backend = NativeAvb;
+            backend
+                .add_hashtree_footer(&native_request(&p, 2 * 1024 * 1024))
+                .unwrap();
+            native_footer(&p)
+        };
+        assert_eq!(with_footer.original_image_size, 1024 * 1024);
+        assert_eq!(with_footer.vbmeta_offset, 1024 * 1024 + 12288);
+        assert_eq!(with_footer.vbmeta_size, 512);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
+
+        let displaced = image_with_footer(&dir, 4096);
+        let size = std::fs::metadata(&displaced).unwrap().len();
+        assert_eq!(
+            super::original_image_size(&mut File::open(&displaced).unwrap(), size).unwrap(),
+            size,
+            "a footer outside the last 64 bytes is not detected"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_adds_a_footer_to_an_image_without_one() {
+        let dir = tmp("volte_avb_native_no_footer");
+        let p = plain_image(&dir, 1024 * 1024);
+        assert!(!avb_info_fast(&p).unwrap().has_footer);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+        let info = native_footer(&p);
+        assert_eq!(info.original_image_size, 1024 * 1024);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_rejects_a_partition_that_cannot_hold_the_metadata() {
+        let dir = tmp("volte_avb_native_small_partition");
+        let p = pattern_image(&dir, "vendor.img", 12 * 1024 * 1024);
+        let before = file_sha(&p);
+        let mut backend = NativeAvb;
+        let err = backend
+            .add_hashtree_footer(&native_request(&p, 12582912))
+            .unwrap_err();
+        let msg = err.message();
+        assert!(msg.contains("12410880"), "{msg}");
+        assert!(msg.contains("exceeds maximum image size"), "{msg}");
+        assert_eq!(file_sha(&p), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_rejects_an_unsupported_hash_algorithm_before_writing() {
+        let dir = tmp("volte_avb_native_hash");
+        let p = plain_image(&dir, 1024 * 1024);
+        let before = file_sha(&p);
+        let mut backend = NativeAvb;
+        for algorithm in ["sha512", "sha999", "blake2b-256"] {
+            let mut req = native_request(&p, 2 * 1024 * 1024);
+            req.hash_algorithm = algorithm.to_string();
+            let err = backend.add_hashtree_footer(&req).unwrap_err();
+            let msg = err.message();
+            assert!(msg.contains("unsupported AVB hash algorithm"), "{msg}");
+            assert!(msg.contains(algorithm), "{msg}");
+            assert!(msg.contains("sha1, sha256"), "{msg}");
+            assert_eq!(file_sha(&p), before);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_keeps_the_unrounded_original_size() {
+        let dir = tmp("volte_avb_native_unaligned");
+        let p = plain_image(&dir, 1024 * 1024 + 1234);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+        let info = native_footer(&p);
+        assert_eq!(info.original_image_size, 1024 * 1024 + 1234);
+        assert_eq!(info.vbmeta_offset, 1052672 + 16384);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_does_not_hide_a_displaced_footer() {
+        let dir = tmp("volte_avb_native_displaced");
+        let p = pattern_image(&dir, "vendor.img", 12 * 1024 * 1024);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_request(&p, 16 * 1024 * 1024))
+            .unwrap();
+        {
+            let mut f = OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(&[0u8; 4096]).unwrap();
+        }
+        let before = file_sha(&p);
+        let err = backend
+            .add_hashtree_footer(&native_request(&p, 16 * 1024 * 1024))
+            .unwrap_err();
+        assert!(
+            err.message().contains("exceeds maximum image size"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(file_sha(&p), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn run_avbtool(python: &Path, avbtool: &Path, args: &[String]) -> String {
+        let out = std::process::Command::new(python)
+            .arg(avbtool)
+            .args(args)
+            .output()
+            .expect("run avbtool.py");
+        assert!(
+            out.status.success(),
+            "avbtool.py failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    #[ignore = "needs the bundled Python and avbtool.py; byte-compares whole files"]
+    fn avb_parity_with_the_bundled_avbtool() {
+        let Ok(python) = std::env::var("VOLTE_AVB_PARITY_PYTHON") else {
+            eprintln!("VOLTE_AVB_PARITY_PYTHON is not set - skipping");
+            return;
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let avbtool = root.join("tool").join("avbtool.py");
+        assert!(avbtool.is_file(), "{} is missing", avbtool.display());
+        let dir = tmp("volte_avb_native_parity");
+
+        let cases = [
+            ("pattern", 12 * 1024 * 1024, 16 * 1024 * 1024, "sha256"),
+            ("unaligned", 1024 * 1024 + 1234, 2 * 1024 * 1024, "sha256"),
+            ("zeros", 1024 * 1024, 2 * 1024 * 1024, "sha256"),
+            // Three hash levels, like the multi-GB vendor images.
+            ("deep", 70 * 1024 * 1024, 96 * 1024 * 1024, "sha256"),
+            ("sha1_pattern", 12 * 1024 * 1024, 16 * 1024 * 1024, "sha1"),
+            (
+                "sha1_unaligned",
+                1024 * 1024 + 1234,
+                2 * 1024 * 1024,
+                "sha1",
+            ),
+            ("sha1_deep", 70 * 1024 * 1024, 96 * 1024 * 1024, "sha1"),
+        ];
+        for (name, len, partition_size, algorithm) in cases {
+            let data: Vec<u8> = if name.ends_with("pattern") {
+                (0..len).map(|i| ((i * 37 + 11) % 251) as u8).collect()
+            } else {
+                vec![0u8; len]
+            };
+            // `verify_image` resolves a hashtree descriptor by looking for
+            // `<partition_name>.img` next to the image, so each side needs its
+            // own `vendor.img`.
+            let reference = dir.join(format!("{name}_ref")).join("vendor.img");
+            let native = dir.join(format!("{name}_native")).join("vendor.img");
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+            std::fs::write(&reference, &data).unwrap();
+            std::fs::write(&native, &data).unwrap();
+
+            let mut req = native_request(&reference, partition_size);
+            req.hash_algorithm = algorithm.to_string();
+            if algorithm == "sha1" {
+                req.salt = SHA1_SALT.to_string();
+            }
+            if name == "zeros" {
+                req.props = vec![
+                    ("com.android.build.vendor".to_string(), "v2".to_string()),
+                    (
+                        "com.android.build.vendor.extra".to_string(),
+                        "hello".to_string(),
+                    ),
+                ];
+            }
+            run_avbtool(Path::new(&python), &avbtool, &req.cli_args());
+
+            let mut native_req = req.clone();
+            native_req.image = native.clone();
+            NativeAvb.add_hashtree_footer(&native_req).unwrap();
+
+            let expected = std::fs::read(&reference).unwrap();
+            let actual = std::fs::read(&native).unwrap();
+            assert_eq!(
+                actual, expected,
+                "{name}: native output differs from avbtool"
+            );
+
+            let info_ref = run_avbtool(
+                Path::new(&python),
+                &avbtool,
+                &[
+                    "info_image".to_string(),
+                    "--image".to_string(),
+                    reference.display().to_string(),
+                ],
+            );
+            let info_native = run_avbtool(
+                Path::new(&python),
+                &avbtool,
+                &[
+                    "info_image".to_string(),
+                    "--image".to_string(),
+                    native.display().to_string(),
+                ],
+            );
+            assert_eq!(info_ref, info_native, "{name}: info_image differs");
+            run_avbtool(
+                Path::new(&python),
+                &avbtool,
+                &[
+                    "verify_image".to_string(),
+                    "--image".to_string(),
+                    native.display().to_string(),
+                ],
+            );
+
+            NativeAvb.add_hashtree_footer(&native_req).unwrap();
+            assert_eq!(
+                std::fs::read(&native).unwrap(),
+                actual,
+                "{name}: the second native call must be idempotent"
+            );
+            eprintln!(
+                "{name}: size={} sha256={} cmp=IDENTICAL info_image=MATCH verify_image=exit=0 idempotent=IDENTICAL",
+                actual.len(),
+                file_sha(&native)
+            );
+        }
+    }
+
+    fn files_identical(a: &Path, b: &Path) -> bool {
+        let mut fa = File::open(a).unwrap();
+        let mut fb = File::open(b).unwrap();
+        let mut ba = vec![0u8; 1024 * 1024];
+        let mut bb = vec![0u8; 1024 * 1024];
+        loop {
+            let na = fa.read(&mut ba).unwrap();
+            let nb = fb.read(&mut bb).unwrap();
+            if na != nb || ba[..na] != bb[..nb] {
+                return false;
+            }
+            if na == 0 {
+                return true;
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs VOLTE_AVB_REAL_IMAGE and the bundled Python; copies a multi-GB image"]
+    fn avb_parity_on_a_signed_vendor_image() {
+        let Ok(python) = std::env::var("VOLTE_AVB_PARITY_PYTHON") else {
+            eprintln!("VOLTE_AVB_PARITY_PYTHON is not set - skipping");
+            return;
+        };
+        let Ok(src) = std::env::var("VOLTE_AVB_REAL_IMAGE") else {
+            eprintln!("VOLTE_AVB_REAL_IMAGE is not set - skipping");
+            return;
+        };
+        let src = PathBuf::from(src);
+        assert!(src.is_file(), "{} is missing", src.display());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let avbtool = root.join("tool").join("avbtool.py");
+        assert!(avbtool.is_file(), "{} is missing", avbtool.display());
+
+        let size = std::fs::metadata(&src).unwrap().len();
+        let info = avb_info_fast(&src).unwrap();
+        assert!(info.has_footer, "{} has no AVB footer", src.display());
+        assert!(info.footer_at_exact_tail, "footer is not at the tail");
+        assert_eq!(info.hash_algorithm, "sha1");
+        assert_eq!(info.partition_size, size);
+
+        let dir = tmp("volte_avb_native_real_image");
+        let reference_dir = dir.join("ref");
+        let native_dir = dir.join("native");
+        std::fs::create_dir_all(&reference_dir).unwrap();
+        std::fs::create_dir_all(&native_dir).unwrap();
+        let reference = reference_dir.join("vendor.img");
+        let native = native_dir.join("vendor.img");
+        std::fs::copy(&src, &reference).unwrap();
+        std::fs::copy(&src, &native).unwrap();
+
+        let req = HashtreeRequest {
+            image: reference.clone(),
+            partition_size: size,
+            partition_name: info.partition_name.clone(),
+            hash_algorithm: info.hash_algorithm.clone(),
+            salt: info.salt.clone(),
+            props: info.props.clone(),
+        };
+        run_avbtool(Path::new(&python), &avbtool, &req.cli_args());
+        let mut native_req = req.clone();
+        native_req.image = native.clone();
+        NativeAvb.add_hashtree_footer(&native_req).unwrap();
+
+        assert!(
+            files_identical(&native, &reference),
+            "whole-file bytes differ from avbtool"
+        );
+        let info_ref = run_avbtool(
+            Path::new(&python),
+            &avbtool,
+            &[
+                "info_image".to_string(),
+                "--image".to_string(),
+                reference.display().to_string(),
+            ],
+        );
+        let info_native = run_avbtool(
+            Path::new(&python),
+            &avbtool,
+            &[
+                "info_image".to_string(),
+                "--image".to_string(),
+                native.display().to_string(),
+            ],
+        );
+        assert_eq!(info_ref, info_native, "info_image differs");
+        run_avbtool(
+            Path::new(&python),
+            &avbtool,
+            &[
+                "verify_image".to_string(),
+                "--image".to_string(),
+                native.display().to_string(),
+            ],
+        );
+
+        let first = file_sha(&native);
+        NativeAvb.add_hashtree_footer(&native_req).unwrap();
+        assert_eq!(
+            file_sha(&native),
+            first,
+            "the second native call must be idempotent"
+        );
+        eprintln!(
+            "real_image: size={} sha256={} cmp=IDENTICAL info_image=MATCH verify_image=exit=0 idempotent=IDENTICAL",
+            std::fs::metadata(&native).unwrap().len(),
+            first
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

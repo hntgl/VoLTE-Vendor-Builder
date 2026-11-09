@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 mod modem_cli;
 
-use volte_core::avb::{Avb, HashtreeRequest, PythonAvbtool};
+use volte_core::avb::{Avb, HashtreeRequest, NativeAvb, PythonAvbtool};
 use volte_core::config;
 use volte_core::env;
 use volte_core::ext4_tools::E2fsck;
@@ -160,14 +160,43 @@ impl Sink for Console {
 /// so a missing tool degrades to the boot-safe SKIP path instead of aborting
 /// the build up front.
 struct LazyAvb {
+    backend: Backend,
     python: PathBuf,
     avbtool: PathBuf,
     inner: Option<PythonAvbtool>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Python,
+    Native,
+}
+
+impl Backend {
+    fn from_env() -> std::result::Result<Self, String> {
+        match std::env::var("VOLTE_AVB_BACKEND") {
+            Ok(v) if v.eq_ignore_ascii_case("python") => Ok(Backend::Python),
+            Ok(v) if v.eq_ignore_ascii_case("native") => Ok(Backend::Native),
+            Ok(v) => Err(format!(
+                "VOLTE_AVB_BACKEND must be python or native, got {v}"
+            )),
+            Err(std::env::VarError::NotPresent) => Ok(Backend::Python),
+            Err(e) => Err(format!("cannot read VOLTE_AVB_BACKEND: {e}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Backend::Python => "python",
+            Backend::Native => "native",
+        }
+    }
+}
+
 impl LazyAvb {
-    fn new(python: PathBuf, avbtool: PathBuf) -> Self {
+    fn new(python: PathBuf, avbtool: PathBuf, backend: Backend) -> Self {
         LazyAvb {
+            backend,
             python,
             avbtool,
             inner: None,
@@ -177,6 +206,10 @@ impl LazyAvb {
 
 impl Avb for LazyAvb {
     fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> volte_core::error::Result<()> {
+        if self.backend == Backend::Native {
+            let mut native = NativeAvb;
+            return native.add_hashtree_footer(req);
+        }
         match self.inner.as_mut() {
             Some(tool) => tool.add_hashtree_footer(req),
             None => {
@@ -193,6 +226,13 @@ fn build(a: &Args) -> i32 {
     let root = env::exe_root();
     let tool = env::tool_dir(&root);
     let logs = root.join("Logs");
+    let backend = match Backend::from_env() {
+        Ok(backend) => backend,
+        Err(msg) => {
+            eprintln!("volte-cli: error: {msg}");
+            return 2;
+        }
+    };
     let python = {
         let bundled = tool.join("python").join("python.exe");
         if bundled.is_file() {
@@ -204,13 +244,14 @@ fn build(a: &Args) -> i32 {
 
     let mut ops = RustFsExt4Backend::new();
     let mut fsck = E2fsck::new(&tool);
-    let mut avb = LazyAvb::new(python, tool.join("avbtool.py"));
+    let mut avb = LazyAvb::new(python, tool.join("avbtool.py"), backend);
     let mut deps = Deps {
         ops: &mut ops,
         fsck: &mut fsck,
         avb: &mut avb,
     };
     let mut log = Logger::new().with_sink(Console);
+    log.log(format!("[AVB] backend={}", backend.name()));
     let mut progress = |_n: u8, _label: &str| {};
     let opts = Options {
         src: Path::new(&a.image),

@@ -22,6 +22,7 @@ pub mod profile;
 pub mod props;
 pub mod report;
 pub mod rustfs_ext4;
+pub mod sha1;
 pub mod sha256;
 pub mod slot;
 pub mod sparse;
