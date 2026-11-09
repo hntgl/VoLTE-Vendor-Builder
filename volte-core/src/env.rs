@@ -7,10 +7,10 @@
 use std::path::{Path, PathBuf};
 
 /// Candidate order of `tool_dir`: `tool\` → `tools\` → the root itself, chosen
-/// by the presence of `avbtool.py` or `e2fsck.exe`. Falls back to the root.
+/// by the presence of `e2fsck.exe`. Falls back to the root.
 pub fn tool_dir(root: &Path) -> PathBuf {
     for cand in [root.join("tool"), root.join("tools"), root.to_path_buf()] {
-        if cand.join("avbtool.py").is_file() || cand.join("e2fsck.exe").is_file() {
+        if cand.join("e2fsck.exe").is_file() {
             return cand;
         }
     }
@@ -49,7 +49,7 @@ mod tests {
         let root = tmp("volte_env_tool_priority");
         std::fs::create_dir_all(root.join("tool")).unwrap();
         std::fs::create_dir_all(root.join("tools")).unwrap();
-        std::fs::write(root.join("tool").join("avbtool.py"), b"#").unwrap();
+        std::fs::write(root.join("tool").join("e2fsck.exe"), b"MZ").unwrap();
         std::fs::write(root.join("tools").join("e2fsck.exe"), b"MZ").unwrap();
         std::fs::write(root.join("e2fsck.exe"), b"MZ").unwrap();
         assert_eq!(tool_dir(&root), root.join("tool"));
@@ -64,10 +64,10 @@ mod tests {
         assert_eq!(tool_dir(&root), root.join("tools"));
 
         std::fs::remove_file(root.join("tools").join("e2fsck.exe")).unwrap();
-        std::fs::write(root.join("avbtool.py"), b"#").unwrap();
+        std::fs::write(root.join("e2fsck.exe"), b"MZ").unwrap();
         assert_eq!(tool_dir(&root), root);
 
-        std::fs::remove_file(root.join("avbtool.py")).unwrap();
+        std::fs::remove_file(root.join("e2fsck.exe")).unwrap();
         assert_eq!(tool_dir(&root), root);
         let _ = std::fs::remove_dir_all(&root);
     }

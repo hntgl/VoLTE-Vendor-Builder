@@ -17,7 +17,8 @@ VoLTE-Vendor-Builder/
 ├── fixtures/             generated test fixtures (no vendor data)
 ├── tests/                reserved for gate evidence (currently empty)
 ├── tool/                 bundled runtime: e2fsck.exe, mke2fs.exe,
-│                         avbtool.py, Python 3.10, MSYS/Cygwin DLLs, etc\mke2fs.conf
+│                         reference avbtool.py + Python (parity oracle only),
+│                         MSYS/Cygwin DLLs, etc\mke2fs.conf
 └── payload/              OPPO_VoLTE_Overlay.apk, oppo_{mtk,qc}_volte.rc,
                           volte_features.xml, overlay.bin, config.bin
 ```
@@ -82,17 +83,18 @@ The vendor build classifies the source image right after copying it, before any 
 |---|---|
 | No `AVBf` footer at the last 64 bytes and none found by the backward scan | Skip AVB: `AVB_HASHTREE=SKIP`, image exported at the locked slot size. |
 | Footer parsed from the last 64 bytes | Rebuild the hashtree. `AVB_HASHTREE=PASS` when the new footer fits the slot; if the backend fails or the hashtree grows past the slot, the tail is restored and the image is exported with `SKIP`. |
-| Footer found only by the backward scan, not at the exact tail | Build error before debugfs, `e2fsck` or avbtool runs; no output is reported and the copied file stays on disk untouched. The source was padded or modified after signing - re-dump the original `vendor.img`. |
+| Footer found only by the backward scan, not at the exact tail | Build error before debugfs, `e2fsck` or the AVB rebuild runs; no output is reported and the copied file stays on disk untouched. The source was padded or modified after signing - re-dump the original `vendor.img`. |
 
 Notes:
 
 - Only the tail from the footer's `original_image_size` to EOF is saved and restored; there is
   no whole-image `vendor_pre_avb.img` snapshot.
-- avbtool only recognises a footer in the last 64 bytes, so a displaced footer (the last row
-  above) must be rejected before it reaches avbtool.
-- Every error after avbtool starts (backend error, unparsable footer, backend returning `Ok`
-  without writing a footer, hashtree larger than the slot, padding failure) restores the saved
-  tail. If the restore itself fails, the build exits `2` without reporting an output.
+- The footer parser only recognises a footer in the last 64 bytes, so a displaced footer
+  (the last row above) must be rejected before the rebuild.
+- Every error after the AVB rebuild starts (backend error, unparsable footer, backend
+  returning `Ok` without writing a footer, hashtree larger than the slot, padding failure)
+  restores the saved tail. If the restore itself fails, the build exits `2` without
+  reporting an output.
 - The source image is never modified: the pipeline works on a copy, so a failed run can be
   retried from the original.
 - Tests compare the whole-file SHA-256 before and after the AVB step, so a skipped rebuild
@@ -142,9 +144,9 @@ uses; the vendor builder's own suite carries the same caveat.
 
 ## External tools
 
-`e2fsck.exe` and `avbtool.py` are invoked as subprocesses from `tool\`; `avbtool.py`
-runs under `tool\python\python.exe` when that bundled interpreter is present, otherwise
-under `python.exe` from `PATH`. All ext4 reads and writes go through the in-process
+`e2fsck.exe` is invoked as a subprocess from `tool\`. The AVB hashtree, vbmeta and footer
+are rebuilt in-process by `NativeAvb`, so neither `avbtool.py` nor the bundled Python is
+executed at runtime. All ext4 reads and writes go through the in-process
 `rust-fs-ext4` engine (`RustFsExt4Backend`); `debugfs.exe` is not used, not bundled and not
 read by the build or the tests. Nothing is statically linked against `libext2fs`.
 
@@ -163,5 +165,6 @@ Design notes:
 - `build.prop` and the other property files are rewritten in place: untouched bytes, line
   endings, duplicate keys and inode metadata survive, and the vendor-file SELinux label is
   applied only to `/build.prop`.
-- `avbtool.py` runs under a 30-minute deadline and its output is captured; the AVB salt is
-  read from the OS CSPRNG.
+- The AVB rebuild runs in-process; the salt is read from the OS CSPRNG. The bundled
+  `avbtool.py` remains the external oracle for the ignored parity tests, not a runtime
+  dependency.

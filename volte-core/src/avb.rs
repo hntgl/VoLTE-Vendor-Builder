@@ -1,19 +1,17 @@
 //! AVB footer inspection, partition fitting and hashtree rebuild.
 //!
 //! Ports `_parse_avbf` (`hd_vendor_build.py:529`), `avb_info_fast` (`:554`),
-//! `fit_avb_part` (`:608`), `avb_module` (`:1256`) and `rebuild_hashtree`
-//! (`:1271`). `avbtool.py` is executed as a subprocess (decision 8.2/1); the
-//! frozen parameters are exactly the ones the Python call passes.
+//! `fit_avb_part` (`:608`) and `rebuild_hashtree` (`:1271`). The hashtree,
+//! vbmeta and footer are rebuilt in-process and match the bundled
+//! `avbtool.py` 1.3.0 byte for byte; the frozen parameters are exactly the
+//! ones the Python call passes.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
 
 use crate::config::{AVB_MAGIC, BLOCK};
 use crate::error::{Error, Result};
-use crate::ext4_tools::capture;
 use crate::logging::Logger;
 use crate::sha1::Sha1;
 use crate::sha256::Sha256;
@@ -24,9 +22,6 @@ const DIGEST_LEN: u64 = 32;
 const META_LEN: u64 = 64 * 1024 + 4 * 1024;
 const FOOTER_LEN: usize = 64;
 const SCAN_LEN: u64 = 32 * 1024 * 1024;
-/// `avbtool.py` rewrites a multi-GB image, so it gets a generous but finite
-/// deadline instead of blocking the build forever.
-const AVB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Parsed `AvbFooter` (`_parse_avbf`, `:529`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,8 +617,10 @@ pub struct HashtreeRequest {
     pub props: Vec<(String, String)>,
 }
 
+#[cfg(test)]
 impl HashtreeRequest {
-    /// CLI form of the same arguments, for `avbtool.py add_hashtree_footer`.
+    /// CLI form of the same arguments, used only by the parity harness that
+    /// runs the bundled `avbtool.py` as an external oracle.
     pub(crate) fn cli_args(&self) -> Vec<String> {
         let mut args = vec![
             "add_hashtree_footer".to_string(),
@@ -662,41 +659,6 @@ impl HashtreeRequest {
 /// Backend that appends the hashtree/footer.
 pub trait Avb {
     fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()>;
-}
-
-/// `avb_module`: the embedded `avbtool.py`, run through the embedded Python.
-#[derive(Debug)]
-pub struct PythonAvbtool {
-    python: PathBuf,
-    avbtool: PathBuf,
-}
-
-impl PythonAvbtool {
-    pub fn new(python: PathBuf, avbtool: PathBuf) -> Result<Self> {
-        if !avbtool.is_file() {
-            return Err(Error::missing("tool", &avbtool));
-        }
-        Ok(PythonAvbtool { python, avbtool })
-    }
-}
-
-impl Avb for PythonAvbtool {
-    fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
-        let mut cmd = Command::new(&self.python);
-        cmd.arg(&self.avbtool).args(req.cli_args());
-        let out = capture(&mut cmd, AVB_TIMEOUT)
-            .map_err(|e| Error::build(format!("avbtool.py did not finish: {e}")))?;
-        if out.code != 0 {
-            let text = out.text();
-            let text = text.trim();
-            let text: String = text.chars().take(240).collect();
-            return Err(Error::build(format!(
-                "avbtool.py failed ({}): {text}",
-                out.code
-            )));
-        }
-        Ok(())
-    }
 }
 
 const AVBTOOL_RELEASE: &str = "avbtool 1.3.0";
@@ -1096,12 +1058,13 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
 ///
 /// The bytes from `original_image_size` to the end of the file (old hashtree,
 /// vbmeta, footer and padding) are read into memory first; the file itself is
-/// not touched before the backend runs. `avbtool` rewrites that tail in place,
-/// so a failed rebuild, or a tree that does not fit the locked slot, is rolled
-/// back from the saved bytes. `Ok(Some(info))` means a footer was rebuilt and
-/// the image was padded to the locked slot when needed; `Ok(None)` means the
-/// hashtree grew past the slot and the tail was restored; `Err` means the
-/// backend failed or left no valid footer, and the tail was restored first.
+/// not touched before the backend runs. The native backend rewrites that tail
+/// in place, so a failed rebuild, or a tree that does not fit the locked slot,
+/// is rolled back from the saved bytes. `Ok(Some(info))` means a footer was
+/// rebuilt and the image was padded to the locked slot when needed; `Ok(None)`
+/// means the hashtree grew past the slot and the tail was restored; `Err`
+/// means the backend failed or left no valid footer, and the tail was restored
+/// first.
 pub fn rebuild_hashtree(
     image: &Path,
     info: &AvbInfo,
@@ -1531,16 +1494,6 @@ mod tests {
         for _ in 0..25 {
             assert!(seen.insert(random_salt_hex().unwrap()), "salt repeated");
         }
-    }
-
-    #[test]
-    fn missing_avbtool_names_the_exact_path() {
-        let dir = tmp("volte_avb_missing_tool");
-        let tool = dir.join("tool").join("avbtool.py");
-        let err = PythonAvbtool::new(PathBuf::from("python.exe"), tool.clone()).unwrap_err();
-        assert_eq!(err.kind(), crate::error::ErrorKind::Missing);
-        assert!(err.message().contains(&tool.display().to_string()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     struct NoopBackend;
