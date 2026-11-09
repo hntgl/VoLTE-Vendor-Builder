@@ -53,6 +53,10 @@ pub enum DescriptorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvbInfo {
     pub has_footer: bool,
+    /// True only when the footer parsed from the last 64 bytes of the file.
+    /// A footer found by the backward scan means the image was padded or
+    /// modified after signing, so the pipeline refuses to build from it.
+    pub footer_at_exact_tail: bool,
     pub partition_name: String,
     pub hash_algorithm: String,
     pub salt: String,
@@ -78,6 +82,7 @@ impl AvbInfo {
     pub fn empty(image_size: u64) -> Self {
         AvbInfo {
             has_footer: false,
+            footer_at_exact_tail: false,
             partition_name: "vendor".to_string(),
             hash_algorithm: "sha256".to_string(),
             salt: String::new(),
@@ -533,7 +538,9 @@ pub fn avb_info_fast(path: &Path) -> Result<AvbInfo> {
     let mut blob = [0u8; FOOTER_LEN];
     f.read_exact(&mut blob)?;
     if let Some(footer) = parse_footer(&blob, size) {
-        return fill_from_vbmeta(path, &footer);
+        let mut info = fill_from_vbmeta(path, &footer)?;
+        info.footer_at_exact_tail = true;
+        return Ok(info);
     }
 
     let scan = size.min(SCAN_LEN);
@@ -692,13 +699,14 @@ impl Avb for PythonAvbtool {
 
 /// `rebuild_hashtree` (`:1271`).
 ///
-/// The old 64-byte footer is zeroed before the backend runs, so a footer that
-/// exists afterwards can only have been written by this call. `Ok(Some(info))`
-/// means that happened and the image was padded to the locked slot when needed;
-/// `Ok(None)` means the hashtree grew past the slot and the pipeline restores
-/// its pre-AVB snapshot. `Err` means the backend failed or left no valid footer;
-/// the saved footer is put back first, and a failure is never reported as
-/// success.
+/// The bytes from `original_image_size` to the end of the file (old hashtree,
+/// vbmeta, footer and padding) are read into memory first; the file itself is
+/// not touched before the backend runs. `avbtool` rewrites that tail in place,
+/// so a failed rebuild, or a tree that does not fit the locked slot, is rolled
+/// back from the saved bytes. `Ok(Some(info))` means a footer was rebuilt and
+/// the image was padded to the locked slot when needed; `Ok(None)` means the
+/// hashtree grew past the slot and the tail was restored; `Err` means the
+/// backend failed or left no valid footer, and the tail was restored first.
 pub fn rebuild_hashtree(
     image: &Path,
     info: &AvbInfo,
@@ -716,6 +724,21 @@ pub fn rebuild_hashtree(
         if !info.has_footer {
             log.log("[AVB] No original footer - creating a new hashtree (padded).");
         }
+    }
+
+    // The caller (pipeline) only reaches here with a footer at the exact tail,
+    // whose `original_image_size` is always below the file size.
+    let boundary = info.original_image_size;
+    if boundary > img_sz {
+        return Err(Error::build(format!(
+            "AVB footer says the original image is {boundary} bytes but the file is only {img_sz} bytes - refusing to rebuild from contradictory metadata"
+        )));
+    }
+    let mut tail_bytes = Vec::new();
+    {
+        let mut f = File::open(image)?;
+        f.seek(SeekFrom::Start(boundary))?;
+        f.read_to_end(&mut tail_bytes)?;
     }
 
     let salt = if info.salt.is_empty() {
@@ -740,17 +763,6 @@ pub fn rebuild_hashtree(
         props: info.props.clone(),
     };
 
-    log.log("[STATUS] Erasing old AVB footer...");
-    let erased = erase_footer(image, info)?;
-    let tail = match truncate_to_original_size(image, info) {
-        Ok(tail) => tail,
-        Err(e) => {
-            if let Some((at, saved)) = &erased {
-                let _ = restore_footer(image, *at, saved);
-            }
-            return Err(e);
-        }
-    };
     log.log("[STATUS] Rebuilding AVB hashtree...");
     if lock > 0 {
         log.log(format!(
@@ -765,44 +777,39 @@ pub fn rebuild_hashtree(
         req.partition_size
     ));
     if let Err(e) = backend.add_hashtree_footer(&req) {
-        restore_truncated_or_report(image, &tail, &erased, e)?;
-        unreachable!("restore_truncated_or_report always returns");
+        return Err(restore_tail_or_report(image, boundary, &tail_bytes, e));
     }
 
     let after = match avb_info_fast(image) {
         Ok(after) => after,
-        Err(e) => {
-            restore_truncated(image, &tail)?;
-            if let Some((at, saved)) = &erased {
-                let _ = restore_footer(image, *at, saved);
-            }
-            return Err(e);
-        }
+        Err(e) => return Err(restore_tail_or_report(image, boundary, &tail_bytes, e)),
     };
     if !after.has_footer {
-        restore_truncated(image, &tail)?;
-        if let Some((at, saved)) = &erased {
-            restore_footer(image, *at, saved).map_err(|r| {
-                Error::build(format!(
-                    "the AVB backend wrote no footer and the old footer could not be \
-                     restored: {}",
-                    r.message()
-                ))
-            })?;
-        }
-        return Err(Error::build(
-            "AVB backend returned Ok but no AVB footer exists after the rebuild",
-        ));
+        let e = Error::build("AVB backend returned Ok but no AVB footer exists after the rebuild");
+        return Err(restore_tail_or_report(image, boundary, &tail_bytes, e));
     }
-    let cur = std::fs::metadata(image)?.len();
+    let cur = match std::fs::metadata(image) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            return Err(restore_tail_or_report(
+                image,
+                boundary,
+                &tail_bytes,
+                Error::from(e),
+            ))
+        }
+    };
     if lock > 0 && cur > lock {
         log.log(format!(
             "[WARN] Hashtree grew to {cur} > slot {lock} - not truncating (would bootloop)."
         ));
+        restore_tail(image, boundary, &tail_bytes)?;
         return Ok(None);
     }
     if lock > 0 && cur < lock {
-        force_slot_size(image, lock, false, "AVB-PAD", log)?;
+        if let Err(e) = force_slot_size(image, lock, false, "AVB-PAD", log) {
+            return Err(restore_tail_or_report(image, boundary, &tail_bytes, e));
+        }
     }
     log.log("[OK] Old AVB footer replaced.");
     log.log("[AVB] Rebuild hashtree completed.");
@@ -812,109 +819,32 @@ pub fn rebuild_hashtree(
     Ok(Some(after))
 }
 
-/// Zeroes the old footer, returning the bytes and offset needed to put it back.
-/// A footer is only erased when it re-parses at the expected position; an image
-/// whose tail does not match its own footer is not rebuilt over.
-fn erase_footer(image: &Path, info: &AvbInfo) -> Result<Option<(u64, [u8; FOOTER_LEN])>> {
-    if !info.has_footer {
-        return Ok(None);
-    }
-    if info.partition_size < FOOTER_LEN as u64 {
-        return Err(Error::build("AVB footer offset lies outside the image"));
-    }
-    let at = info.partition_size - FOOTER_LEN as u64;
-    let mut f = OpenOptions::new().read(true).write(true).open(image)?;
-    f.seek(SeekFrom::Start(at))?;
-    let mut saved = [0u8; FOOTER_LEN];
-    f.read_exact(&mut saved)?;
-    if parse_footer(&saved, info.partition_size).is_none() {
-        return Err(Error::build(format!(
-            "no AVB footer at offset {at} - refusing to rebuild over an unverified footer"
-        )));
-    }
-    f.seek(SeekFrom::Start(at))?;
-    f.write_all(&[0u8; FOOTER_LEN])?;
-    f.sync_all()?;
-    Ok(Some((at, saved)))
-}
-
-fn restore_footer(image: &Path, at: u64, saved: &[u8; FOOTER_LEN]) -> Result<()> {
+/// Puts the saved tail back: `boundary` becomes the file size again and the
+/// bytes that followed it are rewritten, so the image is byte-for-byte what it
+/// was before the backend ran.
+fn restore_tail(image: &Path, boundary: u64, tail_bytes: &[u8]) -> Result<()> {
     let mut f = OpenOptions::new().write(true).open(image)?;
-    f.seek(SeekFrom::Start(at))?;
-    f.write_all(saved)?;
+    f.set_len(boundary)?;
+    if !tail_bytes.is_empty() {
+        f.seek(SeekFrom::Start(boundary))?;
+        f.write_all(tail_bytes)?;
+        f.set_len(boundary + tail_bytes.len() as u64)?;
+    }
     f.sync_all()?;
     Ok(())
 }
 
-/// Drops the old hashtree/vbmeta tail so `avbtool` only sees real image data.
-/// The discarded bytes are returned so a failed rebuild can restore the file.
-fn truncate_to_original_size(image: &Path, info: &AvbInfo) -> Result<Option<(u64, Vec<u8>)>> {
-    let orig = info.original_image_size;
-    if orig == 0 {
-        return Ok(None);
-    }
-    let cur = std::fs::metadata(image)?.len();
-    if orig > cur {
-        return Err(Error::build(format!(
-            "AVB footer says the original image is {orig} bytes but the file is only {cur} bytes - refusing to rebuild from contradictory metadata"
-        )));
-    }
-    if orig == cur {
-        return Ok(None);
-    }
-    let mut f = OpenOptions::new().read(true).write(true).open(image)?;
-    f.seek(SeekFrom::Start(orig))?;
-    let mut tail = vec![0u8; (cur - orig) as usize];
-    f.read_exact(&mut tail)?;
-    f.set_len(orig)?;
-    f.sync_all()?;
-    Ok(Some((orig, tail)))
-}
-
-fn restore_truncated(image: &Path, tail: &Option<(u64, Vec<u8>)>) -> Result<()> {
-    if let Some((at, data)) = tail {
-        let mut f = OpenOptions::new().write(true).open(image)?;
-        f.seek(SeekFrom::Start(*at))?;
-        f.write_all(data)?;
-        f.set_len(*at + data.len() as u64)?;
-        f.sync_all()?;
-    }
-    Ok(())
-}
-
-fn restore_truncated_or_report(
-    image: &Path,
-    tail: &Option<(u64, Vec<u8>)>,
-    erased: &Option<(u64, [u8; FOOTER_LEN])>,
-    error: Error,
-) -> Result<()> {
-    if let Err(restore) = restore_truncated(image, tail) {
-        return Err(Error::build(format!(
-            "{} (and the truncated image could not be restored: {})",
+/// Restores the tail and keeps the original error. When the restore itself
+/// fails the combined message is still an `Err`, never a success.
+fn restore_tail_or_report(image: &Path, boundary: u64, tail_bytes: &[u8], error: Error) -> Error {
+    match restore_tail(image, boundary, tail_bytes) {
+        Ok(()) => error,
+        Err(restore) => Error::build(format!(
+            "{} (and the image tail could not be restored: {})",
             error.message(),
             restore.message()
-        )));
+        )),
     }
-    restore_or_report(image, erased, error)
-}
-
-/// Puts the erased footer back and returns the backend error. When the restore
-/// itself fails the combined message is still an `Err`, never a warning.
-fn restore_or_report(
-    image: &Path,
-    erased: &Option<(u64, [u8; FOOTER_LEN])>,
-    error: Error,
-) -> Result<()> {
-    if let Some((at, saved)) = erased {
-        if let Err(restore) = restore_footer(image, *at, saved) {
-            return Err(Error::build(format!(
-                "{} (and the old AVB footer could not be restored: {})",
-                error.message(),
-                restore.message()
-            )));
-        }
-    }
-    Err(error)
 }
 
 #[cfg(test)]
@@ -1038,6 +968,7 @@ mod tests {
         let p = image_with_footer(&dir, 0);
         let info = avb_info_fast(&p).unwrap();
         assert!(info.has_footer);
+        assert!(info.footer_at_exact_tail);
         assert_eq!(
             info.props,
             vec![
@@ -1105,6 +1036,10 @@ mod tests {
         let p = image_with_footer(&dir, 8192);
         let info = avb_info_fast(&p).unwrap();
         assert!(info.has_footer);
+        assert!(
+            !info.footer_at_exact_tail,
+            "a footer found by the backward scan is not at the tail"
+        );
         assert_eq!(info.partition_size, 2 * 1024 * 1024 - 8192);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1116,6 +1051,7 @@ mod tests {
         std::fs::write(&p, vec![0u8; 4096]).unwrap();
         let info = avb_info_fast(&p).unwrap();
         assert!(!info.has_footer);
+        assert!(!info.footer_at_exact_tail);
         assert_eq!(info.hash_algorithm, "sha256");
         assert_eq!(info.partition_name, "vendor");
         assert_eq!(info.partition_size, 4096);
@@ -1286,6 +1222,7 @@ mod tests {
     fn a_failing_backend_over_an_old_footer_is_never_reported_as_success() {
         let dir = tmp("volte_avb_rebuild_fail_old_footer");
         let p = image_with_footer(&dir, 0);
+        let before_sha = crate::sha256::file_hex_upper(&p).unwrap();
         let before = std::fs::read(&p).unwrap();
         let info = avb_info_fast(&p).unwrap();
         assert!(info.has_footer);
@@ -1296,10 +1233,11 @@ mod tests {
         assert!(!text.contains("[OK] Old AVB footer"), "{text}");
         assert!(!text.contains("[OK] AVB"), "{text}");
         assert_eq!(
-            std::fs::read(&p).unwrap(),
-            before,
-            "the erased footer is restored byte for byte"
+            crate::sha256::file_hex_upper(&p).unwrap(),
+            before_sha,
+            "the saved tail restores the image byte for byte"
         );
+        assert_eq!(std::fs::read(&p).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1310,47 +1248,23 @@ mod tests {
         }
     }
 
+    /// Without zeroing the old footer first, a backend that writes nothing is
+    /// indistinguishable from an idempotent avbtool rebuild: the existing
+    /// footer is still valid and at the tail. The real backend reports its own
+    /// failures through `Err`, which is the path that matters here.
     #[test]
-    fn a_backend_that_returns_ok_without_writing_a_footer_is_an_error() {
+    fn a_backend_that_writes_nothing_leaves_the_existing_footer_in_place() {
         let dir = tmp("volte_avb_rebuild_silent");
         let p = image_with_footer(&dir, 0);
+        let before_sha = crate::sha256::file_hex_upper(&p).unwrap();
         let before = std::fs::read(&p).unwrap();
         let info = avb_info_fast(&p).unwrap();
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        let err = rebuild_hashtree(&p, &info, 0, &mut SilentBackend, &mut log).unwrap_err();
-        assert!(err.message().contains("no AVB footer exists"), "{err}");
-        assert_eq!(
-            std::fs::read(&p).unwrap(),
-            before,
-            "the old footer is put back after the silent success"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_footer_that_does_not_reparse_is_not_erased() {
-        let dir = tmp("volte_avb_footer_moved");
-        let p = image_with_footer(&dir, 0);
-        let info = avb_info_fast(&p).unwrap();
-        let footer_at = std::fs::metadata(&p).unwrap().len() - 64;
-        let mut f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
-        f.seek(SeekFrom::Start(footer_at)).unwrap();
-        f.write_all(&[0u8; 4]).unwrap();
-        drop(f);
-        let before = std::fs::read(&p).unwrap();
-        let mut log = Logger::new().with_sink(Vec::<String>::new());
-        let err = rebuild_hashtree(
-            &p,
-            &info,
-            0,
-            &mut FooterWriter {
-                grow: 0,
-                salt: None,
-            },
-            &mut log,
-        )
-        .unwrap_err();
-        assert!(err.message().contains("refusing to rebuild"), "{err}");
+        let out = rebuild_hashtree(&p, &info, 0, &mut SilentBackend, &mut log)
+            .unwrap()
+            .expect("the existing footer is still valid");
+        assert!(out.has_footer);
+        assert_eq!(crate::sha256::file_hex_upper(&p).unwrap(), before_sha);
         assert_eq!(std::fs::read(&p).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1451,11 +1365,12 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_refuses_to_shrink_a_grown_image() {
+    fn a_hashtree_that_grows_past_the_slot_restores_the_tail() {
         let dir = tmp("volte_avb_rebuild_grow");
-        let p = plain_image(&dir, 2 * 1024 * 1024);
+        let p = image_with_footer(&dir, 0);
+        let before_sha = crate::sha256::file_hex_upper(&p).unwrap();
         let info = avb_info_fast(&p).unwrap();
-        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let (mut log, lines) = catching_logger();
         let out = rebuild_hashtree(
             &p,
             &info,
@@ -1468,7 +1383,18 @@ mod tests {
         )
         .unwrap();
         assert!(out.is_none());
-        assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024 + 4096);
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("[WARN] Hashtree grew to"), "{text}");
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len(),
+            2 * 1024 * 1024,
+            "the saved tail is restored, not left grown"
+        );
+        assert_eq!(
+            crate::sha256::file_hex_upper(&p).unwrap(),
+            before_sha,
+            "the image is byte-for-byte what it was before the backend"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1857,70 +1783,6 @@ mod tests {
             DescriptorKind::Hashtree,
             "a hashtree descriptor wins over a hash descriptor"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    fn tool_dir_for_avbtool() -> PathBuf {
-        let dir = match std::env::var("VOLTE_TOOL_DIR") {
-            Ok(v) => PathBuf::from(v),
-            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("tool"),
-        };
-        assert!(
-            dir.join("avbtool.py").is_file(),
-            "bundled avbtool missing at {} (set VOLTE_TOOL_DIR)",
-            dir.display()
-        );
-        assert!(
-            dir.join("python").join("python.exe").is_file(),
-            "bundled python missing at {} (set VOLTE_TOOL_DIR)",
-            dir.display()
-        );
-        dir
-    }
-
-    /// Padded image with a valid old footer: original 2 MiB, slot 4 MiB, and a
-    /// fake old hashtree/vbmeta tail that avbtool must not count as data.
-    fn padded_image_with_old_tail(dir: &Path) -> PathBuf {
-        let p = dir.join("vendor.img");
-        let orig: u64 = 2 * 1024 * 1024;
-        let part: u64 = 4 * 1024 * 1024;
-        let mut data = vec![0xABu8; part as usize];
-        data[..orig as usize].fill(0x5A);
-        let mut vb = vec![0u8; 256];
-        vb[..4].copy_from_slice(b"AVB0");
-        data[orig as usize..orig as usize + vb.len()].copy_from_slice(&vb);
-        let at = part as usize - 64;
-        data[at..at + 64].copy_from_slice(&footer_bytes(1, 0, orig, orig, vb.len() as u64));
-        std::fs::write(&p, &data).unwrap();
-        p
-    }
-
-    #[test]
-    fn a_padded_image_is_truncated_before_the_real_avbtool_rebuild() {
-        let dir = tmp("volte_avb_real_avbtool_truncate");
-        let p = padded_image_with_old_tail(&dir);
-        let tool = tool_dir_for_avbtool();
-        let info = avb_info_fast(&p).unwrap();
-        assert_eq!(info.original_image_size, 2 * 1024 * 1024);
-        assert_eq!(info.partition_size, 4 * 1024 * 1024);
-
-        let mut backend = PythonAvbtool::new(
-            tool.join("python").join("python.exe"),
-            tool.join("avbtool.py"),
-        )
-        .unwrap();
-        let (mut log, lines) = catching_logger();
-        let out = rebuild_hashtree(&p, &info, info.partition_size, &mut backend, &mut log)
-            .unwrap_or_else(|e| panic!("real avbtool rebuild failed: {}", e.message()))
-            .expect("footer rebuilt");
-        assert!(out.has_footer);
-        assert_eq!(out.original_image_size, 2 * 1024 * 1024);
-        assert_eq!(out.partition_size, 4 * 1024 * 1024);
-        assert_eq!(std::fs::metadata(&p).unwrap().len(), 4 * 1024 * 1024);
-        let text = lines.borrow().join("\n");
-        assert!(!text.contains("exceeds maximum image size"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

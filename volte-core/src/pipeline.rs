@@ -22,7 +22,6 @@ use crate::payload;
 use crate::profile;
 use crate::props;
 use crate::report;
-use crate::slot;
 use crate::sparse;
 use crate::verify::{self, Verdict};
 
@@ -87,9 +86,10 @@ const AVB_HEADROOM: u64 = 64 * 1024 * 1024;
 
 /// Peak bytes the build needs on each kind of volume.
 ///
-/// Destination: the output image, plus the verified restore side file that A02
-/// writes when AVB cannot fit, plus [`AVB_HEADROOM`]. Temp: the unsparsed image
-/// when the source is sparse, plus the always-present pre-AVB backup.
+/// Destination: the output image, one spare image-sized reserve and
+/// [`AVB_HEADROOM`]. Temp: the working image, plus the unsparsed copy when the
+/// source is sparse. The old peak also covered the removed pre-AVB backup, so
+/// this stays conservative.
 fn space_need(raw_sz: u64, sparse: bool) -> (u64, u64) {
     let dest = raw_sz.saturating_mul(2).saturating_add(AVB_HEADROOM);
     let temp = raw_sz.saturating_add(if sparse { raw_sz } else { 0 });
@@ -220,78 +220,6 @@ fn copy_with_progress(src: &Path, dst: &Path, progress: &mut dyn FnMut(u8, &str)
     Ok(())
 }
 
-/// Copies `work` to `backup` and refuses to continue unless the copy has the
-/// same size and SHA-256 as the live image (A02).
-fn take_pre_avb_backup(work: &Path, backup: &Path) -> Result<(u64, String)> {
-    let size = std::fs::metadata(work)?.len();
-    let sha = crate::sha256::file_hex_upper(work)?;
-    if backup.exists() {
-        std::fs::remove_file(backup).map_err(|e| {
-            Error::build(format!(
-                "pre-AVB backup: cannot replace {}: {e}",
-                backup.display()
-            ))
-        })?;
-    }
-    let copied = std::fs::copy(work, backup).map_err(|e| {
-        Error::build(format!(
-            "pre-AVB backup failed ({}): {e} - refusing to run AVB without a verified restore point",
-            backup.display()
-        ))
-    })?;
-    if copied != size {
-        return Err(Error::build(format!(
-            "pre-AVB backup copied {copied} of {size} bytes - refusing to run AVB"
-        )));
-    }
-    let backup_sha = crate::sha256::file_hex_upper(backup)?;
-    if backup_sha != sha {
-        return Err(Error::build(format!(
-            "pre-AVB backup hash differs from the image ({backup_sha} != {sha}) - refusing to run AVB"
-        )));
-    }
-    Ok((size, sha))
-}
-
-/// Restores the pre-AVB snapshot through a side file that is hashed before an
-/// atomic rename, so a failed restore never leaves a half-written image (A02).
-fn restore_pre_avb(work: &Path, backup: &Path, size: u64, sha: &str) -> Result<()> {
-    let backup_size = std::fs::metadata(backup).map(|m| m.len()).unwrap_or(0);
-    if backup_size != size || crate::sha256::file_hex_upper(backup)? != sha {
-        return Err(Error::build(format!(
-            "pre-AVB backup {} no longer matches the copied image - cannot restore safely",
-            backup.display()
-        )));
-    }
-    let mut side = work.as_os_str().to_owned();
-    side.push(".restore.tmp");
-    let side = PathBuf::from(side);
-    if side.exists() {
-        std::fs::remove_file(&side)?;
-    }
-    let copied = std::fs::copy(backup, &side)?;
-    if copied != size || crate::sha256::file_hex_upper(&side)? != sha {
-        let _ = std::fs::remove_file(&side);
-        return Err(Error::build(
-            "restored side file does not match the pre-AVB backup - the image was left untouched",
-        ));
-    }
-    std::fs::rename(&side, work).map_err(|e| {
-        let _ = std::fs::remove_file(&side);
-        Error::build(format!(
-            "atomic restore over {} failed: {e}",
-            work.display()
-        ))
-    })?;
-    let after = std::fs::metadata(work).map(|m| m.len()).unwrap_or(0);
-    if after != size || crate::sha256::file_hex_upper(work)? != sha {
-        return Err(Error::build(
-            "the restored image does not match the pre-AVB backup",
-        ));
-    }
-    Ok(())
-}
-
 /// Drops the `mkdir` commands whose directory already exists (`:1565-1581`);
 /// a probe error, including a non-EXT4 image, is fatal like in Python.
 fn filter_mkdir(
@@ -327,7 +255,9 @@ pub fn run(
     }
 
     std::fs::create_dir_all(opts.logs_dir)?;
-    let log_path = opts.logs_dir.join(format!("hue_chuan_{}.log", log_stamp()));
+    let log_path = opts
+        .logs_dir
+        .join(format!("build_vendor_volte_{}.log", log_stamp()));
     log.add_sink(FileSink::create(&log_path)?);
 
     let (folder, out_path) = resolve_output(&src, opts.out_path, opts.keep_out)?;
@@ -449,6 +379,15 @@ pub fn run(
 
     progress(30, "AVB info");
     let mut avb_info = avb::avb_info_fast(&work)?;
+    if avb_info.has_footer && !avb_info.footer_at_exact_tail {
+        return Err(Error::build(
+            "AVB footer found but not positioned at the end of the partition \
+             (found via backward scan, not at the expected tail offset). This \
+             usually means the source vendor.img was already modified or \
+             corrupted by a previous process. Refusing to build from a \
+             suspect source image - re-dump the original vendor.img and retry.",
+        ));
+    }
     for tag in &avb_info.unsupported_descriptor_tags {
         log.log(format!(
             "[WARN] AVB vbmeta: unsupported descriptor tag {tag}"
@@ -643,48 +582,47 @@ pub fn run(
     };
 
     let slot_size = orig_sz;
-    let pre_avb = td.join("vendor_pre_avb.img");
-    let (pre_avb_size, pre_avb_sha) = take_pre_avb_backup(&work, &pre_avb)?;
-    log.log("[STATUS] Pre-AVB snapshot verified (size + SHA-256).");
     progress(82, "AVB");
-    log.log("[STATUS] Generating hashtree for the image (FEC disabled)...");
-    let avb_reason = match avb::rebuild_hashtree(&work, &avb_info, orig_sz, deps.avb, log) {
-        Ok(Some(_)) => None,
-        Ok(None) => Some("the rebuilt hashtree grew past the slot".to_string()),
-        Err(e) => {
-            let text = trunc(e.message(), 200);
-            log.log(format!("[WARN] AVB hashtree: {text}"));
-            Some(text)
+    let avb_token: &str = if !avb_info.has_footer {
+        log.log("[STEP] Source image has no AVB footer - skipping AVB (no footer added).");
+        "SKIP"
+    } else {
+        log.log("[STATUS] Generating hashtree for the image (FEC disabled)...");
+        let avb_reason = match avb::rebuild_hashtree(&work, &avb_info, orig_sz, deps.avb, log) {
+            Ok(Some(_)) => None,
+            Ok(None) => Some("the rebuilt hashtree grew past the slot".to_string()),
+            Err(e) => {
+                let text = trunc(e.message(), 200);
+                log.log(format!("[WARN] AVB hashtree: {text}"));
+                Some(text)
+            }
+        };
+        match avb_reason {
+            None => {
+                log.log("[OK] AVB hashtree + EDL size match - safe to boot.");
+                "PASS"
+            }
+            Some(reason) => {
+                log.log(
+                    "[STEP] Dropping AVB + EDL size - the rebuilt footer cannot be exported safely.",
+                );
+                // rebuild_hashtree restores the saved tail on every failure
+                // path. Confirm it did: a failed restore must stop the build
+                // instead of exporting a half-written image.
+                let cur = std::fs::metadata(&work).map(|m| m.len()).unwrap_or(0);
+                let footer_ok = avb::avb_info_fast(&work)
+                    .map(|i| i.has_footer)
+                    .unwrap_or(false);
+                if !footer_ok || slot_size == 0 || cur != slot_size {
+                    return Err(Error::build(format!(
+                        "AVB rebuild failed: {reason}. The image tail could not be restored \
+                         to its pre-AVB state ({cur} bytes, footer={footer_ok}) - no image was exported."
+                    )));
+                }
+                "SKIP"
+            }
         }
     };
-    let cur = std::fs::metadata(&work).map(|m| m.len()).unwrap_or(0);
-    let footer_ok = avb::avb_info_fast(&work)
-        .map(|i| i.has_footer)
-        .unwrap_or(false);
-    let boot_safe = avb_reason.is_none() && footer_ok && slot_size > 0 && cur == slot_size;
-    if !boot_safe {
-        let reason = avb_reason.unwrap_or_else(|| {
-            if !footer_ok {
-                "the AVB backend produced no footer".to_string()
-            } else {
-                format!("the rebuilt image is {cur} bytes but the slot is {slot_size}")
-            }
-        });
-        log.log("[STEP] Dropping AVB + EDL size - the rebuilt footer cannot be exported safely.");
-        restore_pre_avb(&work, &pre_avb, pre_avb_size, &pre_avb_sha)?;
-        log.log("[OK] Restored the pre-AVB image (size + SHA-256 verified).");
-        slot::force_slot_size(&work, slot_size, true, "BOOT-SAFE", log)?;
-        if let Err(e) = std::fs::remove_file(&work) {
-            log.log(format!(
-                "[WARN] Could not remove the unsafe output: {}",
-                trunc(&e.to_string(), 160)
-            ));
-        }
-        return Err(Error::build(format!(
-            "AVB rebuild failed: {reason}. The image still carries the original AVB footer while the filesystem content was modified, so it is not safe to boot or flash - no image was exported."
-        )));
-    }
-    log.log("[OK] AVB hashtree + EDL size match - safe to boot.");
 
     let out_sz = std::fs::metadata(&work).map(|m| m.len()).unwrap_or(0);
     if slot_size > 0 && out_sz != slot_size {
@@ -701,7 +639,6 @@ pub fn run(
     log.log(format!("{}{}", config::TOKEN_FILE, out_display));
     log.log(format!("{}{}", config::TOKEN_SIZE, out_sz));
 
-    let avb_token = "PASS";
     let summary = report::Summary {
         out_path: &out_display,
         out_size: out_sz,
@@ -936,6 +873,12 @@ mod tests {
     impl avb::Avb for FooterAvb {
         fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
             self.calls += 1;
+            if let Some(td) = req.image.parent() {
+                assert!(
+                    !td.join("vendor_pre_avb.img").exists(),
+                    "the file-wide pre-AVB backup must not be created"
+                );
+            }
             write_avb_tail(&req.image, req.partition_size, &req.partition_name, 0)
         }
     }
@@ -1108,86 +1051,6 @@ mod tests {
         assert_eq!(crate::sha256::file_hex_upper(src).unwrap(), hash);
     }
 
-    fn restore_side(work: &Path) -> PathBuf {
-        let mut side = work.as_os_str().to_owned();
-        side.push(".restore.tmp");
-        PathBuf::from(side)
-    }
-
-    #[test]
-    fn a_pre_avb_backup_is_verified_by_size_and_hash() {
-        let dir = tmp("volte_pipeline_pre_avb_ok");
-        let work = dir.join("vendor_VolLTE.img");
-        let backup = dir.join("vendor_pre_avb.img");
-        std::fs::write(&work, vec![b'A'; 8192]).unwrap();
-        let (size, sha) = take_pre_avb_backup(&work, &backup).unwrap();
-        assert_eq!(size, 8192);
-        assert_eq!(sha, crate::sha256::file_hex_upper(&work).unwrap());
-        assert_eq!(
-            std::fs::read(&backup).unwrap(),
-            std::fs::read(&work).unwrap()
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn restore_replaces_the_image_with_the_verified_snapshot() {
-        let dir = tmp("volte_pipeline_restore_ok");
-        let work = dir.join("vendor_VolLTE.img");
-        let backup = dir.join("vendor_pre_avb.img");
-        std::fs::write(&backup, vec![b'A'; 4096]).unwrap();
-        let sha = crate::sha256::file_hex_upper(&backup).unwrap();
-        std::fs::write(&work, vec![b'B'; 4096]).unwrap();
-        restore_pre_avb(&work, &backup, 4096, &sha).unwrap();
-        assert_eq!(std::fs::read(&work).unwrap(), vec![b'A'; 4096]);
-        assert!(!restore_side(&work).exists(), "the side file is gone");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_truncated_backup_makes_restore_fatal_and_leaves_the_image_untouched() {
-        let dir = tmp("volte_pipeline_restore_short");
-        let work = dir.join("vendor_VolLTE.img");
-        let backup = dir.join("vendor_pre_avb.img");
-        std::fs::write(&work, vec![b'B'; 4096]).unwrap();
-        std::fs::write(&backup, vec![b'A'; 1024]).unwrap();
-        let sha = crate::sha256::file_hex_upper(&backup).unwrap();
-        let err = restore_pre_avb(&work, &backup, 4096, &sha).unwrap_err();
-        assert!(err.message().contains("no longer matches"), "{err}");
-        assert_eq!(std::fs::read(&work).unwrap(), vec![b'B'; 4096]);
-        assert!(!restore_side(&work).exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_backup_with_the_wrong_hash_makes_restore_fatal() {
-        let dir = tmp("volte_pipeline_restore_hash");
-        let work = dir.join("vendor_VolLTE.img");
-        let backup = dir.join("vendor_pre_avb.img");
-        std::fs::write(&work, vec![b'B'; 4096]).unwrap();
-        std::fs::write(&backup, vec![b'A'; 4096]).unwrap();
-        let err = restore_pre_avb(&work, &backup, 4096, &"00".repeat(32)).unwrap_err();
-        assert!(err.message().contains("no longer matches"), "{err}");
-        assert_eq!(std::fs::read(&work).unwrap(), vec![b'B'; 4096]);
-        assert!(!restore_side(&work).exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_failed_atomic_replace_is_fatal_and_removes_the_side_file() {
-        let dir = tmp("volte_pipeline_restore_rename");
-        let work = dir.join("vendor_VolLTE.img");
-        std::fs::create_dir(&work).unwrap();
-        let backup = dir.join("vendor_pre_avb.img");
-        std::fs::write(&backup, vec![b'A'; 4096]).unwrap();
-        let sha = crate::sha256::file_hex_upper(&backup).unwrap();
-        let err = restore_pre_avb(&work, &backup, 4096, &sha).unwrap_err();
-        assert!(err.message().contains("atomic restore"), "{err}");
-        assert!(work.is_dir(), "the destination is untouched");
-        assert!(!restore_side(&work).exists(), "the side file is removed");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn output_equal_to_the_source_is_refused_and_the_source_is_untouched() {
         let dir = tmp("volte_pipeline_out_equals_src");
@@ -1325,15 +1188,19 @@ mod tests {
     }
 
     #[test]
-    fn space_need_counts_the_copy_the_restore_side_and_the_temp_backup() {
+    fn space_need_counts_the_copy_and_the_temp_headroom() {
         let raw = 100 * 1024 * 1024;
         let (dest, temp) = space_need(raw, false);
         assert_eq!(dest, raw * 2 + AVB_HEADROOM);
-        assert_eq!(temp, raw, "a raw source only needs the pre-AVB backup");
+        assert_eq!(temp, raw, "a raw source only needs the working copy");
 
         let (dest, temp) = space_need(raw, true);
         assert_eq!(dest, raw * 2 + AVB_HEADROOM);
-        assert_eq!(temp, raw * 2, "the unsparsed image and the backup coexist");
+        assert_eq!(
+            temp,
+            raw * 2,
+            "the unsparsed copy and the working image coexist"
+        );
     }
 
     #[test]
@@ -1378,6 +1245,7 @@ mod tests {
         let dir = tmp("volte_pipeline_full");
         let tool = tool_dir();
         let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor("vendor", 0)]);
         let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
         seed_payloads(&dir);
         let logs = dir.join("Logs");
@@ -1460,7 +1328,11 @@ mod tests {
         let log_files: Vec<_> = std::fs::read_dir(&logs)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("hue_chuan_"))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("build_vendor_volte_")
+            })
             .collect();
         assert_eq!(log_files.len(), 1);
 
@@ -1576,8 +1448,8 @@ mod tests {
     }
 
     #[test]
-    fn an_avb_backend_failure_never_claims_a_passed_hashtree() {
-        let dir = tmp("volte_pipeline_avb_fail");
+    fn a_no_footer_image_that_fills_the_slot_skips_avb_and_exports() {
+        let dir = tmp("volte_pipeline_no_footer_full_slot");
         let src = make_ext4(&dir, "vendor.img");
         let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
         seed_payloads(&dir);
@@ -1603,36 +1475,150 @@ mod tests {
             logs_dir: &logs,
         };
 
-        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
-        assert_eq!(avb.calls, 1);
+        assert!(!avb::avb_info_fast(&src).unwrap().has_footer);
+        let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
+
+        assert_eq!(
+            avb.calls, 0,
+            "a source without a footer must not reach avbtool"
+        );
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            std::fs::metadata(&src).unwrap().len()
+        );
         assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
-        assert!(
-            !dir.join("vendor_VolLTE.img").exists(),
-            "no unsafe image may be exported"
-        );
-        assert!(
-            err.message().contains("simulated avbtool.py failure"),
-            "{err}"
-        );
-        assert!(err.message().contains("not safe to boot or flash"), "{err}");
 
         let text = lines.borrow().join("\n");
-        assert!(text.contains("[WARN] AVB hashtree:"), "{text}");
-        assert!(!text.contains("AVB_HASHTREE="), "{text}");
-        assert!(!text.contains("[OUTPUT] "), "{text}");
-        assert!(!text.contains("Rebuild hashtree completed."), "{text}");
         assert!(
-            !text.contains("[OK] AVB hashtree + EDL size match"),
+            text.contains(
+                "[STEP] Source image has no AVB footer - skipping AVB (no footer added)."
+            ),
             "{text}"
         );
+        assert!(text.contains("AVB_HASHTREE=SKIP"), "{text}");
+        assert!(text.contains("[OUTPUT] "), "{text}");
+        assert!(!text.contains("[AVB] add_hashtree"), "{text}");
+        assert!(!text.contains("[STATUS] Generating hashtree"), "{text}");
+        assert!(!text.contains("Pre-AVB snapshot"), "{text}");
+        let report = std::fs::read_to_string(logs.join("vendor_VolLTE_report.txt")).unwrap();
+        assert!(report.contains("AVB_HASHTREE=SKIP"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_footer_that_is_not_at_the_tail_stops_the_build_before_processing() {
+        let dir = tmp("volte_pipeline_footer_misplaced");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor("vendor", 0)]);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&src).unwrap();
+        f.write_all(&[0u8; 4096]).unwrap();
+        drop(f);
+        let src_len = std::fs::metadata(&src).unwrap().len();
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
+        let info = avb::avb_info_fast(&src).unwrap();
+        assert!(info.has_footer);
+        assert!(
+            !info.footer_at_exact_tail,
+            "the fixture must only expose the footer through the backward scan"
+        );
+        let logs = dir.join("Logs");
+
+        let mut ops = NoopOps;
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FailingAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert!(
+            err.message()
+                .contains("not positioned at the end of the partition"),
+            "{err}"
+        );
+        assert_eq!(fsck.calls, 0, "e2fsck must not run");
+        assert_eq!(avb.calls, 0, "avbtool must not run");
+        assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), src_len);
+
+        let text = lines.borrow().join("\n");
+        assert!(!text.contains("EXT4 engine:"), "{text}");
+        assert!(!text.contains("e2fsck -fn"), "{text}");
+        assert!(!text.contains("e2fsck="), "{text}");
+        assert!(!text.contains("[STATUS] Generating hashtree"), "{text}");
+        assert!(!text.contains("AVB_HASHTREE="), "{text}");
+        assert!(!text.contains("[OUTPUT] "), "{text}");
         assert!(!logs.join("vendor_VolLTE_report.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_hashtree_that_grows_past_the_slot_fails_the_build() {
+    fn an_avb_backend_failure_skips_avb_and_exports_the_image() {
+        let dir = tmp("volte_pipeline_avb_fail");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor("vendor", 0)]);
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FailingAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
+        assert_eq!(avb.calls, 1);
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            std::fs::metadata(&src).unwrap().len()
+        );
+        assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
+
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("[WARN] AVB hashtree:"), "{text}");
+        assert!(text.contains("[STEP] Dropping AVB + EDL size"), "{text}");
+        assert!(text.contains("AVB_HASHTREE=SKIP"), "{text}");
+        assert!(!text.contains("AVB_HASHTREE=PASS"), "{text}");
+        assert!(text.contains("[OUTPUT] "), "{text}");
+        assert!(!text.contains("not safe to boot or flash"), "{text}");
+        let report = std::fs::read_to_string(logs.join("vendor_VolLTE_report.txt")).unwrap();
+        assert!(report.contains("AVB_HASHTREE=SKIP"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hashtree_that_grows_past_the_slot_skips_avb_and_exports_the_image() {
         let dir = tmp("volte_pipeline_avb_grow");
         let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor("vendor", 0)]);
         let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
         seed_payloads(&dir);
         let logs = dir.join("Logs");
@@ -1657,15 +1643,22 @@ mod tests {
             logs_dir: &logs,
         };
 
-        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
         assert_eq!(avb.calls, 1);
-        assert!(err.message().contains("grew past the slot"), "{err}");
-        assert!(err.message().contains("not safe to boot or flash"), "{err}");
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            std::fs::metadata(&src).unwrap().len()
+        );
         assert_eq!(crate::sha256::file_hex_upper(&src).unwrap(), src_sha);
-        assert!(!dir.join("vendor_VolLTE.img").exists());
+
         let text = lines.borrow().join("\n");
-        assert!(!text.contains("AVB_HASHTREE="), "{text}");
-        assert!(!text.contains("[OUTPUT] "), "{text}");
+        assert!(text.contains("[WARN] Hashtree grew to"), "{text}");
+        assert!(text.contains("[STEP] Dropping AVB + EDL size"), "{text}");
+        assert!(text.contains("AVB_HASHTREE=SKIP"), "{text}");
+        assert!(!text.contains("AVB_HASHTREE=PASS"), "{text}");
+        assert!(text.contains("[OUTPUT] "), "{text}");
+        let report = std::fs::read_to_string(logs.join("vendor_VolLTE_report.txt")).unwrap();
+        assert!(report.contains("AVB_HASHTREE=SKIP"), "{report}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1673,6 +1666,7 @@ mod tests {
     fn a_successful_avb_rebuild_exports_the_image() {
         let dir = tmp("volte_pipeline_avb_ok");
         let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor("vendor", 0)]);
         let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
         seed_payloads(&dir);
         let logs = dir.join("Logs");
@@ -1706,6 +1700,7 @@ mod tests {
         );
         let text = lines.borrow().join("\n");
         assert!(text.contains("AVB_HASHTREE=PASS"), "{text}");
+        assert!(!text.contains("Pre-AVB snapshot"), "{text}");
         assert!(
             text.contains("[STATUS] Generating hashtree for the image (FEC disabled)..."),
             "{text}"
