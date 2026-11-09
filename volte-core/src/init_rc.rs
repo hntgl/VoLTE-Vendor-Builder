@@ -113,7 +113,7 @@ pub fn link(
         .filter(|n| !n.is_empty() && !has_import(&text, n))
         .collect();
     if missing.is_empty() {
-        log.log(format!("[OK] {found} already imports HD VoLTE."));
+        log.log(format!("[OK] {found} already imports VoLTE vendor config."));
         return Ok(true);
     }
     for needle in &missing {

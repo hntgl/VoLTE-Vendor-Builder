@@ -270,7 +270,7 @@ pub fn upsert(image: &Path, td: &Path, ops: &mut dyn Ext4Ops, log: &mut Logger) 
         }
         if !add.is_empty() {
             out.extend_from_slice(term);
-            out.extend_from_slice(b"# HD VoLTE show switch");
+            out.extend_from_slice(b"# VoLTE switch option enabled");
             out.extend_from_slice(term);
             for (i, line) in add.iter().enumerate() {
                 if i > 0 {
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(ops.written.len(), 1);
         let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
         assert!(text.starts_with("# comment\n\nro.unknown=keep\nro.product.model=X\n"));
-        assert!(text.contains("\n# HD VoLTE show switch\n"));
+        assert!(text.contains("\n# VoLTE switch option enabled\n"));
         for line in VOLTE_PROP_OVERRIDES {
             assert_eq!(text.matches(line).count(), 1, "{line}");
         }
@@ -660,10 +660,13 @@ PERSIST.RADIO.VT_ENABLE=0\r\nlast.noeol=1";
         assert!(contains(out, b"persist.radio.VT_ENABLE=1\r\n"), "{out:?}");
         assert!(!contains(out, b"persist.mtk.volte_support=0"));
         assert!(
-            contains(out, b"last.noeol=1\r\n\r\n# HD VoLTE show switch\r\n"),
+            contains(
+                out,
+                b"last.noeol=1\r\n\r\n# VoLTE switch option enabled\r\n"
+            ),
             "the appended block follows the detected CRLF style"
         );
-        assert!(!contains(out, b"\n\n# HD VoLTE show switch\n"));
+        assert!(!contains(out, b"\n\n# VoLTE switch option enabled\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

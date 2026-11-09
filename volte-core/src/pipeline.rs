@@ -399,7 +399,7 @@ pub fn run(
     }
 
     log.log("=".repeat(64));
-    log.log("HD Vendor Fix VoLTE");
+    log.log("VoLTE Vendor Patcher");
     log.log("Version: 2.9.2 / V298");
     log.log("Mode   : STANDARD - e2fsck + AVB signature, EDL-sized");
     log.log("Engine : HT");
