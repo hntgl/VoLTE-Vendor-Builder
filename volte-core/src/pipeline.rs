@@ -361,7 +361,17 @@ pub fn run(
     log.log("[STATUS] Copying source image...");
     progress(8, "Copy");
     if out_path.is_file() && !path_id::same_file(&out_path, &src) {
-        if let Err(e) = std::fs::remove_file(&out_path) {
+        // Keep the previous output as a single-generation backup so a failed
+        // build cannot destroy the image the user is currently flashing.
+        let bak = {
+            let mut s = out_path.as_os_str().to_owned();
+            s.push(".bak");
+            PathBuf::from(s)
+        };
+        if bak.is_file() {
+            let _ = std::fs::remove_file(&bak);
+        }
+        if let Err(e) = std::fs::rename(&out_path, &bak) {
             log.log(format!(
                 "[WARN] Destination file is open/locked: {}",
                 trunc(&e.to_string(), 160)
@@ -1045,6 +1055,41 @@ mod tests {
         run(&opts, &mut deps, &mut log, &mut progress)
     }
 
+    fn bak_path(out: &Path) -> PathBuf {
+        let mut s = out.as_os_str().to_owned();
+        s.push(".bak");
+        PathBuf::from(s)
+    }
+
+    /// Runs a full build with the real ext4 engine and the given fsck/AVB seams.
+    fn run_full_build(
+        src: &Path,
+        out: &str,
+        root: &Path,
+        logs: &Path,
+        fsck: &mut dyn Fsck,
+        avb: &mut dyn avb::Avb,
+        lines: &Rc<RefCell<Vec<String>>>,
+    ) -> Result<PathBuf> {
+        let mut ops = RustFsExt4Backend::new();
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck,
+            avb,
+        };
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src,
+            out_path: out,
+            chip: "mtk",
+            keep_out: !out.is_empty(),
+            root,
+            logs_dir: logs,
+        };
+        run(&opts, &mut deps, &mut log, &mut progress)
+    }
+
     fn assert_source_intact(src: &Path, len: u64, hash: &str) {
         assert!(src.is_file(), "the source must still exist");
         assert_eq!(std::fs::metadata(src).unwrap().len(), len);
@@ -1396,6 +1441,173 @@ mod tests {
         assert!(
             text.contains("APK_SHA256=") && !text.contains("APK_SHA256=UNVERIFIED"),
             "the overlay must be verified through the default backend\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_build_creates_no_backup() {
+        let dir = tmp("volte_pipeline_bak_first");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+
+        let out = run_full_build(&src, "", &dir, &logs, &mut fsck, &mut avb, &lines).unwrap();
+
+        assert!(out.is_file());
+        assert!(
+            !bak_path(&out).exists(),
+            "a first build must not create a backup"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_output_is_kept_as_a_single_generation_backup() {
+        let dir = tmp("volte_pipeline_bak_existing");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+        let out_path = dir.join("vendor_VolLTE.img");
+        std::fs::write(&out_path, b"previous output").unwrap();
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+
+        let out = run_full_build(&src, "", &dir, &logs, &mut fsck, &mut avb, &lines).unwrap();
+
+        assert_eq!(out, out_path);
+        assert_eq!(
+            std::fs::read(bak_path(&out)).unwrap(),
+            b"previous output",
+            "the backup must hold the exact previous output"
+        );
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            std::fs::metadata(&src).unwrap().len(),
+            "the output itself must be the new build"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_backup_is_replaced_by_the_previous_output() {
+        let dir = tmp("volte_pipeline_bak_replace");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+        let out_path = dir.join("vendor_VolLTE.img");
+        std::fs::write(&out_path, b"second generation").unwrap();
+        std::fs::write(bak_path(&out_path), b"first generation").unwrap();
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+
+        let out = run_full_build(&src, "", &dir, &logs, &mut fsck, &mut avb, &lines).unwrap();
+
+        assert_eq!(
+            std::fs::read(bak_path(&out)).unwrap(),
+            b"second generation",
+            "the backup must be the output that existed before this build"
+        );
+        let extra: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("vendor_VolLTE.img.bak."))
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "only one backup generation must exist, found {extra:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_custom_out_path_gets_the_same_backup_treatment() {
+        let dir = tmp("volte_pipeline_bak_custom_out");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+        let out_path = dir.join("custom_output.img");
+        std::fs::write(&out_path, b"custom previous").unwrap();
+        let out_s = out_path.to_string_lossy().into_owned();
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+
+        let out = run_full_build(&src, &out_s, &dir, &logs, &mut fsck, &mut avb, &lines).unwrap();
+
+        assert_eq!(out, std::path::absolute(&out_path).unwrap());
+        assert_eq!(
+            std::fs::read(bak_path(&out)).unwrap(),
+            b"custom previous",
+            "--out must not delete the previous file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_build_keeps_the_previous_output_backup() {
+        let dir = tmp("volte_pipeline_bak_failure");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+        let out_path = dir.join("vendor_VolLTE.img");
+        std::fs::write(&out_path, b"good previous output").unwrap();
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut fsck = AlwaysFailFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+
+        let err = run_full_build(&src, "", &dir, &logs, &mut fsck, &mut avb, &lines).unwrap_err();
+
+        assert!(err.message().contains("e2fsck failed"), "{err}");
+        assert_eq!(
+            std::fs::read(bak_path(&out_path)).unwrap(),
+            b"good previous output",
+            "a failure after the copy must leave the backup intact"
+        );
+        assert!(
+            !logs.join("vendor_VolLTE_report.txt").exists(),
+            "a failed build must not report an output"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rename_failure_only_warns_and_the_build_continues() {
+        let dir = tmp("volte_pipeline_bak_rename_fail");
+        let src = make_ext4(&dir, "vendor.img");
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+        let out_path = dir.join("vendor_VolLTE.img");
+        std::fs::write(&out_path, b"old output").unwrap();
+        // A directory at the backup path makes rename fail on every platform
+        // while leaving out_path writable, which is the case under test.
+        let bak = bak_path(&out_path);
+        std::fs::create_dir(&bak).unwrap();
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+
+        let out = run_full_build(&src, "", &dir, &logs, &mut fsck, &mut avb, &lines).unwrap();
+
+        let text = lines.borrow().join("\n");
+        assert!(
+            text.contains("[WARN] Destination file is open/locked:"),
+            "a failed rename must only warn\n{text}"
+        );
+        assert!(
+            bak.is_dir(),
+            "the failed rename must not alter the backup path"
+        );
+        assert_eq!(
+            std::fs::metadata(&out).unwrap().len(),
+            std::fs::metadata(&src).unwrap().len(),
+            "the build must continue and write the new output"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
