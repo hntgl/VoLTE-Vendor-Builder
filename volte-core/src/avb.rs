@@ -1249,8 +1249,10 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
 /// vbmeta, footer and padding) are read into memory first; the file itself is
 /// not touched before the backend runs. The native backend rewrites that tail
 /// in place, so a failed rebuild, or a tree that does not fit the locked slot,
-/// is rolled back from the saved bytes. `Ok(Some(info))` means a footer was
-/// rebuilt and the image was padded to the locked slot when needed; `Ok(None)`
+/// is rolled back from the saved bytes. A successful rebuild is also verified
+/// by recomputing the Merkle root from the partition bytes. `Ok(Some(info))`
+/// means a footer was rebuilt and the image was padded to the locked slot when
+/// needed; `Ok(None)`
 /// means the hashtree grew past the slot and the tail was restored; `Err`
 /// means the backend failed or left no valid footer, and the tail was restored
 /// first.
@@ -1357,6 +1359,23 @@ pub fn rebuild_hashtree(
         restore_tail(image, boundary, &tail_bytes)?;
         return Ok(None);
     }
+    // Independent check: recompute the tree from the bytes on disk. Parsing the
+    // footer only proves the metadata is well-formed, not that it matches the
+    // filesystem the backend just wrote.
+    match verify_hashtree_integrity(image, &after) {
+        Ok(true) => log.log("[OK] AVB verifier: Merkle root matches the descriptor."),
+        Ok(false) => {
+            return Err(restore_tail_or_report(
+                image,
+                boundary,
+                &tail_bytes,
+                Error::build(
+                    "AVB verifier: the rebuilt Merkle root does not match the root digest in the descriptor",
+                ),
+            ))
+        }
+        Err(e) => return Err(restore_tail_or_report(image, boundary, &tail_bytes, e)),
+    }
     if lock > 0 && cur < lock {
         if let Err(e) = force_slot_size(image, lock, false, "AVB-PAD", log) {
             return Err(restore_tail_or_report(image, boundary, &tail_bytes, e));
@@ -1368,6 +1387,58 @@ pub fn rebuild_hashtree(
         log.log(line);
     }
     Ok(Some(after))
+}
+
+/// Recomputes the dm-verity tree over the partition bytes and compares its
+/// root with the digest stored in the just-written descriptor. `Ok(false)`
+/// means the tree on disk does not cover the data on disk. A persistent
+/// digest (`digest_len == 0`) carries no root to compare, so it is reported
+/// as verifiable only when the tree can be recomputed.
+pub fn verify_hashtree_integrity(image: &Path, info: &AvbInfo) -> Result<bool> {
+    if info.data_block_size != BLOCK as u32 || info.hash_block_size != BLOCK as u32 {
+        return Err(Error::build(format!(
+            "AVB verifier only supports {}-byte hashtree blocks, not {} / {}",
+            BLOCK, info.data_block_size, info.hash_block_size
+        )));
+    }
+    let kind = HashKind::from_name(&info.hash_algorithm)?;
+    let salt = decode_salt(&info.salt)?;
+    let original = info.original_image_size;
+    let rounded = if info.descriptor_image_size >= original
+        && info.descriptor_image_size.is_multiple_of(BLOCK)
+    {
+        info.descriptor_image_size
+    } else {
+        round_block(original)
+    };
+    let size = std::fs::metadata(image)?.len();
+    if rounded > size {
+        return Err(Error::build(format!(
+            "AVB verifier: descriptor covers {rounded} bytes but the image is only {size} bytes"
+        )));
+    }
+    let mut f = File::open(image)?;
+    let (root, _tree) = build_merkle(&mut f, original, rounded, &salt, kind)?;
+    if info.persistent_digest || info.root_digest.is_empty() {
+        return Ok(true);
+    }
+    Ok(root == info.root_digest)
+}
+
+/// Test-only wrapper so fixtures in other modules can write a Merkle root that
+/// `verify_hashtree_integrity` will accept.
+#[cfg(test)]
+pub(crate) fn test_merkle_root(
+    image: &Path,
+    original: u64,
+    rounded: u64,
+    salt: &[u8],
+    algorithm: &str,
+) -> Result<Vec<u8>> {
+    let kind = HashKind::from_name(algorithm)?;
+    let mut f = File::open(image)?;
+    let (root, _tree) = build_merkle(&mut f, original, rounded, salt, kind)?;
+    Ok(root)
 }
 
 /// Puts the saved tail back: `boundary` becomes the file size again and the
@@ -1707,28 +1778,39 @@ mod tests {
         salt: Option<[u8; 32]>,
     }
 
-    /// Offset of the hashtree salt inside the golden vbmeta, derived from the
-    /// descriptor header rather than hard-coded.
-    fn golden_salt_offset() -> usize {
-        let auth = be_u64(&GOLDEN_VBMETA[12..20]) as usize;
-        let desc_offset = be_u64(&GOLDEN_VBMETA[96..104]) as usize;
-        let start = VBMETA_HEADER_LEN + auth + desc_offset;
-        let name_len = be_u32(&GOLDEN_VBMETA[start + 104..start + 108]) as usize;
-        start + HASHTREE_DESCRIPTOR_LEN + name_len
-    }
-
     impl Avb for FooterWriter {
         fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
             let size = req.partition_size;
-            let mut vb = GOLDEN_VBMETA.to_vec();
-            if let Some(salt) = self.salt {
-                let at = golden_salt_offset();
-                vb[at..at + 32].copy_from_slice(&salt);
-            }
+            let salt = match self.salt {
+                Some(salt) => salt.to_vec(),
+                None => decode_salt(&req.salt)?,
+            };
             let mut f = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&req.image)?;
+            // The fixture covers a 1 MiB payload with the same salt and
+            // algorithm the rebuild reported, so the verifier accepts it.
+            let (root, tree) =
+                build_merkle(&mut f, 1024 * 1024, 1024 * 1024, &salt, HashKind::Sha256)?;
+            let mut descriptors = encode_hashtree_descriptor(
+                1024 * 1024,
+                tree.len() as u64,
+                "vendor",
+                &salt,
+                "sha256",
+                &root,
+                0,
+            );
+            descriptors
+                .extend_from_slice(&encode_property("com.android.build.vendor", "v2"));
+            descriptors
+                .extend_from_slice(&encode_property("com.android.build.vendor.extra", "hello"));
+            let vb = encode_vbmeta(
+                &descriptors,
+                req.rollback_index,
+                req.rollback_index_location,
+            );
             f.seek(SeekFrom::Start(1024 * 1024))?;
             f.write_all(&vb)?;
             let footer = footer_bytes(1, 0, 1024 * 1024, 1024 * 1024, vb.len() as u64);
@@ -2444,6 +2526,7 @@ mod tests {
         let reread = avb_info_fast(&p).unwrap();
         assert!(reread.persistent_digest);
         assert!(reread.root_digest.is_empty());
+        assert!(verify_hashtree_integrity(&p, &reread).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2636,6 +2719,70 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), first);
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 2 * 1024 * 1024);
         assert_eq!(native_footer(&p).original_image_size, 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_verifier_detects_a_corrupted_partition_byte() {
+        let dir = tmp("volte_avb_verifier_corrupt");
+        let p = pattern_image(&dir, "vendor.img", 1024 * 1024);
+        let mut backend = NativeAvb;
+        backend
+            .add_hashtree_footer(&native_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+        let info = native_footer(&p);
+        assert!(verify_hashtree_integrity(&p, &info).unwrap());
+
+        let mut f = OpenOptions::new().write(true).open(&p).unwrap();
+        f.seek(SeekFrom::Start(BLOCK)).unwrap();
+        f.write_all(&[0xFF]).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        assert!(!verify_hashtree_integrity(&p, &info).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct TamperingBackend;
+
+    impl Avb for TamperingBackend {
+        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+            NativeAvb.add_hashtree_footer(req)?;
+            // The tree and digest are valid for the original data; changing a
+            // data byte afterwards simulates a backend that wrote a tree for
+            // different bytes than the ones it exported.
+            let mut f = OpenOptions::new().write(true).open(&req.image)?;
+            f.seek(SeekFrom::Start(BLOCK))?;
+            f.write_all(&[0xFF])?;
+            f.sync_all()?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_mismatched_merkle_root_aborts_the_rebuild() {
+        let dir = tmp("volte_avb_verifier_tamper");
+        let p = plain_image(&dir, 1024 * 1024);
+        let mut native = NativeAvb;
+        native
+            .add_hashtree_footer(&native_request(&p, 2 * 1024 * 1024))
+            .unwrap();
+        let info = native_footer(&p);
+        let boundary = info.original_image_size as usize;
+        let before = std::fs::read(&p).unwrap();
+
+        let mut backend = TamperingBackend;
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let err = rebuild_hashtree(&p, &info, 0, &mut backend, &mut log).unwrap_err();
+        assert!(err.message().contains("Merkle root"), "{err}");
+
+        let after = std::fs::read(&p).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            &after[boundary..],
+            &before[boundary..],
+            "the tail must be restored after a verifier mismatch"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

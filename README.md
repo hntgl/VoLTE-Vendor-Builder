@@ -56,6 +56,25 @@ target.
 
 Target: `x86_64-pc-windows-msvc`, stable toolchain, no nightly, no `rust-toolchain.toml`.
 
+### AVB parity checks (ignored by default)
+
+Two tests byte-compare the native backend against the bundled `tool\avbtool.py`:
+`avb::tests::avb_parity_with_the_bundled_avbtool` (synthetic sha1/sha256 images, including
+multi-level trees) and `avb::tests::avb_parity_on_a_signed_vendor_image` (a real multi-GB
+image). They stay `#[ignore]` in the default run because they need the Python oracle and,
+for the second one, a vendor dump, but they must not be forgotten. Run the script before a
+release, or on a schedule:
+
+```bat
+scripts\avb-parity.sh
+:: also run the multi-GB case:
+set VOLTE_AVB_REAL_IMAGE=D:\dump\vendor.img
+scripts\avb-parity.sh
+```
+
+The script exports `VOLTE_AVB_PARITY_PYTHON` (default `tool\python\python.exe`) and runs
+`cargo test -p volte-core avb::tests::avb_parity -- --ignored --nocapture`.
+
 ## Run
 
 `tool\` and `payload\` are resolved from the directory of the running executable
@@ -70,9 +89,10 @@ volte-cli.exe vendor <vendor.img> [--mtk | --qc] [--out <path>]
 Exit code `0` on success and for `--help`; `2` for a usage error, the GUI divergence and any
 pipeline error, matching the Python tool. A failed mandatory step fails the build: when
 `e2fsck -fn` reports an error the CLI exits `2` without printing any flashable line. An AVB
-backend failure is recoverable: the saved tail is restored and the image is still exported
-with `AVB_HASHTREE=SKIP`; only a tail restore that cannot be verified is fatal (exit `2`,
-no `[OUTPUT]`). See "AVB footer handling" below.
+failure is fatal: the saved tail is restored, the working copy is deleted and the CLI exits
+`2` without printing `[OUTPUT]`, so a filesystem that does not match its AVB metadata is
+never exported. `AVB_HASHTREE=SKIP` is reserved for source images that have no AVB footer
+at all. See "AVB footer handling" below.
 Logs, the command list and the report go to `.\Logs\`, which is created on demand.
 
 ## AVB footer handling
@@ -82,8 +102,14 @@ The vendor build classifies the source image right after copying it, before any 
 | Source state | Behavior |
 |---|---|
 | No `AVBf` footer at the last 64 bytes and none found by the backward scan | Skip AVB: `AVB_HASHTREE=SKIP`, image exported at the locked slot size. |
-| Footer parsed from the last 64 bytes | Rebuild the hashtree. `AVB_HASHTREE=PASS` when the new footer fits the slot; if the backend fails or the hashtree grows past the slot, the tail is restored and the image is exported with `SKIP`. |
+| Footer parsed from the last 64 bytes | Rebuild the hashtree. `AVB_HASHTREE=PASS` only when the footer fits the slot and the verifier recomputes a matching Merkle root. A backend failure, a hashtree that grows past the slot, or a verifier mismatch restores the tail and fails the build (exit `2`, no image exported). |
 | Footer found only by the backward scan, not at the exact tail | Build error before debugfs, `e2fsck` or the AVB rebuild runs; no output is reported and the copied file stays on disk untouched. The source was padded or modified after signing - re-dump the original `vendor.img`. |
+
+Inputs the rebuild cannot reproduce faithfully are refused before any filesystem work:
+unknown vbmeta descriptor tags (notably Tag 3, the kernel command line), Tag 2
+whole-partition hashes, FEC, non-4096-byte hashtree blocks, and persistent (`digest_len = 0`)
+root digests. `rollback_index`, `rollback_index_location` and the hashtree descriptor flags
+are copied from the source descriptor into the rebuilt vbmeta.
 
 Notes:
 
@@ -92,13 +118,17 @@ Notes:
 - The footer parser only recognises a footer in the last 64 bytes, so a displaced footer
   (the last row above) must be rejected before the rebuild.
 - Every error after the AVB rebuild starts (backend error, unparsable footer, backend
-  returning `Ok` without writing a footer, hashtree larger than the slot, padding failure)
-  restores the saved tail. If the restore itself fails, the build exits `2` without
-  reporting an output.
+  returning `Ok` without writing a footer, verifier mismatch, hashtree larger than the slot,
+  padding failure) restores the saved tail and then deletes the working copy, so no
+  partially rebuilt image is exported. If the restore itself fails, the build still exits `2`
+  without reporting an output.
+- After a successful rebuild the pipeline recomputes the dm-verity tree from the bytes on
+  disk and compares its root with the descriptor (`verify_hashtree_integrity`).
 - The source image is never modified: the pipeline works on a copy, so a failed run can be
   retried from the original.
-- Tests compare the whole-file SHA-256 before and after the AVB step, so a skipped rebuild
-  leaves the copy byte-identical to its pre-AVB state.
+- Tests compare the whole-file SHA-256 before and after the AVB step, so a build that skips
+  AVB leaves the copy byte-identical to its pre-AVB state, and every failure path is checked
+  to leave no output behind.
 
 ## Modem (BUILD MODEM / BUILD FIX MODEM)
 

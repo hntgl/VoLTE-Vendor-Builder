@@ -829,6 +829,33 @@ mod tests {
         d
     }
 
+    fn hashtree_descriptor_with_digest(
+        name: &str,
+        image_size: u64,
+        fec_roots: u32,
+        digest: &[u8],
+    ) -> Vec<u8> {
+        let salt = [0x11u8, 0x22, 0x33, 0x44];
+        let mut d = vec![0u8; 180];
+        d[0..8].copy_from_slice(&1u64.to_be_bytes());
+        d[16..20].copy_from_slice(&1u32.to_be_bytes());
+        d[20..28].copy_from_slice(&image_size.to_be_bytes());
+        d[44..48].copy_from_slice(&4096u32.to_be_bytes());
+        d[48..52].copy_from_slice(&4096u32.to_be_bytes());
+        d[52..56].copy_from_slice(&fec_roots.to_be_bytes());
+        d[72..78].copy_from_slice(b"sha256");
+        d[104..108].copy_from_slice(&(name.len() as u32).to_be_bytes());
+        d[108..112].copy_from_slice(&(salt.len() as u32).to_be_bytes());
+        d[112..116].copy_from_slice(&(digest.len() as u32).to_be_bytes());
+        d.extend_from_slice(name.as_bytes());
+        d.extend_from_slice(&salt);
+        d.extend_from_slice(digest);
+        let nbf = pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
     fn hashtree_descriptor_with_blocks(name: &str, data: u32, hash: u32) -> Vec<u8> {
         let mut d = hashtree_descriptor(name, 0);
         // The parser checks image_size against the declared data block size.
@@ -916,10 +943,19 @@ mod tests {
     }
 
     /// Writes a valid vbmeta + footer ending at `end`, moving the file size to
-    /// `end`. Used both for an in-place rebuild and for a grown hashtree.
+    /// `end`. Used both for an in-place rebuild and for a grown hashtree. The
+    /// digest covers the bytes the verifier will hash, so a successful path is
+    /// accepted by `verify_hashtree_integrity`.
     fn write_avb_tail(image: &Path, end: u64, name: &str, fec_roots: u32) -> Result<()> {
-        let vb = vbmeta_with(&[hashtree_descriptor(name, fec_roots)]);
         let vb_off = end - 4096;
+        // The fixture only covers the first MiB; the verifier hashes exactly
+        // this range, and no pipeline test asserts the reported original size.
+        let covered = 1024 * 1024;
+        let salt = [0x11u8, 0x22, 0x33, 0x44];
+        let root = avb::test_merkle_root(image, covered, covered, &salt, "sha256")?;
+        let vb = vbmeta_with(&[hashtree_descriptor_with_digest(
+            name, covered, fec_roots, &root,
+        )]);
         let footer_at = end - 64;
         assert!(vb_off + vb.len() as u64 <= footer_at);
         let mut f = std::fs::OpenOptions::new().write(true).open(image)?;
@@ -927,7 +963,7 @@ mod tests {
         f.seek(SeekFrom::Start(vb_off))?;
         f.write_all(&vb)?;
         f.write_all(&vec![0u8; (footer_at - vb_off - vb.len() as u64) as usize])?;
-        f.write_all(&footer_bytes(vb_off, vb_off, vb.len() as u64))?;
+        f.write_all(&footer_bytes(covered, vb_off, vb.len() as u64))?;
         f.sync_all()?;
         Ok(())
     }
