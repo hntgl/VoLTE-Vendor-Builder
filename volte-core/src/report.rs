@@ -7,8 +7,25 @@
 use crate::avb::AvbInfo;
 use crate::config;
 
-/// `hue_avb_lines` (`:1374`): the nine AVB report lines.
+/// `hue_avb_lines` (`:1374`): the nine AVB report lines for a rebuilt image.
+/// The rebuild never signs, so the exported file always carries
+/// `Algorithm: NONE`.
 pub fn avb_lines(info: &AvbInfo) -> Vec<String> {
+    avb_lines_with_algorithm(info, "NONE")
+}
+
+/// The same lines for the source image: the signature algorithm is the one
+/// parsed from its vbmeta header (`NONE` for an unsigned source).
+pub fn avb_lines_input(info: &AvbInfo) -> Vec<String> {
+    let alg = if info.signature_algorithm.is_empty() {
+        "NONE"
+    } else {
+        info.signature_algorithm.as_str()
+    };
+    avb_lines_with_algorithm(info, alg)
+}
+
+fn avb_lines_with_algorithm(info: &AvbInfo, signature_algorithm: &str) -> Vec<String> {
     if !info.has_footer {
         return vec!["avbtool: Given image does not look like a vbmeta image.".to_string()];
     }
@@ -36,7 +53,7 @@ pub fn avb_lines(info: &AvbInfo) -> Vec<String> {
         format!("VBMeta size:              {} bytes", info.vbmeta_size),
         format!("Partition Name:           {name}"),
         format!("Hash Algorithm:           {alg}"),
-        "Algorithm:                NONE".to_string(),
+        format!("Algorithm:                {signature_algorithm}"),
         format!("FEC num roots:            {}", info.fec_roots),
     ]
 }
@@ -83,6 +100,9 @@ pub struct Summary<'a> {
     pub out_size: u64,
     pub e2fsck: FsckStatus,
     pub avb_hashtree: &'a str,
+    /// `DROPPED` when a footer was rebuilt (the OEM signature is not
+    /// recreated), `NONE` when the source had no footer at all.
+    pub avb_signature: &'a str,
     pub flags: u8,
     pub apk_sha256: Option<&'a str>,
     pub rc_sha256: Option<&'a str>,
@@ -110,12 +130,20 @@ pub fn summary_lines(s: &Summary) -> Vec<String> {
                 .to_string(),
         );
     } else if s.e2fsck == FsckStatus::Pass {
-        lines.push("[NOTE] STANDARD AVB hashtree PASS + matching size - safe to boot.".to_string());
+        lines.push(
+            "[NOTE] STANDARD AVB hashtree PASS + matching size - bootloader acceptance not tested."
+                .to_string(),
+        );
     } else {
         lines.push("[ERROR] AVB hashtree PASS but e2fsck did not pass - do not flash.".to_string());
     }
     lines.push(format!("{}{}", config::TOKEN_FLAGS, s.flags));
     lines.push(config::TOKEN_AVB_ALGORITHM_NONE.to_string());
+    lines.push(format!(
+        "{}{}",
+        config::TOKEN_AVB_SIGNATURE,
+        s.avb_signature
+    ));
     if let Some(h) = s.apk_sha256 {
         lines.push(format!("{}{}", config::TOKEN_APK_SHA256, h.to_uppercase()));
     }
@@ -134,9 +162,10 @@ pub fn report_body(
     out_size: u64,
     e2fsck: FsckStatus,
     avb_hashtree: &str,
+    avb_signature: &str,
 ) -> String {
     format!(
-        "{}{}\n{}{}\n{}{}\n{}{}\n{}\n{}\n",
+        "{}{}\n{}{}\n{}{}\n{}{}\n{}\n{}{}\n{}\n",
         config::TOKEN_FILE,
         out_path,
         config::TOKEN_SIZE,
@@ -146,6 +175,8 @@ pub fn report_body(
         config::TOKEN_AVB_HASHTREE,
         avb_hashtree,
         config::TOKEN_AVB_ALGORITHM_NONE,
+        config::TOKEN_AVB_SIGNATURE,
+        avb_signature,
         config::TOKEN_FLASH
     )
 }
@@ -161,15 +192,17 @@ mod tests {
         info.vbmeta_offset = 2_000_000;
         info.vbmeta_size = 4096;
         info.fec_roots = 0;
+        info.signature_algorithm = "SHA256_RSA2048".to_string();
         info
     }
 
-    fn summary<'a>(avb: &'a str) -> Summary<'a> {
+    fn summary<'a>(avb: &'a str, signature: &'a str) -> Summary<'a> {
         Summary {
             out_path: "/out/vendor_VolLTE.img",
             out_size: 2 * 1024 * 1024,
             e2fsck: FsckStatus::Pass,
             avb_hashtree: avb,
+            avb_signature: signature,
             flags: 1,
             apk_sha256: Some("abc"),
             rc_sha256: Some("def"),
@@ -210,6 +243,18 @@ mod tests {
     }
 
     #[test]
+    fn input_lines_show_the_parsed_signature_and_output_lines_show_none() {
+        let info = footer_info();
+        let input = avb_lines_input(&info);
+        assert_eq!(input[7], "Algorithm:                SHA256_RSA2048");
+        let output = avb_lines(&info);
+        assert_eq!(
+            output[7], "Algorithm:                NONE",
+            "the rebuild never recreates the OEM signature"
+        );
+    }
+
+    #[test]
     fn flag_note_maps_to_zero_or_one() {
         let (n, hit, tip) = flag_note(0);
         assert_eq!(n, 0);
@@ -224,14 +269,15 @@ mod tests {
     #[test]
     fn summary_lines_match_python_order_and_tokens() {
         assert_eq!(
-            summary_lines(&summary("PASS")),
+            summary_lines(&summary("PASS", "DROPPED")),
             vec![
                 "[OK] EDL size matches - UnlockTool can flash it.",
                 "e2fsck=PASS",
                 "AVB_HASHTREE=PASS",
-                "[NOTE] STANDARD AVB hashtree PASS + matching size - safe to boot.",
+                "[NOTE] STANDARD AVB hashtree PASS + matching size - bootloader acceptance not tested.",
                 "VOLTE_FLAGS=1",
                 "AVB_ALGORITHM=NONE",
+                "AVB_SIGNATURE=DROPPED",
                 "APK_SHA256=ABC",
                 "RC_SHA256=DEF",
                 "FLASH=NO",
@@ -239,11 +285,17 @@ mod tests {
                 "[OUTPUT] /out/vendor_VolLTE.img",
             ]
         );
+        assert!(
+            !summary_lines(&summary("PASS", "DROPPED"))
+                .iter()
+                .any(|l| l.contains("safe to boot")),
+            "the summary must not claim bootloader acceptance"
+        );
     }
 
     #[test]
     fn the_skip_note_replaces_the_pass_note() {
-        let lines = summary_lines(&summary("SKIP"));
+        let lines = summary_lines(&summary("SKIP", "NONE"));
         assert!(lines[2].starts_with("AVB_HASHTREE=SKIP"));
         assert!(lines[3].starts_with("[NOTE] AVB hashtree skipped"));
         assert!(!lines.iter().any(|l| l.contains("STANDARD")));
@@ -251,7 +303,7 @@ mod tests {
 
     #[test]
     fn a_failed_fsck_is_never_rendered_as_flashable() {
-        let mut s = summary("PASS");
+        let mut s = summary("PASS", "DROPPED");
         s.e2fsck = FsckStatus::Fail;
         let lines = summary_lines(&s);
         assert!(!lines.iter().any(|l| l.contains("[OK]")), "{lines:?}");
@@ -265,7 +317,7 @@ mod tests {
 
     #[test]
     fn a_never_run_fsck_is_never_rendered_as_flashable() {
-        let mut s = summary("PASS");
+        let mut s = summary("PASS", "DROPPED");
         s.e2fsck = FsckStatus::NotRun;
         let lines = summary_lines(&s);
         assert_eq!(lines[1], "e2fsck=NOTRUN");
@@ -274,7 +326,7 @@ mod tests {
 
     #[test]
     fn missing_hashes_omit_the_token_like_python_falsy_values() {
-        let mut s = summary("PASS");
+        let mut s = summary("PASS", "DROPPED");
         s.apk_sha256 = None;
         s.rc_sha256 = None;
         let lines = summary_lines(&s);
@@ -289,10 +341,11 @@ mod tests {
                 "/out/vendor_VolLTE.img",
                 2 * 1024 * 1024,
                 FsckStatus::Fail,
-                "SKIP"
+                "SKIP",
+                "NONE",
             ),
             "File=/out/vendor_VolLTE.img\nSize=2097152\ne2fsck=FAIL\n\
-             AVB_HASHTREE=SKIP\nAVB_ALGORITHM=NONE\nFLASH=NO\n"
+             AVB_HASHTREE=SKIP\nAVB_ALGORITHM=NONE\nAVB_SIGNATURE=NONE\nFLASH=NO\n"
         );
     }
 }

@@ -56,8 +56,28 @@ pub struct AvbInfo {
     pub footer_at_exact_tail: bool,
     pub partition_name: String,
     pub hash_algorithm: String,
+    /// Signature algorithm recorded in the vbmeta header (`NONE` when the
+    /// image is unsigned, e.g. everything this pipeline exports).
+    pub signature_algorithm: String,
     pub salt: String,
     pub fec_roots: u32,
+    /// `AvbVBMetaImageHeader.rollback_index` (offset 112).
+    pub rollback_index: u64,
+    /// `AvbVBMetaImageHeader.rollback_index_location` (offset 124).
+    pub rollback_index_location: u32,
+    /// `AvbHashtreeDescriptor.flags` (offset 116).
+    pub hashtree_flags: u32,
+    pub dm_verity_version: u32,
+    pub data_block_size: u32,
+    pub hash_block_size: u32,
+    /// The `image_size` field of the hashtree descriptor (the rounded data
+    /// size covered by the Merkle tree).
+    pub descriptor_image_size: u64,
+    /// Embedded root digest; empty when the source uses a persistent digest.
+    pub root_digest: Vec<u8>,
+    /// `digest_len == 0`: the root digest lives on the device, not in the
+    /// descriptor.
+    pub persistent_digest: bool,
     pub image_size: u64,
     pub partition_size: u64,
     pub original_image_size: u64,
@@ -82,8 +102,18 @@ impl AvbInfo {
             footer_at_exact_tail: false,
             partition_name: "vendor".to_string(),
             hash_algorithm: "sha256".to_string(),
+            signature_algorithm: "NONE".to_string(),
             salt: String::new(),
             fec_roots: 0,
+            rollback_index: 0,
+            rollback_index_location: 0,
+            hashtree_flags: 0,
+            dm_verity_version: 1,
+            data_block_size: BLOCK as u32,
+            hash_block_size: BLOCK as u32,
+            descriptor_image_size: 0,
+            root_digest: Vec::new(),
+            persistent_digest: false,
             image_size,
             partition_size: image_size,
             original_image_size: 0,
@@ -179,12 +209,34 @@ fn fill_from_vbmeta(path: &Path, footer: &AvbFooter) -> Result<AvbInfo> {
     if let Some(alg) = meta.hash_algorithm {
         info.hash_algorithm = alg;
     }
+    info.signature_algorithm = meta.signature_algorithm;
     if let Some(salt) = meta.salt {
         info.salt = salt;
     }
     if let Some(roots) = meta.fec_roots {
         info.fec_roots = roots;
     }
+    info.rollback_index = meta.rollback_index;
+    info.rollback_index_location = meta.rollback_index_location;
+    if let Some(flags) = meta.hashtree_flags {
+        info.hashtree_flags = flags;
+    }
+    if let Some(version) = meta.dm_verity_version {
+        info.dm_verity_version = version;
+    }
+    if let Some(size) = meta.data_block_size {
+        info.data_block_size = size;
+    }
+    if let Some(size) = meta.hash_block_size {
+        info.hash_block_size = size;
+    }
+    if let Some(size) = meta.descriptor_image_size {
+        info.descriptor_image_size = size;
+    }
+    if let Some(root) = meta.root_digest {
+        info.root_digest = root;
+    }
+    info.persistent_digest = meta.persistent_digest;
     info.props = meta.props;
     info.unsupported_descriptor_tags = meta.unsupported_tags;
     info.has_chain_descriptor = meta.has_chain_descriptor;
@@ -215,8 +267,18 @@ const CHAIN_PARTITION_DESCRIPTOR_LEN: usize = 92;
 struct VbmetaMeta {
     partition_name: Option<String>,
     hash_algorithm: Option<String>,
+    signature_algorithm: String,
     salt: Option<String>,
     fec_roots: Option<u32>,
+    rollback_index: u64,
+    rollback_index_location: u32,
+    hashtree_flags: Option<u32>,
+    dm_verity_version: Option<u32>,
+    data_block_size: Option<u32>,
+    hash_block_size: Option<u32>,
+    descriptor_image_size: Option<u64>,
+    root_digest: Option<Vec<u8>>,
+    persistent_digest: bool,
     props: Vec<(String, String)>,
     unsupported_tags: Vec<u64>,
     has_chain_descriptor: bool,
@@ -235,6 +297,21 @@ fn be_u64(bytes: &[u8]) -> u64 {
 
 fn round8(n: usize) -> usize {
     n.div_ceil(8) * 8
+}
+
+/// `AvbVBMetaImageHeader.algorithm_type` names from `avbtool.py:117-197`.
+fn signature_algorithm_name(kind: u32) -> String {
+    match kind {
+        0 => "NONE",
+        1 => "SHA256_RSA2048",
+        2 => "SHA256_RSA4096",
+        3 => "SHA256_RSA8192",
+        4 => "SHA512_RSA2048",
+        5 => "SHA512_RSA4096",
+        6 => "SHA512_RSA8192",
+        _ => return format!("UNKNOWN({kind})"),
+    }
+    .to_string()
 }
 
 fn fixed_string(field: &[u8], what: &str) -> std::result::Result<String, String> {
@@ -290,10 +367,23 @@ fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
     if &vb[..4] != b"AVB0" {
         return Err("bad vbmeta magic (expected AVB0)".to_owned());
     }
+    let signature_algorithm = signature_algorithm_name(be_u32(&vb[28..32]));
     let auth = be_u64(&vb[12..20]);
     let aux = be_u64(&vb[20..28]);
     let desc_offset = be_u64(&vb[96..104]);
     let desc_size = be_u64(&vb[104..112]);
+    // libavb requires the authentication and auxiliary blocks to be 64-byte
+    // aligned; avbtool pads them the same way.
+    if !auth.is_multiple_of(64) {
+        return Err(format!(
+            "authentication block size {auth} is not 64-byte aligned"
+        ));
+    }
+    if !aux.is_multiple_of(64) {
+        return Err(format!(
+            "auxiliary block size {aux} is not 64-byte aligned"
+        ));
+    }
     let aux_end = (VBMETA_HEADER_LEN as u64)
         .checked_add(auth)
         .and_then(|n| n.checked_add(aux))
@@ -1905,6 +1995,39 @@ mod tests {
         assert_eq!(info.hash_algorithm, "sha256");
         assert_eq!(info.salt, "");
         assert_eq!(info.fec_roots, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_the_vbmeta_signature_algorithm_is_parsed() {
+        let dir = tmp("volte_avb_a2_signature");
+        let mut vb = a2_vbmeta_with(&[a2_hashtree_descriptor(
+            4096,
+            "sha256",
+            "vendor",
+            &[0x11, 0x22],
+            &[0x55; 32],
+            0,
+        )]);
+        vb[28..32].copy_from_slice(&1u32.to_be_bytes()); // SHA256_RSA2048
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        assert_eq!(
+            avb_info_fast(&p).unwrap().signature_algorithm,
+            "SHA256_RSA2048"
+        );
+
+        let unsigned = a2_image_with_vbmeta(
+            &dir,
+            &a2_vbmeta_with(&[a2_hashtree_descriptor(
+                4096,
+                "sha256",
+                "vendor",
+                &[0x11, 0x22],
+                &[0x55; 32],
+                0,
+            )]),
+        );
+        assert_eq!(avb_info_fast(&unsigned).unwrap().signature_algorithm, "NONE");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -398,10 +398,22 @@ pub fn run(
              suspect source image - re-dump the original vendor.img and retry.",
         ));
     }
-    for tag in &avb_info.unsupported_descriptor_tags {
-        log.log(format!(
-            "[WARN] AVB vbmeta: unsupported descriptor tag {tag}"
-        ));
+    if !avb_info.unsupported_descriptor_tags.is_empty() {
+        for tag in &avb_info.unsupported_descriptor_tags {
+            log.log(format!(
+                "[WARN] AVB vbmeta: unsupported descriptor tag {tag}"
+            ));
+        }
+        let tags = avb_info
+            .unsupported_descriptor_tags
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(Error::build(format!(
+            "input image has unsupported AVB descriptor tag(s) {tags}; the rebuild cannot \
+             preserve them (Tag 3 is the kernel command line descriptor) - refusing to rebuild"
+        )));
     }
     if avb_info.has_chain_descriptor {
         return Err(Error::build(
@@ -657,6 +669,7 @@ pub fn run(
         out_size: out_sz,
         e2fsck: fsck_status,
         avb_hashtree: avb_token,
+        avb_signature: if avb_token == "PASS" { "DROPPED" } else { "NONE" },
         flags: on,
         apk_sha256: Some(&apk_sha),
         rc_sha256: Some(&rc_sha),
@@ -667,7 +680,13 @@ pub fn run(
     }
 
     let final_size = std::fs::metadata(&work).map(|m| m.len()).unwrap_or(0);
-    let body = report::report_body(&out_display, final_size, fsck_status, avb_token);
+    let body = report::report_body(
+        &out_display,
+        final_size,
+        fsck_status,
+        avb_token,
+        summary.avb_signature,
+    );
     let _ = std::fs::write(opts.logs_dir.join("vendor_VolLTE_report.txt"), body);
 
     Ok(work)
@@ -820,15 +839,30 @@ mod tests {
         d
     }
 
+    /// Tag 3 (`AvbKernelCmdlineDescriptor`) is not reproduced by the rebuild.
+    fn kernel_cmdline_descriptor(cmdline: &str) -> Vec<u8> {
+        let mut d = vec![0u8; 24];
+        d[0..8].copy_from_slice(&3u64.to_be_bytes());
+        d[16..20].copy_from_slice(&1u32.to_be_bytes());
+        d[20..24].copy_from_slice(&(cmdline.len() as u32).to_be_bytes());
+        d.extend_from_slice(cmdline.as_bytes());
+        let nbf = pad8(d.len() - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.resize(16 + nbf, 0);
+        d
+    }
+
     fn vbmeta_with(descriptors: &[Vec<u8>]) -> Vec<u8> {
         let mut vb = vec![0u8; 256];
         vb[..4].copy_from_slice(b"AVB0");
         let desc_size: usize = descriptors.iter().map(Vec::len).sum();
-        vb[20..28].copy_from_slice(&(desc_size as u64).to_be_bytes());
+        let aux = desc_size.div_ceil(64) * 64;
+        vb[20..28].copy_from_slice(&(aux as u64).to_be_bytes());
         vb[104..112].copy_from_slice(&(desc_size as u64).to_be_bytes());
         for d in descriptors {
             vb.extend_from_slice(d);
         }
+        vb.resize(256 + aux, 0);
         vb
     }
 
@@ -1343,6 +1377,7 @@ mod tests {
             "AVB_HASHTREE=PASS",
             "VOLTE_FLAGS=0",
             "AVB_ALGORITHM=NONE",
+            "AVB_SIGNATURE=DROPPED",
             "FLASH=NO",
             "[OUTPUT] ",
         ] {
@@ -1369,9 +1404,10 @@ mod tests {
         assert!(commands.starts_with("rm /overlay/OPPO_VoLTE_Overlay.apk\n"));
         assert!(commands.contains("\ncd /overlay\n"));
         let report = std::fs::read_to_string(logs.join("vendor_VolLTE_report.txt")).unwrap();
-        assert_eq!(report.lines().count(), 6, "{report}");
+        assert_eq!(report.lines().count(), 7, "{report}");
         assert!(report.starts_with("File="));
         assert!(report.contains("\ne2fsck=PASS\n"));
+        assert!(report.contains("\nAVB_SIGNATURE=DROPPED\n"));
         assert!(report.ends_with("FLASH=NO\n"));
         let log_files: Vec<_> = std::fs::read_dir(&logs)
             .unwrap()
@@ -2028,7 +2064,57 @@ mod tests {
     }
 
     #[test]
-    fn a_hash_only_input_warns_but_still_builds() {
+    fn an_image_with_an_unsupported_descriptor_tag_is_refused_before_avb() {
+        let dir = tmp("volte_pipeline_unknown_tag");
+        let src = make_ext4(&dir, "vendor.img");
+        attach_avb_footer(
+            &src,
+            &[
+                hashtree_descriptor("vendor", 0),
+                kernel_cmdline_descriptor("androidboot.selinux=permissive"),
+            ],
+        );
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = NoFooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert!(
+            err.message().contains("unsupported AVB descriptor tag(s) 3"),
+            "{err}"
+        );
+        assert!(err.message().contains("kernel command line"), "{err}");
+        assert_eq!(avb.calls, 0, "the AVB backend must not be reached");
+        assert_eq!(fsck.calls, 0, "the build must stop before e2fsck");
+        let text = lines.borrow().join("\n");
+        assert!(
+            text.contains("[WARN] AVB vbmeta: unsupported descriptor tag 3"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hash_only_input_is_refused() {
         let dir = tmp("volte_pipeline_tag2");
         let src = make_ext4_with_slack(&dir, "vendor.img");
         attach_avb_footer(&src, &[hash_descriptor("vendor")]);
