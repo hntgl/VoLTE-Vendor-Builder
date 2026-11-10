@@ -151,7 +151,7 @@ pub(crate) fn parse_footer(blob: &[u8], footer_end: u64) -> Option<AvbFooter> {
         q.copy_from_slice(&blob[28..36]);
         u64::from_be_bytes(q)
     };
-    if orig < 1024 * 1024 || orig >= footer_end {
+    if orig >= footer_end {
         return None;
     }
     if voff == 0 || voff >= footer_end {
@@ -403,8 +403,17 @@ fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
             "descriptors end at {end}, past the auxiliary block end {aux_end}"
         ));
     }
+    let padding = aux_end - end;
+    if padding >= 64 {
+        return Err(format!(
+            "descriptor block leaves {padding} bytes of auxiliary padding (expected less than 64)"
+        ));
+    }
 
     let mut meta = VbmetaMeta::default();
+    meta.signature_algorithm = signature_algorithm;
+    meta.rollback_index = be_u64(&vb[112..120]);
+    meta.rollback_index_location = be_u32(&vb[124..128]);
     let mut pos = start as usize;
     let end = end as usize;
     while pos < end {
@@ -453,11 +462,49 @@ fn parse_hashtree(
         ));
     }
     let nbf = be_u64(&body[8..16]) as usize;
+    let dm_verity_version = be_u32(&body[16..20]);
+    let image_size = be_u64(&body[20..28]);
+    let tree_offset = be_u64(&body[28..36]);
+    let tree_size = be_u64(&body[36..44]);
+    let data_block_size = be_u32(&body[44..48]);
+    let hash_block_size = be_u32(&body[48..52]);
     let fec_roots = be_u32(&body[52..56]);
     let algorithm = fixed_string(&body[72..104], "hash algorithm")?;
     let name_len = be_u32(&body[104..108]) as usize;
     let salt_len = be_u32(&body[108..112]) as usize;
     let digest_len = be_u32(&body[112..116]) as usize;
+    let flags = be_u32(&body[116..120]);
+    // The same geometry checks libavb applies before trusting a descriptor.
+    if dm_verity_version != 1 {
+        return Err(format!(
+            "hashtree descriptor at {pos} uses dm-verity version {dm_verity_version} (supported: 1)"
+        ));
+    }
+    if data_block_size == 0 || !data_block_size.is_multiple_of(8) {
+        return Err(format!(
+            "hashtree descriptor at {pos} has an invalid data block size {data_block_size}"
+        ));
+    }
+    if hash_block_size == 0 || !hash_block_size.is_multiple_of(8) {
+        return Err(format!(
+            "hashtree descriptor at {pos} has an invalid hash block size {hash_block_size}"
+        ));
+    }
+    if image_size % data_block_size as u64 != 0 {
+        return Err(format!(
+            "hashtree descriptor at {pos} image size {image_size} is not a multiple of the {data_block_size}-byte data block"
+        ));
+    }
+    if tree_offset % hash_block_size as u64 != 0 || tree_size % hash_block_size as u64 != 0 {
+        return Err(format!(
+            "hashtree descriptor at {pos} tree offset/size is not aligned to the {hash_block_size}-byte hash block"
+        ));
+    }
+    if digest_len != 0 && digest_len != HashKind::digest_len_for(&algorithm).unwrap_or(digest_len) {
+        return Err(format!(
+            "hashtree descriptor at {pos} declares a {digest_len}-byte root digest for {algorithm}"
+        ));
+    }
     let dynamic = HASHTREE_DESCRIPTOR_LEN
         .checked_add(name_len)
         .and_then(|n| n.checked_add(salt_len))
@@ -478,6 +525,8 @@ fn parse_hashtree(
     let name_at = HASHTREE_DESCRIPTOR_LEN;
     let salt_at = name_at + name_len;
     let salt = &body[salt_at..salt_at + salt_len];
+    let root_at = salt_at + salt_len;
+    let root = &body[root_at..root_at + digest_len];
     let name = std::str::from_utf8(&body[name_at..name_at + name_len])
         .map_err(|_| format!("partition name at {pos} is not UTF-8"))?;
 
@@ -485,6 +534,25 @@ fn parse_hashtree(
         merge_hash_fields(meta, algorithm, hex_lower(salt));
         if meta.fec_roots.is_none() {
             meta.fec_roots = Some(fec_roots);
+        }
+        if meta.hashtree_flags.is_none() {
+            meta.hashtree_flags = Some(flags);
+        }
+        if meta.dm_verity_version.is_none() {
+            meta.dm_verity_version = Some(dm_verity_version);
+        }
+        if meta.data_block_size.is_none() {
+            meta.data_block_size = Some(data_block_size);
+        }
+        if meta.hash_block_size.is_none() {
+            meta.hash_block_size = Some(hash_block_size);
+        }
+        if meta.descriptor_image_size.is_none() {
+            meta.descriptor_image_size = Some(image_size);
+        }
+        if meta.root_digest.is_none() {
+            meta.root_digest = Some(root.to_vec());
+            meta.persistent_digest = digest_len == 0;
         }
         meta.descriptor_kind = DescriptorKind::Hashtree;
     }
@@ -533,6 +601,9 @@ fn parse_hash_descriptor(
 
     if select_image_partition(meta, name) {
         merge_hash_fields(meta, algorithm, hex_lower(salt));
+        if meta.root_digest.is_none() {
+            meta.persistent_digest = digest_len == 0;
+        }
         if meta.descriptor_kind == DescriptorKind::None {
             meta.descriptor_kind = DescriptorKind::HashOnly;
         }
@@ -705,6 +776,11 @@ pub struct HashtreeRequest {
     pub hash_algorithm: String,
     pub salt: String,
     pub props: Vec<(String, String)>,
+    pub rollback_index: u64,
+    pub rollback_index_location: u32,
+    pub hashtree_flags: u32,
+    /// Write `digest_len = 0` instead of embedding the freshly computed root.
+    pub persistent_digest: bool,
 }
 
 #[cfg(test)]
@@ -729,11 +805,11 @@ impl HashtreeRequest {
             "--algorithm".to_string(),
             "NONE".to_string(),
             "--rollback_index".to_string(),
-            "0".to_string(),
+            self.rollback_index.to_string(),
             "--rollback_index_location".to_string(),
-            "0".to_string(),
+            self.rollback_index_location.to_string(),
             "--flags".to_string(),
-            "0".to_string(),
+            self.hashtree_flags.to_string(),
             "--do_not_generate_fec".to_string(),
             "--fec_num_roots".to_string(),
             "2".to_string(),
@@ -788,6 +864,18 @@ impl HashKind {
         match self {
             HashKind::Sha1 => 20,
             HashKind::Sha256 => 32,
+        }
+    }
+
+    /// Digest size for a descriptor whose algorithm this build may not support
+    /// (the parser still has to validate the declared length).
+    fn digest_len_for(name: &str) -> Option<usize> {
+        if name.eq_ignore_ascii_case("sha1") {
+            Some(20)
+        } else if name.eq_ignore_ascii_case("sha256") {
+            Some(32)
+        } else {
+            None
         }
     }
 }
@@ -955,6 +1043,7 @@ fn encode_hashtree_descriptor(
     salt: &[u8],
     algorithm: &str,
     root: &[u8],
+    flags: u32,
 ) -> Vec<u8> {
     let name = partition_name.as_bytes();
     let total = round8(HASHTREE_DESCRIPTOR_LEN + name.len() + salt.len() + root.len());
@@ -976,7 +1065,7 @@ fn encode_hashtree_descriptor(
     out.extend_from_slice(&(name.len() as u32).to_be_bytes());
     out.extend_from_slice(&(salt.len() as u32).to_be_bytes());
     out.extend_from_slice(&(root.len() as u32).to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes()); // flags
+    out.extend_from_slice(&flags.to_be_bytes());
     out.extend_from_slice(&[0u8; 60]); // reserved
     out.extend_from_slice(name);
     out.extend_from_slice(salt);
@@ -1011,7 +1100,7 @@ fn round_block(n: u64) -> u64 {
     n.div_ceil(BLOCK) * BLOCK
 }
 
-fn encode_vbmeta(descriptors: &[u8]) -> Vec<u8> {
+fn encode_vbmeta(descriptors: &[u8], rollback_index: u64, rollback_index_location: u32) -> Vec<u8> {
     let aux = round64(descriptors.len());
     let mut out = vec![0u8; VBMETA_HEADER_LEN];
     out[..4].copy_from_slice(b"AVB0");
@@ -1021,6 +1110,10 @@ fn encode_vbmeta(descriptors: &[u8]) -> Vec<u8> {
     out[64..72].copy_from_slice(&(descriptors.len() as u64).to_be_bytes());
     out[80..88].copy_from_slice(&(descriptors.len() as u64).to_be_bytes());
     out[104..112].copy_from_slice(&(descriptors.len() as u64).to_be_bytes());
+    out[112..120].copy_from_slice(&rollback_index.to_be_bytes());
+    // Header flags (offset 120) stay 0: a chained vbmeta image must have zero
+    // flags per libavb.
+    out[124..128].copy_from_slice(&rollback_index_location.to_be_bytes());
     let release = AVBTOOL_RELEASE.as_bytes();
     out[128..128 + release.len()].copy_from_slice(release);
     out.extend_from_slice(descriptors);
@@ -1099,18 +1192,24 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
     let (root, tree) = build_merkle(&mut f, original, rounded, &salt, kind)?;
     let tree_len = tree.len() as u64;
 
+    let encoded_root: &[u8] = if req.persistent_digest { &[] } else { &root };
     let mut descriptors = encode_hashtree_descriptor(
         rounded,
         tree_len,
         &req.partition_name,
         &salt,
         kind.name(),
-        &root,
+        encoded_root,
+        req.hashtree_flags,
     );
     for (key, value) in &req.props {
         descriptors.extend_from_slice(&encode_property(key, value));
     }
-    let vbmeta = encode_vbmeta(&descriptors);
+    let vbmeta = encode_vbmeta(
+        &descriptors,
+        req.rollback_index,
+        req.rollback_index_location,
+    );
     if vbmeta.len() as u64 > MAX_VBMETA {
         return Err(Error::build(format!(
             "AVB vbmeta is {} bytes, above the {MAX_VBMETA}-byte limit",
@@ -1209,6 +1308,10 @@ pub fn rebuild_hashtree(
         },
         salt,
         props: info.props.clone(),
+        rollback_index: info.rollback_index,
+        rollback_index_location: info.rollback_index_location,
+        hashtree_flags: info.hashtree_flags,
+        persistent_digest: info.persistent_digest,
     };
 
     log.log("[STATUS] Rebuilding AVB hashtree...");
@@ -1378,7 +1481,8 @@ mod tests {
         assert!(parse_footer(&b, 4 * 1024 * 1024).is_none());
 
         let b = footer_bytes(1, 0, 512 * 1024, 1024 * 1024, 4096);
-        assert!(parse_footer(&b, 4 * 1024 * 1024).is_none(), "orig < 1 MiB");
+        let small = parse_footer(&b, 4 * 1024 * 1024).expect("a sub-1 MiB image is valid");
+        assert_eq!(small.original_image_size, 512 * 1024);
 
         let b = footer_bytes(1, 0, 5 * 1024 * 1024, 1024 * 1024, 4096);
         assert!(
@@ -1550,6 +1654,10 @@ mod tests {
             hash_algorithm: "sha256".to_string(),
             salt: "aabb".to_string(),
             props: vec![("k".to_string(), "v".to_string())],
+            rollback_index: 7,
+            rollback_index_location: 3,
+            hashtree_flags: 1,
+            persistent_digest: false,
         };
         let args = req.cli_args();
         let joined = args.join(" ");
@@ -1560,8 +1668,9 @@ mod tests {
         assert!(joined.contains("--block_size 4096"));
         assert!(joined.contains("--hash_algorithm sha256"));
         assert!(joined.contains("--salt aabb"));
-        assert!(joined.contains("--rollback_index 0"));
-        assert!(joined.contains("--flags 0"));
+        assert!(joined.contains("--rollback_index 7"));
+        assert!(joined.contains("--rollback_index_location 3"));
+        assert!(joined.contains("--flags 1"));
         assert!(joined.contains("--prop k:v"));
         assert!(!joined.contains("--key"));
         assert!(!joined.contains("--generate_fec "));
@@ -1936,13 +2045,15 @@ mod tests {
         let mut vb = vec![0u8; 256];
         vb[..4].copy_from_slice(b"AVB0");
         let desc_size: usize = descriptors.iter().map(Vec::len).sum();
-        // The descriptor block lives inside the auxiliary data block, so the
-        // header's aux size must cover it (`parse_vbmeta` checks this bound).
-        vb[20..28].copy_from_slice(&(desc_size as u64).to_be_bytes());
+        // The descriptor block lives inside the auxiliary data block, which
+        // libavb requires to be 64-byte aligned (`parse_vbmeta` checks this).
+        let aux = desc_size.div_ceil(64) * 64;
+        vb[20..28].copy_from_slice(&(aux as u64).to_be_bytes());
         vb[104..112].copy_from_slice(&(desc_size as u64).to_be_bytes());
         for d in descriptors {
             vb.extend_from_slice(d);
         }
+        vb.resize(256 + aux, 0);
         vb
     }
 
@@ -2257,6 +2368,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn a2_hashtree_descriptor_with_flags(
+        image_size: u64,
+        algorithm: &str,
+        name: &str,
+        salt: &[u8],
+        digest: &[u8],
+        fec_roots: u32,
+        flags: u32,
+    ) -> Vec<u8> {
+        let mut d = a2_hashtree_descriptor(image_size, algorithm, name, salt, digest, fec_roots);
+        d[116..120].copy_from_slice(&flags.to_be_bytes());
+        d
+    }
+
+    #[test]
+    fn encode_vbmeta_round_trips_the_rollback_fields() {
+        let d = encode_hashtree_descriptor(4096, 0, "vendor", &[0x11], "sha256", &[0x22; 32], 0);
+        let vb = encode_vbmeta(&d, 42, 7);
+        let meta = parse_vbmeta(&vb).unwrap();
+        assert_eq!(meta.rollback_index, 42);
+        assert_eq!(meta.rollback_index_location, 7);
+    }
+
+    #[test]
+    fn a_rebuild_preserves_rollback_index_location_and_hashtree_flags() {
+        let dir = tmp("volte_avb_preserve_header");
+        let d = a2_hashtree_descriptor_with_flags(
+            4096,
+            "sha256",
+            "vendor",
+            &[0x11, 0x22],
+            &[0x33; 32],
+            0,
+            2,
+        );
+        let mut vb = a2_vbmeta_with(&[d]);
+        vb[112..120].copy_from_slice(&42u64.to_be_bytes());
+        vb[124..128].copy_from_slice(&7u32.to_be_bytes());
+        let p = a2_image_with_vbmeta(&dir, &vb);
+
+        let before = avb_info_fast(&p).unwrap();
+        assert_eq!(before.rollback_index, 42);
+        assert_eq!(before.rollback_index_location, 7);
+        assert_eq!(before.hashtree_flags, 2);
+
+        let mut backend = NativeAvb;
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let after = rebuild_hashtree(&p, &before, 0, &mut backend, &mut log)
+            .unwrap()
+            .expect("the rebuild fits the locked slot");
+
+        assert_eq!(after.rollback_index, 42);
+        assert_eq!(after.rollback_index_location, 7);
+        assert_eq!(after.hashtree_flags, 2);
+        let reread = avb_info_fast(&p).unwrap();
+        assert_eq!(reread.rollback_index, 42);
+        assert_eq!(reread.rollback_index_location, 7);
+        assert_eq!(reread.hashtree_flags, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_persistent_digest_survives_encode_and_parse() {
+        let dir = tmp("volte_avb_persistent_digest");
+        let p = pattern_image(&dir, "vendor.img", 1024 * 1024);
+        let mut req = native_request(&p, 2 * 1024 * 1024);
+        req.persistent_digest = true;
+        NativeAvb.add_hashtree_footer(&req).unwrap();
+
+        let info = native_footer(&p);
+        assert!(info.persistent_digest);
+        assert!(info.root_digest.is_empty());
+
+        let reread = avb_info_fast(&p).unwrap();
+        assert!(reread.persistent_digest);
+        assert!(reread.root_digest.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_vbmeta_rejects_unaligned_blocks_and_extra_padding() {
+        let d = a2_hashtree_descriptor(4096, "sha256", "vendor", &[0x11], &[0x22; 32], 0);
+
+        let mut vb = a2_vbmeta_with(&[d.clone()]);
+        let aux = be_u64(&vb[20..28]);
+        vb[20..28].copy_from_slice(&(aux - 8).to_be_bytes());
+        let err = parse_vbmeta(&vb).unwrap_err();
+        assert!(err.contains("auxiliary block size"), "{err}");
+
+        let mut vb = a2_vbmeta_with(&[d.clone()]);
+        vb[12..20].copy_from_slice(&8u64.to_be_bytes());
+        let err = parse_vbmeta(&vb).unwrap_err();
+        assert!(err.contains("authentication block size"), "{err}");
+
+        let mut vb = a2_vbmeta_with(&[d]);
+        let desc = be_u64(&vb[104..112]);
+        vb[104..112].copy_from_slice(&(desc - 72).to_be_bytes());
+        let err = parse_vbmeta(&vb).unwrap_err();
+        assert!(err.contains("auxiliary padding"), "{err}");
+    }
+
+    #[test]
+    fn parse_hashtree_rejects_invalid_geometry() {
+        let mut d = a2_hashtree_descriptor(4096, "sha256", "vendor", &[0x11], &[0x22; 32], 0);
+        d[16..20].copy_from_slice(&2u32.to_be_bytes());
+        let err = parse_vbmeta(&a2_vbmeta_with(&[d])).unwrap_err();
+        assert!(err.contains("dm-verity version"), "{err}");
+
+        let d = a2_hashtree_descriptor(1000, "sha256", "vendor", &[0x11], &[0x22; 32], 0);
+        let err = parse_vbmeta(&a2_vbmeta_with(&[d])).unwrap_err();
+        assert!(err.contains("not a multiple"), "{err}");
+
+        let d = a2_hashtree_descriptor(4096, "sha256", "vendor", &[0x11], &[0x22; 16], 0);
+        let err = parse_vbmeta(&a2_vbmeta_with(&[d])).unwrap_err();
+        assert!(err.contains("root digest"), "{err}");
+    }
+
     struct CountingBackend {
         calls: usize,
     }
@@ -2298,6 +2526,10 @@ mod tests {
             hash_algorithm: "sha256".to_string(),
             salt: NATIVE_SALT.to_string(),
             props: Vec::new(),
+            rollback_index: 0,
+            rollback_index_location: 0,
+            hashtree_flags: 0,
+            persistent_digest: false,
         }
     }
 
@@ -2332,10 +2564,10 @@ mod tests {
         let root = decode_salt("ed31474c9a630faa3981531d8b443d325734e82b7e4a360ac60d1b4b416ad0ca")
             .unwrap();
         let mut descriptors =
-            encode_hashtree_descriptor(1024 * 1024, 12288, "vendor", &salt, "sha256", &root);
+            encode_hashtree_descriptor(1024 * 1024, 12288, "vendor", &salt, "sha256", &root, 0);
         descriptors.extend_from_slice(&encode_property("com.android.build.vendor", "v2"));
         descriptors.extend_from_slice(&encode_property("com.android.build.vendor.extra", "hello"));
-        let vbmeta = encode_vbmeta(&descriptors);
+        let vbmeta = encode_vbmeta(&descriptors, 0, 0);
         assert_eq!(vbmeta.as_slice(), GOLDEN_VBMETA);
     }
 
@@ -2789,6 +3021,10 @@ mod tests {
             hash_algorithm: info.hash_algorithm.clone(),
             salt: info.salt.clone(),
             props: info.props.clone(),
+            rollback_index: info.rollback_index,
+            rollback_index_location: info.rollback_index_location,
+            hashtree_flags: info.hashtree_flags,
+            persistent_digest: false,
         };
         run_avbtool(Path::new(&python), &avbtool, &req.cli_args());
         let mut native_req = req.clone();

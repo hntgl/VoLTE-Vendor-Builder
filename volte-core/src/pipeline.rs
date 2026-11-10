@@ -421,19 +421,40 @@ pub fn run(
         ));
     }
     if avb_info.descriptor_kind == avb::DescriptorKind::HashOnly {
-        log.log(
-            "[WARN] input is Tag 2 (whole-partition hash), rebuild converts it to a hashtree (Tag 1) descriptor — this is a format change, not a like-for-like rebuild.",
-        );
+        return Err(Error::build(
+            "input image uses a whole-partition hash descriptor (Tag 2); the rebuild can only \
+             produce a hashtree descriptor (Tag 1), so the format would change - refusing to rebuild",
+        ));
     }
     if avb_info.fec_roots > 0 {
-        log.log(format!(
-            "[WARN] original image has FEC (fec_roots={}) but rebuild always runs with --do_not_generate_fec — FEC will be dropped.",
+        return Err(Error::build(format!(
+            "input image has FEC (fec_roots={}) but the rebuild always runs with \
+             --do_not_generate_fec; dropping FEC would change the verified-boot metadata - \
+             refusing to rebuild",
             avb_info.fec_roots
+        )));
+    }
+    if avb_info.has_footer
+        && (avb_info.data_block_size != config::BLOCK as u32
+            || avb_info.hash_block_size != config::BLOCK as u32)
+    {
+        return Err(Error::build(format!(
+            "input image uses {} / {} byte hashtree blocks, but the rebuild only supports \
+             {block}-byte blocks - refusing to write different geometry",
+            avb_info.data_block_size,
+            avb_info.hash_block_size,
+            block = config::BLOCK
+        )));
+    }
+    if avb_info.persistent_digest {
+        return Err(Error::build(
+            "input image uses a persistent on-device root digest (digest_len = 0); the rebuild \
+             cannot refresh a digest that is not stored in the descriptor - refusing to rebuild",
         ));
     }
     if avb_info.has_footer {
         log.log("[AVB] Existing AVB footer detected; original AVB parameters will be preserved.");
-        for line in report::avb_lines(&avb_info) {
+        for line in report::avb_lines_input(&avb_info) {
             log.log(line);
         }
     } else {
@@ -805,6 +826,24 @@ mod tests {
         let nbf = pad8(d.len() - 16);
         d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
         d.resize(16 + nbf, 0);
+        d
+    }
+
+    fn hashtree_descriptor_with_blocks(name: &str, data: u32, hash: u32) -> Vec<u8> {
+        let mut d = hashtree_descriptor(name, 0);
+        // The parser checks image_size against the declared data block size.
+        d[20..28].copy_from_slice(&(u64::from(data) * 4).to_be_bytes());
+        d[44..48].copy_from_slice(&data.to_be_bytes());
+        d[48..52].copy_from_slice(&hash.to_be_bytes());
+        d
+    }
+
+    fn persistent_hashtree_descriptor(name: &str) -> Vec<u8> {
+        let mut d = hashtree_descriptor(name, 0);
+        d[112..116].copy_from_slice(&0u32.to_be_bytes());
+        let nbf = pad8(180 + name.len() + 4 - 16);
+        d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
+        d.truncate(16 + nbf);
         d
     }
 
@@ -2145,22 +2184,18 @@ mod tests {
             avb::avb_info_fast(&src).unwrap().descriptor_kind,
             avb::DescriptorKind::HashOnly
         );
-        let out = run(&opts, &mut deps, &mut log, &mut progress).unwrap();
-        assert!(out.is_file());
-        assert_eq!(avb.calls, 1);
-        let text = lines.borrow().join("\n");
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
         assert!(
-            text.contains(
-                "[WARN] input is Tag 2 (whole-partition hash), rebuild converts it to a hashtree (Tag 1) descriptor — this is a format change, not a like-for-like rebuild."
-            ),
-            "{text}"
+            err.message().contains("whole-partition hash descriptor (Tag 2)"),
+            "{err}"
         );
-        assert!(text.contains("AVB_HASHTREE=PASS"), "{text}");
+        assert_eq!(avb.calls, 0, "the AVB backend must not be reached");
+        assert_eq!(fsck.calls, 0, "the build must stop before e2fsck");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn an_image_with_fec_warns_that_fec_is_dropped() {
+    fn an_image_with_fec_is_refused() {
         let dir = tmp("volte_pipeline_fec");
         let src = make_ext4_with_slack(&dir, "vendor.img");
         attach_avb_footer(&src, &[hashtree_descriptor("vendor", 2)]);
@@ -2188,14 +2223,82 @@ mod tests {
         };
 
         assert_eq!(avb::avb_info_fast(&src).unwrap().fec_roots, 2);
-        run(&opts, &mut deps, &mut log, &mut progress).unwrap();
-        let text = lines.borrow().join("\n");
-        assert!(
-            text.contains(
-                "[WARN] original image has FEC (fec_roots=2) but rebuild always runs with --do_not_generate_fec — FEC will be dropped."
-            ),
-            "{text}"
-        );
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert!(err.message().contains("fec_roots=2"), "{err}");
+        assert_eq!(avb.calls, 0, "the AVB backend must not be reached");
+        assert_eq!(fsck.calls, 0, "the build must stop before e2fsck");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_default_hashtree_block_size_is_refused() {
+        let dir = tmp("volte_pipeline_block_size");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[hashtree_descriptor_with_blocks("vendor", 16384, 4096)]);
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert!(err.message().contains("16384"), "{err}");
+        assert!(err.message().contains("4096-byte blocks"), "{err}");
+        assert_eq!(avb.calls, 0, "the AVB backend must not be reached");
+        assert_eq!(fsck.calls, 0, "the build must stop before e2fsck");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_persistent_root_digest_is_refused() {
+        let dir = tmp("volte_pipeline_persistent_digest");
+        let src = make_ext4_with_slack(&dir, "vendor.img");
+        attach_avb_footer(&src, &[persistent_hashtree_descriptor("vendor")]);
+        seed_payloads(&dir);
+        let logs = dir.join("Logs");
+
+        let mut ops = RustFsExt4Backend::new();
+        let mut fsck = PassingFsck { calls: 0 };
+        let mut avb = FooterAvb { calls: 0 };
+        let mut deps = Deps {
+            ops: &mut ops,
+            fsck: &mut fsck,
+            avb: &mut avb,
+        };
+        let lines = Rc::new(RefCell::new(Vec::new()));
+        let mut log = Logger::new().with_sink(SharedSink(lines.clone()));
+        let mut progress = |_n: u8, _l: &str| {};
+        let opts = Options {
+            src: &src,
+            out_path: "",
+            chip: "mtk",
+            keep_out: false,
+            root: &dir,
+            logs_dir: &logs,
+        };
+
+        assert!(avb::avb_info_fast(&src).unwrap().persistent_digest);
+        let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
+        assert!(err.message().contains("persistent on-device root digest"), "{err}");
+        assert_eq!(avb.calls, 0, "the AVB backend must not be reached");
+        assert_eq!(fsck.calls, 0, "the build must stop before e2fsck");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
