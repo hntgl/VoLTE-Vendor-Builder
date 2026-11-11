@@ -7,10 +7,10 @@
 use std::path::{Path, PathBuf};
 
 /// Candidate order of `tool_dir`: `tool\` → `tools\` → the root itself, chosen
-/// by the presence of `debugfs.exe` or `avbtool.py`. Falls back to the root.
+/// by the presence of `e2fsck.exe`. Falls back to the root.
 pub fn tool_dir(root: &Path) -> PathBuf {
     for cand in [root.join("tool"), root.join("tools"), root.to_path_buf()] {
-        if cand.join("debugfs.exe").is_file() || cand.join("avbtool.py").is_file() {
+        if cand.join("e2fsck.exe").is_file() {
             return cand;
         }
     }
@@ -26,8 +26,9 @@ pub fn exe_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Python passes paths to `debugfs` with `"\\"` replaced by `"/"`; the Cygwin
-/// tools do not understand backslashes.
+/// The pipeline keeps Python's `"\\"` → `"/"` conversion so the command lists
+/// stay byte-identical; host paths never reach the in-process engine with a
+/// Windows separator.
 pub fn forward_slashes(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -48,9 +49,9 @@ mod tests {
         let root = tmp("volte_env_tool_priority");
         std::fs::create_dir_all(root.join("tool")).unwrap();
         std::fs::create_dir_all(root.join("tools")).unwrap();
-        std::fs::write(root.join("tool").join("avbtool.py"), b"#").unwrap();
-        std::fs::write(root.join("tools").join("debugfs.exe"), b"MZ").unwrap();
-        std::fs::write(root.join("debugfs.exe"), b"MZ").unwrap();
+        std::fs::write(root.join("tool").join("e2fsck.exe"), b"MZ").unwrap();
+        std::fs::write(root.join("tools").join("e2fsck.exe"), b"MZ").unwrap();
+        std::fs::write(root.join("e2fsck.exe"), b"MZ").unwrap();
         assert_eq!(tool_dir(&root), root.join("tool"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -59,21 +60,24 @@ mod tests {
     fn tool_dir_falls_back_to_tools_then_root() {
         let root = tmp("volte_env_tool_fallback");
         std::fs::create_dir_all(root.join("tools")).unwrap();
-        std::fs::write(root.join("tools").join("debugfs.exe"), b"MZ").unwrap();
+        std::fs::write(root.join("tools").join("e2fsck.exe"), b"MZ").unwrap();
         assert_eq!(tool_dir(&root), root.join("tools"));
 
-        std::fs::remove_file(root.join("tools").join("debugfs.exe")).unwrap();
-        std::fs::write(root.join("debugfs.exe"), b"MZ").unwrap();
+        std::fs::remove_file(root.join("tools").join("e2fsck.exe")).unwrap();
+        std::fs::write(root.join("e2fsck.exe"), b"MZ").unwrap();
         assert_eq!(tool_dir(&root), root);
 
-        std::fs::remove_file(root.join("debugfs.exe")).unwrap();
+        std::fs::remove_file(root.join("e2fsck.exe")).unwrap();
         assert_eq!(tool_dir(&root), root);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn forward_slashes_replaces_backslashes() {
-        assert_eq!(forward_slashes(Path::new(r"E:\Build_app\x\payload.apk")), "E:/Build_app/x/payload.apk");
+        assert_eq!(
+            forward_slashes(Path::new(r"E:\Build_app\x\payload.apk")),
+            "E:/Build_app/x/payload.apk"
+        );
     }
 
     #[test]

@@ -14,7 +14,13 @@ use crate::logging::Logger;
 
 /// Returns the resulting size, or `0` when the arguments are unusable (missing
 /// file, `slot <= 0`), exactly like Python's early return.
-pub fn force_slot_size(path: &Path, slot: u64, hard: bool, tag: &str, log: &mut Logger) -> Result<u64> {
+pub fn force_slot_size(
+    path: &Path,
+    slot: u64,
+    hard: bool,
+    tag: &str,
+    log: &mut Logger,
+) -> Result<u64> {
     if slot == 0 || !path.is_file() {
         return Ok(0);
     }
@@ -28,7 +34,9 @@ pub fn force_slot_size(path: &Path, slot: u64, hard: bool, tag: &str, log: &mut 
     ));
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     if cur > slot {
-        let msg = format!("file is larger than slot {tag} ({cur} > {slot}) - not truncating (would bootloop)");
+        let msg = format!(
+            "file is larger than slot {tag} ({cur} > {slot}) - not truncating (would bootloop)"
+        );
         if hard {
             return Err(Error::build(msg));
         }
@@ -76,7 +84,10 @@ mod tests {
         let p = dir.join("img.bin");
         std::fs::write(&p, vec![5u8; 4096]).unwrap();
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert_eq!(force_slot_size(&p, 4096, true, "EDL", &mut log).unwrap(), 4096);
+        assert_eq!(
+            force_slot_size(&p, 4096, true, "EDL", &mut log).unwrap(),
+            4096
+        );
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 4096);
         assert_eq!(std::fs::read(&p).unwrap(), vec![5u8; 4096]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -89,7 +100,10 @@ mod tests {
         std::fs::write(&p, b"HEAD").unwrap();
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         let slot = 8 * 1024 * 1024 + 7;
-        assert_eq!(force_slot_size(&p, slot, true, "EDL", &mut log).unwrap(), slot);
+        assert_eq!(
+            force_slot_size(&p, slot, true, "EDL", &mut log).unwrap(),
+            slot
+        );
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(bytes.len() as u64, slot);
         assert_eq!(&bytes[..4], b"HEAD");
@@ -115,7 +129,10 @@ mod tests {
         let p = dir.join("img.bin");
         std::fs::write(&p, vec![7u8; 8192]).unwrap();
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert_eq!(force_slot_size(&p, 4096, false, "AVB-PAD", &mut log).unwrap(), 8192);
+        assert_eq!(
+            force_slot_size(&p, 4096, false, "AVB-PAD", &mut log).unwrap(),
+            8192
+        );
         assert_eq!(std::fs::metadata(&p).unwrap().len(), 8192);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -124,8 +141,14 @@ mod tests {
     fn missing_file_or_zero_slot_returns_zero() {
         let dir = tmp("volte_slot_invalid");
         let mut log = Logger::new();
-        assert_eq!(force_slot_size(&dir.join("absent.bin"), 4096, true, "EDL", &mut log).unwrap(), 0);
-        assert_eq!(force_slot_size(&dir.join("absent.bin"), 0, true, "EDL", &mut log).unwrap(), 0);
+        assert_eq!(
+            force_slot_size(&dir.join("absent.bin"), 4096, true, "EDL", &mut log).unwrap(),
+            0
+        );
+        assert_eq!(
+            force_slot_size(&dir.join("absent.bin"), 0, true, "EDL", &mut log).unwrap(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

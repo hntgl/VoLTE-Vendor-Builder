@@ -18,9 +18,9 @@ pub const OVERLAP: usize = 256;
 pub const APK_NAME: &str = "OPPO_VoLTE_Overlay.apk";
 pub const APK_NAME_MTK: &str = APK_NAME;
 pub const APK_NAME_QC: &str = APK_NAME;
-pub const RC_NAME_MTK: &str = "hd_oppo_mtk_volte.rc";
-pub const RC_NAME_QC: &str = "hd_oppo_qc_volte.rc";
-pub const FEATURES_XML: &str = "hd_volte_features.xml";
+pub const RC_NAME_MTK: &str = "oppo_mtk_volte.rc";
+pub const RC_NAME_QC: &str = "oppo_qc_volte.rc";
+pub const FEATURES_XML: &str = "volte_features.xml";
 
 /// Report/summary tokens. Their spelling is part of the product output and must
 /// stay byte-identical to the Python tool.
@@ -29,6 +29,7 @@ pub const TOKEN_SIZE: &str = "Size=";
 pub const TOKEN_E2FSCK: &str = "e2fsck=";
 pub const TOKEN_AVB_HASHTREE: &str = "AVB_HASHTREE=";
 pub const TOKEN_AVB_ALGORITHM_NONE: &str = "AVB_ALGORITHM=NONE";
+pub const TOKEN_AVB_SIGNATURE: &str = "AVB_SIGNATURE=";
 pub const TOKEN_FLAGS: &str = "VOLTE_FLAGS=";
 pub const TOKEN_APK_SHA256: &str = "APK_SHA256=";
 pub const TOKEN_RC_SHA256: &str = "RC_SHA256=";

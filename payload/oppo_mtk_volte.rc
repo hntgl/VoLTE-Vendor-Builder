@@ -1,4 +1,4 @@
-# HD OPPO MTK Android 8/9/10 - IMS/VoLTE + nut ColorOS 5–7 (oppo.* + oplus.*)
+# OPPO MTK Android 8/9/10 - IMS/VoLTE + nut ColorOS 5–7 (oppo.* + oplus.*)
 on early-init
     setprop persist.sys.oplus.radio.show_volte 1
     setprop persist.sys.oplus.radio.volte_icon 1

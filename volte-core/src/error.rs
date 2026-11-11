@@ -13,7 +13,11 @@ pub enum ErrorKind {
     Build,
     /// Filesystem or stream error.
     Io,
-    /// The image is not EXT4 (`debugfs: Bad magic number`).
+    /// Reading the image failed while applying a byte patch.
+    Read,
+    /// Writing the image failed while applying a byte patch.
+    Write,
+    /// The image is not EXT4 (`rust-fs-ext4: bad magic number`).
     BadMagic,
     /// A required external tool or payload file is missing.
     Missing,
@@ -29,7 +33,10 @@ pub struct Error {
 
 impl Error {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Error { kind, message: message.into() }
+        Error {
+            kind,
+            message: message.into(),
+        }
     }
 
     pub fn build(message: impl Into<String>) -> Self {
@@ -100,6 +107,9 @@ mod tests {
 
     #[test]
     fn bad_magic_kind_is_distinct() {
-        assert_eq!(Error::bad_magic("debugfs: Bad magic number").kind(), ErrorKind::BadMagic);
+        assert_eq!(
+            Error::bad_magic("rust-fs-ext4: bad magic number").kind(),
+            ErrorKind::BadMagic
+        );
     }
 }

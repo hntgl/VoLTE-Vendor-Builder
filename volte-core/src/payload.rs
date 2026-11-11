@@ -2,8 +2,24 @@
 //!
 //! Ports `payload_dirs` / `payload_file` / `payload_required` /
 //! `first_payload` (`hd_vendor_build.py:285-313`) and `overlay_cmds` (`:857`).
-//! Command lists are byte-identical to the Python tool because `debugfs`
-//! consumes them verbatim.
+//! The write list keeps the Python command order. The cleanup list is
+//! intentionally different: it removes each candidate by absolute path instead
+//! of `cd`-ing into a directory first, so a missing directory cannot leave the
+//! shell at `/` and turn the following `rm` into a no-op.
+//!
+//! Divergence of 2026-11-08: the clean list no longer removes the retired
+//! `HD_OPPO_MTK_`/`HD_OPPO_QC_` OEM overlay apk names. Those only ever existed
+//! on a vendor image previously patched by the old Python/C# tools; on a
+//! stock vendor image (this project's only target now) they never exist, so
+//! the `rm` was always a harmless best-effort no-op there. Removed by
+//! request to keep the command list minimal for stock-only builds.
+//!
+//! Divergence of 2026-11-08 (follow-up): the second overlay apk copy under
+//! `/overlay/HDVoLTE/` was dropped. `HDVoLTE` was confirmed by the user to be
+//! an arbitrary folder name the previous tool author invented, not an OPPO
+//! firmware requirement — AOSP's overlay scanner only needs one canonical
+//! copy at `/overlay/<apk_name>`. Only that copy is now written, cleaned and
+//! verified.
 
 use std::path::{Path, PathBuf};
 
@@ -14,7 +30,7 @@ use crate::profile;
 
 /// `payload_dirs`: `payload\` → `tool\payload\` → root → `vendor_fix_payload\`,
 /// existing directories only, de-duplicated in that order.
-pub fn payload_dirs(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn payload_dirs(root: &Path) -> Vec<PathBuf> {
     let mut seen: Vec<PathBuf> = Vec::new();
     for cand in [
         root.join("payload"),
@@ -30,7 +46,7 @@ pub fn payload_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// `payload_file`: first directory that holds `name`.
-pub fn payload_file(root: &Path, name: &str) -> Option<PathBuf> {
+pub(crate) fn payload_file(root: &Path, name: &str) -> Option<PathBuf> {
     for dir in payload_dirs(root) {
         let p = dir.join(name);
         if p.is_file() {
@@ -41,7 +57,7 @@ pub fn payload_file(root: &Path, name: &str) -> Option<PathBuf> {
 }
 
 /// `payload_required`: same lookup, but a missing file is a build error.
-pub fn payload_required(root: &Path, name: &str) -> Result<PathBuf> {
+pub(crate) fn payload_required(root: &Path, name: &str) -> Result<PathBuf> {
     payload_file(root, name).ok_or_else(|| {
         Error::new(
             crate::error::ErrorKind::Missing,
@@ -81,26 +97,18 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
     let payload_rc = td.join("payload.rc");
     std::fs::copy(&apk_src, &payload_apk)?;
     std::fs::copy(&rc_src, &payload_rc)?;
-    std::fs::copy(payload_required(root, "overlay.bin")?, td.join("overlay.bin"))?;
+    std::fs::copy(
+        payload_required(root, "overlay.bin")?,
+        td.join("overlay.bin"),
+    )?;
     std::fs::copy(payload_required(root, "config.bin")?, td.join("config.bin"))?;
 
     let clean: Vec<String> = [
-        "cd /overlay/HDVoLTE",
-        "rm OPPO_VoLTE_Overlay.apk",
-        "rm HD_OPPO_MTK_VoLTE_Overlay.apk",
-        "rm HD_OPPO_QC_VoLTE_Overlay.apk",
-        "cd /overlay",
-        "rm OPPO_VoLTE_Overlay.apk",
-        "rm HD_OPPO_MTK_VoLTE_Overlay.apk",
-        "rm HD_OPPO_QC_VoLTE_Overlay.apk",
-        "rmdir HDVoLTE",
-        "cd /etc/init",
-        "rm hd_oppo_mtk_volte.rc",
-        "rm hd_oppo_qc_volte.rc",
-        "cd /etc/init/hw",
-        "rm hd_oppo_qc_volte.rc",
-        "rm hd_oppo_mtk_volte.rc",
-        "cd /",
+        "rm /overlay/OPPO_VoLTE_Overlay.apk",
+        "rm /etc/init/oppo_mtk_volte.rc",
+        "rm /etc/init/oppo_qc_volte.rc",
+        "rm /etc/init/hw/oppo_qc_volte.rc",
+        "rm /etc/init/hw/oppo_mtk_volte.rc",
         "mkdir /overlay",
         "mkdir /etc",
         "mkdir /etc/init",
@@ -110,20 +118,7 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
     .map(|s| s.to_string())
     .collect();
 
-    let ovdir = "HDVoLTE";
     let mut write = vec![
-        format!("mkdir /overlay/{ovdir}"),
-        format!("cd /overlay/{ovdir}"),
-        format!("write {} {}", forward_slashes(&payload_apk), apk_name),
-        format!("set_inode_field {apk_name} mode 0x81A4"),
-        format!("set_inode_field {apk_name} uid 0"),
-        format!("set_inode_field {apk_name} gid 0"),
-        format!("ea_set -f overlay.bin {apk_name} security.selinux"),
-        "cd /overlay".to_string(),
-        format!("set_inode_field {ovdir} mode 0x41ED"),
-        format!("set_inode_field {ovdir} uid 0"),
-        format!("set_inode_field {ovdir} gid 2000"),
-        format!("ea_set -f overlay.bin {ovdir} security.selinux"),
         "cd /overlay".to_string(),
         format!("write {} {}", forward_slashes(&payload_apk), apk_name),
         format!("set_inode_field {apk_name} mode 0x81A4"),
@@ -150,8 +145,15 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
         write.push("mkdir /etc/permissions".to_string());
         write.push("cd /etc/permissions".to_string());
         write.push(format!("rm {}", config::FEATURES_XML));
-        write.push(format!("write {} {}", forward_slashes(&feat_host), config::FEATURES_XML));
-        write.push(format!("set_inode_field {} mode 0x81A4", config::FEATURES_XML));
+        write.push(format!(
+            "write {} {}",
+            forward_slashes(&feat_host),
+            config::FEATURES_XML
+        ));
+        write.push(format!(
+            "set_inode_field {} mode 0x81A4",
+            config::FEATURES_XML
+        ));
         write.push(format!("set_inode_field {} uid 0", config::FEATURES_XML));
         write.push(format!("set_inode_field {} gid 0", config::FEATURES_XML));
         write.push(format!(
@@ -166,8 +168,15 @@ pub fn overlay_commands(root: &Path, td: &Path, qc: bool) -> Result<OverlayPlan>
             let qc_host = td.join("payload_qc.rc");
             std::fs::copy(qc_rc, &qc_host)?;
             write.push("cd /etc/init".to_string());
-            write.push(format!("write {} {}", forward_slashes(&qc_host), config::RC_NAME_QC));
-            write.push(format!("set_inode_field {} mode 0x81A4", config::RC_NAME_QC));
+            write.push(format!(
+                "write {} {}",
+                forward_slashes(&qc_host),
+                config::RC_NAME_QC
+            ));
+            write.push(format!(
+                "set_inode_field {} mode 0x81A4",
+                config::RC_NAME_QC
+            ));
             write.push(format!("set_inode_field {} uid 0", config::RC_NAME_QC));
             write.push(format!("set_inode_field {} gid 0", config::RC_NAME_QC));
             write.push(format!(
@@ -254,14 +263,18 @@ mod tests {
     }
 
     #[test]
+    // Divergence of 2026-11-08: the clean list no longer removes the retired
+    // HD_OPPO_MTK_/HD_OPPO_QC_ OEM overlay names (the user only targets stock
+    // vendor images, which never had them), so the count is 4 lower than the
+    // original Python tool's.
     fn qc_command_counts_match_python() {
         let root = tmp("volte_overlay_qc");
         let td = root.join("work");
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, false);
         let plan = overlay_commands(&root, &td, true).unwrap();
-        assert_eq!(plan.clean.len(), 20, "clean commands");
-        assert_eq!(plan.write.len(), 38, "write commands");
+        assert_eq!(plan.clean.len(), 9, "clean commands");
+        assert_eq!(plan.write.len(), 26, "write commands");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -272,12 +285,37 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, true);
         let plan = overlay_commands(&root, &td, false).unwrap();
-        assert_eq!(plan.clean.len(), 20, "clean commands");
-        assert_eq!(plan.write.len(), 44, "write commands");
+        assert_eq!(plan.clean.len(), 9, "clean commands");
+        assert_eq!(plan.write.len(), 32, "write commands");
         assert!(
-            plan.write.iter().any(|c| c.contains("write") && c.ends_with("hd_oppo_qc_volte.rc")),
+            plan.write
+                .iter()
+                .any(|c| c.contains("write") && c.ends_with("oppo_qc_volte.rc")),
             "MTK must also write the QC RC"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_uses_absolute_paths_and_never_changes_directory() {
+        let root = tmp("volte_overlay_clean_abs");
+        let td = root.join("work");
+        std::fs::create_dir_all(&td).unwrap();
+        seed_payloads(&root, true, false);
+        let plan = overlay_commands(&root, &td, true).unwrap();
+        assert!(
+            !plan.clean.iter().any(|c| c.starts_with("cd ")),
+            "{:?}",
+            plan.clean
+        );
+        for cmd in &plan.clean {
+            let path = cmd
+                .strip_prefix("rm ")
+                .or_else(|| cmd.strip_prefix("rmdir "))
+                .or_else(|| cmd.strip_prefix("mkdir "))
+                .unwrap_or_else(|| panic!("unexpected clean command: {cmd}"));
+            assert!(path.starts_with('/'), "{cmd} must use an absolute path");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -290,12 +328,20 @@ mod tests {
         let plan = overlay_commands(&root, &td, true).unwrap();
         let all = plan.clean.join("\n") + "\n" + &plan.write.join("\n");
         assert!(all.contains("set_inode_field OPPO_VoLTE_Overlay.apk mode 0x81A4"));
-        assert!(all.contains("set_inode_field HDVoLTE mode 0x41ED"));
-        assert!(all.contains("set_inode_field HDVoLTE gid 2000"));
         assert!(all.contains("ea_set -f overlay.bin OPPO_VoLTE_Overlay.apk security.selinux"));
-        assert!(all.contains("ea_set -f config.bin hd_oppo_qc_volte.rc security.selinux"));
+        assert!(all.contains("ea_set -f config.bin oppo_qc_volte.rc security.selinux"));
         assert!(all.contains("mkdir /etc/permissions"));
-        assert_eq!(plan.write.iter().filter(|c| c.starts_with("ea_set ")).count(), 6);
+        assert!(
+            !all.contains("HDVoLTE"),
+            "the retired second overlay copy must be gone: {all}"
+        );
+        assert_eq!(
+            plan.write
+                .iter()
+                .filter(|c| c.starts_with("ea_set "))
+                .count(),
+            4
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -306,11 +352,11 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, false, false);
         let qc = overlay_commands(&root, &td, true).unwrap();
-        assert_eq!(qc.write.len(), 30);
-        assert!(!qc.write.iter().any(|c| c.contains("hd_volte_features.xml")));
+        assert_eq!(qc.write.len(), 18);
+        assert!(!qc.write.iter().any(|c| c.contains("volte_features.xml")));
         std::fs::write(root.join("payload").join(config::RC_NAME_QC), b"qc rc").unwrap();
         let mtk = overlay_commands(&root, &td, false).unwrap();
-        assert_eq!(mtk.write.len(), 36);
+        assert_eq!(mtk.write.len(), 24);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -321,7 +367,14 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         seed_payloads(&root, true, true);
         let _ = overlay_commands(&root, &td, false).unwrap();
-        for name in ["payload.apk", "payload.rc", "payload_qc.rc", "overlay.bin", "config.bin", config::FEATURES_XML] {
+        for name in [
+            "payload.apk",
+            "payload.rc",
+            "payload_qc.rc",
+            "overlay.bin",
+            "config.bin",
+            config::FEATURES_XML,
+        ] {
             assert!(td.join(name).is_file(), "{name} must be copied");
         }
         let _ = std::fs::remove_dir_all(&root);

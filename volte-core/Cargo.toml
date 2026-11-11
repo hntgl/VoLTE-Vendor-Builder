@@ -5,6 +5,13 @@ edition = "2021"
 description = "Core logic for the VoLTE vendor image builder (no console output)."
 
 [dependencies]
+# Stable std has no file-identity API on Windows (`file_index` and
+# `volume_serial_number` are unstable), so the A01/A01b/G02 guards compare
+# volume/file index instead of path strings.
+same-file = "1.0.6"
+# `os.urandom(32)` parity for the AVB hashtree salt: the OS CSPRNG, not a
+# time-hashed value.
+getrandom = "0.3.4"
 # Default Ext4Ops engine (decision 2026-11-07): pure-Rust ext4. Pinned by commit
 # so Cargo.lock records a source and a revision, unlike a path dependency.
 rust-fs-ext4 = { git = "https://github.com/antimatter-studios/rust-fs-ext4.git", rev = "1aaea0793baba99c69488c02c2b510adb14bb501" }

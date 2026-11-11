@@ -8,31 +8,58 @@
 
 use std::path::Path;
 
+use crate::config;
 use crate::env::forward_slashes;
-use crate::ext4::Ext4Ops;
+use crate::error::Result;
+use crate::ext4_tools::Ext4Ops;
 use crate::logging::Logger;
 use crate::profile;
-use crate::error::Result;
 
 /// The 21 MTK / 8 QC candidates in Python's order (shared tail included).
-pub fn candidate_vpaths(needles: &[&str]) -> Vec<&'static str> {
+pub(crate) fn candidate_vpaths(needles: &[&str]) -> Vec<&'static str> {
     let mut vpaths: Vec<&'static str> = Vec::new();
-    if needles.iter().any(|n| n.contains("hd_oppo_mtk_volte.rc")) {
+    if needles.iter().any(|n| n.contains(config::RC_NAME_MTK)) {
         vpaths.extend(profile::INIT_VPATHS_MTK);
     }
-    if needles.iter().any(|n| n.contains("hd_oppo_qc_volte.rc")) {
+    if needles.iter().any(|n| n.contains(config::RC_NAME_QC)) {
         vpaths.extend(profile::INIT_VPATHS_QC);
     }
     vpaths.extend(profile::INIT_VPATHS_SHARED);
     vpaths
 }
 
-fn split_vpath(vpath: &str) -> (String, String) {
-    match vpath.rsplit_once('/') {
-        Some((dir, name)) if !dir.is_empty() => (dir.to_owned(), name.to_owned()),
-        Some((_, name)) => ("/etc/init/hw".to_owned(), name.to_owned()),
-        None => ("/etc/init/hw".to_owned(), vpath.to_owned()),
+/// Splits a virtual path into the directory to `cd` into and the file name.
+/// `/name` belongs to the root and `a/b/c` to `a/b`; an empty path or a
+/// trailing slash has no writable target and returns `None`. There is no
+/// silent `/etc/init/hw` fallback: the write must land where the dump came
+/// from.
+fn split_vpath(vpath: &str) -> Option<(String, String)> {
+    if vpath.is_empty() || vpath.ends_with('/') {
+        return None;
     }
+    if let Some(rest) = vpath.strip_prefix('/') {
+        if rest.is_empty() {
+            return None;
+        }
+        return Some(match rest.rsplit_once('/') {
+            Some((dir, name)) if !dir.is_empty() => (format!("/{dir}"), name.to_owned()),
+            Some((_, name)) => ("/".to_owned(), name.to_owned()),
+            None => ("/".to_owned(), rest.to_owned()),
+        });
+    }
+    Some(match vpath.rsplit_once('/') {
+        Some((dir, name)) if !dir.is_empty() => (dir.to_owned(), name.to_owned()),
+        _ => (".".to_owned(), vpath.to_owned()),
+    })
+}
+
+/// True when an uncommented line is exactly the import command.
+///
+/// The old check used `str::contains`, so the text inside a `# import ...`
+/// comment also counted as present and the real import was never written.
+fn has_import(text: &str, needle: &str) -> bool {
+    text.lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.trim() == needle)
 }
 
 /// Returns `true` when an init file was dumped and now imports every needle,
@@ -55,7 +82,10 @@ pub fn link(
         }
         let command = format!("dump {vpath} {}", forward_slashes(&host));
         let mut quiet = Logger::new();
-        if ops.run(image, &[command], td, &mut quiet).is_err() {
+        if ops
+            .run_best_effort(image, &[command], td, &mut quiet)
+            .is_err()
+        {
             continue;
         }
         let big_enough = std::fs::metadata(&host)
@@ -80,10 +110,10 @@ pub fn link(
     let missing: Vec<&str> = needles
         .iter()
         .copied()
-        .filter(|n| !n.is_empty() && !text.contains(n))
+        .filter(|n| !n.is_empty() && !has_import(&text, n))
         .collect();
     if missing.is_empty() {
-        log.log(format!("[OK] {found} already imports HD VoLTE."));
+        log.log(format!("[OK] {found} already imports VoLTE vendor config."));
         return Ok(true);
     }
     for needle in &missing {
@@ -93,7 +123,8 @@ pub fn link(
     }
     std::fs::write(&host, text.as_bytes())?;
 
-    let (dest_dir, dest_name) = split_vpath(&found);
+    let (dest_dir, dest_name) = split_vpath(&found)
+        .ok_or_else(|| crate::error::Error::build(format!("invalid init path: {found}")))?;
     let mut cmds = vec![
         "mkdir /etc".to_owned(),
         "mkdir /etc/init".to_owned(),
@@ -146,6 +177,7 @@ mod tests {
         existing: Vec<String>,
         fail_dump: bool,
         written: Vec<(String, Vec<u8>)>,
+        commands: Vec<String>,
     }
 
     impl FakeOps {
@@ -158,6 +190,7 @@ mod tests {
                 existing: vec!["/etc".to_owned(), "/etc/init".to_owned()],
                 fail_dump: false,
                 written: Vec::new(),
+                commands: Vec::new(),
             }
         }
     }
@@ -171,6 +204,7 @@ mod tests {
             _log: &mut Logger,
         ) -> Result<String> {
             for c in commands {
+                self.commands.push(c.clone());
                 if let Some(rest) = c.strip_prefix("dump ") {
                     if self.fail_dump {
                         return Err(crate::error::Error::build("dump failed"));
@@ -216,7 +250,11 @@ mod tests {
     #[test]
     fn inserts_the_missing_imports_and_keeps_the_file_lf_terminated() {
         let dir = tmp("volte_initrc_insert");
-        std::fs::write(dir.join("config.bin"), b"u:object_r:vendor_configs_file:s0\0").unwrap();
+        std::fs::write(
+            dir.join("config.bin"),
+            b"u:object_r:vendor_configs_file:s0\0",
+        )
+        .unwrap();
         let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", b"on boot\n    exec x")]);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         let cfg = dir.join("config.bin");
@@ -233,8 +271,8 @@ mod tests {
         assert_eq!(ops.written.len(), 1);
         let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
         assert!(text.starts_with("on boot\n    exec x\n"));
-        assert!(text.contains("\nimport /vendor/etc/init/hd_oppo_qc_volte.rc\n"));
-        assert!(text.contains("\nimport /vendor/etc/init/hw/hd_oppo_qc_volte.rc\n"));
+        assert!(text.contains("\nimport /vendor/etc/init/oppo_qc_volte.rc\n"));
+        assert!(text.contains("\nimport /vendor/etc/init/hw/oppo_qc_volte.rc\n"));
         assert_eq!(text.matches(profile::IMPORT_LINE).count(), 1);
         assert!(text.ends_with('\n'));
         assert!(!text.contains('\r'));
@@ -244,10 +282,22 @@ mod tests {
     #[test]
     fn existing_imports_are_idempotent_and_skip_the_write_back() {
         let dir = tmp("volte_initrc_idempotent");
-        let body = format!("on boot\n{}\n{}\n", profile::IMPORT_LINE, profile::IMPORT_LINE_HW);
+        let body = format!(
+            "on boot\n{}\n{}\n",
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE_HW
+        );
         let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", body.as_bytes())]);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert!(link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         assert!(ops.written.is_empty());
         assert_eq!(ops.existing.len(), 2, "no mkdir probe on the early return");
         let _ = std::fs::remove_dir_all(&dir);
@@ -258,7 +308,15 @@ mod tests {
         let dir = tmp("volte_initrc_undumpable");
         let mut ops = FakeOps::new(&[]);
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert!(!link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(!link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         assert!(ops.written.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -269,7 +327,15 @@ mod tests {
         let mut ops = FakeOps::new(&[]);
         ops.fail_dump = true;
         let mut log = Logger::new().with_sink(Vec::<String>::new());
-        assert!(!link(Path::new("img"), &dir, None, &qc_needles(), &mut ops, &mut log).unwrap());
+        assert!(!link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -278,13 +344,23 @@ mod tests {
         let dir = tmp("volte_initrc_mkdir_filter");
         std::fs::write(dir.join("config.bin"), b"label\0").unwrap();
         let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", b"on boot\n    exec x\n")]);
-        ops.existing = vec!["/etc".to_owned(), "/etc/init".to_owned(), "/etc/init/hw".to_owned()];
+        ops.existing = vec![
+            "/etc".to_owned(),
+            "/etc/init".to_owned(),
+            "/etc/init/hw".to_owned(),
+        ];
         let mut log = Logger::new().with_sink(Vec::<String>::new());
         let cfg = dir.join("config.bin");
         let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<String>>>, FakeOps);
         impl Ext4Ops for Recorder {
-            fn run(&mut self, image: &Path, commands: &[String], workdir: &Path, log: &mut Logger) -> Result<String> {
+            fn run(
+                &mut self,
+                image: &Path,
+                commands: &[String],
+                workdir: &Path,
+                log: &mut Logger,
+            ) -> Result<String> {
                 if commands.iter().all(|c| !c.starts_with("dump ")) {
                     self.0.lock().unwrap().extend(commands.iter().cloned());
                 }
@@ -295,11 +371,165 @@ mod tests {
             }
         }
         let mut rec = Recorder(recorded.clone(), ops);
-        assert!(link(Path::new("img"), &dir, Some(&cfg), &qc_needles(), &mut rec, &mut log).unwrap());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            Some(&cfg),
+            &qc_needles(),
+            &mut rec,
+            &mut log
+        )
+        .unwrap());
         let cmds = recorded.lock().unwrap().clone();
         assert!(!cmds.iter().any(|c| c.starts_with("mkdir ")), "{cmds:?}");
         assert_eq!(cmds[0], "rm /etc/init/hw/init.target.rc");
         assert!(cmds.iter().any(|c| c.starts_with("ea_set -f ")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn split_vpath_keeps_the_directory_the_file_came_from() {
+        assert_eq!(
+            split_vpath("/init.target.rc"),
+            Some(("/".to_owned(), "init.target.rc".to_owned()))
+        );
+        assert_eq!(
+            split_vpath("/etc/init/hw/init.target.rc"),
+            Some(("/etc/init/hw".to_owned(), "init.target.rc".to_owned()))
+        );
+        assert_eq!(
+            split_vpath("etc/init/init.vendor.rc"),
+            Some(("etc/init".to_owned(), "init.vendor.rc".to_owned()))
+        );
+        assert_eq!(
+            split_vpath("init.rc"),
+            Some((".".to_owned(), "init.rc".to_owned()))
+        );
+        assert_eq!(split_vpath(""), None);
+        assert_eq!(split_vpath("/"), None);
+        assert_eq!(split_vpath("/etc/"), None, "a trailing slash names no file");
+    }
+
+    #[test]
+    fn a_root_init_file_is_written_back_to_the_root() {
+        let dir = tmp("volte_initrc_root");
+        let mut ops = FakeOps::new(&[("/init.target.rc", b"on boot\n    exec x\n")]);
+        let lines = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct Collect(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+        impl crate::logging::Sink for Collect {
+            fn emit(&mut self, line: &str) {
+                self.0.borrow_mut().push(line.to_owned());
+            }
+        }
+        let mut log = Logger::new().with_sink(Collect(lines.clone()));
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
+        assert_eq!(ops.written.len(), 1);
+        assert_eq!(ops.written[0].0, "init.target.rc");
+        assert!(ops.commands.iter().any(|c| c == "rm /init.target.rc"));
+        assert!(
+            ops.commands.iter().any(|c| c == "cd /"),
+            "{:?}",
+            ops.commands
+        );
+        assert!(
+            !ops.commands.iter().any(|c| c == "cd /etc/init/hw"),
+            "the root file must not be redirected: {:?}",
+            ops.commands
+        );
+        let text = lines.borrow().join("\n");
+        assert!(text.contains("Linked the init script into /init.target.rc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_nested_init_file_is_written_back_to_its_own_directory() {
+        let dir = tmp("volte_initrc_nested");
+        let snap = "/etc/init/hw/init.target.rc";
+        let mut ops = FakeOps::new(&[(snap, b"on boot\n    exec x\n")]);
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
+        assert_eq!(ops.written[0].0, "init.target.rc");
+        assert!(ops.commands.iter().any(|c| c == "cd /etc/init/hw"));
+        assert!(!ops.commands.iter().any(|c| c == "cd /"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a7_a_commented_import_does_not_count_as_present() {
+        let dir = tmp("volte_initrc_a7_commented_import");
+        std::fs::write(dir.join("config.bin"), b"label\0").unwrap();
+        let body = format!(
+            "on boot\n# {}\n    # {}\n    exec x\n",
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE_HW
+        );
+        let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", body.as_bytes())]);
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let cfg = dir.join("config.bin");
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            Some(&cfg),
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
+        assert_eq!(
+            ops.written.len(),
+            1,
+            "a commented import must not satisfy the check: {:?}",
+            ops.commands
+        );
+        let text = String::from_utf8_lossy(&ops.written[0].1).into_owned();
+        assert!(
+            text.contains(&format!("# {}\n", profile::IMPORT_LINE)),
+            "the comment must be preserved:\n{text}"
+        );
+        for needle in qc_needles() {
+            let exact = text.lines().filter(|l| l.trim() == needle).count();
+            assert_eq!(exact, 1, "expected exactly one real {needle:?} in:\n{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a7_a_real_import_plus_comments_stays_idempotent() {
+        let dir = tmp("volte_initrc_a7_idempotent");
+        let body = format!(
+            "on boot\n# {}\n{}\n{}\n",
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE,
+            profile::IMPORT_LINE_HW
+        );
+        let mut ops = FakeOps::new(&[("/etc/init/hw/init.target.rc", body.as_bytes())]);
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        assert!(link(
+            Path::new("img"),
+            &dir,
+            None,
+            &qc_needles(),
+            &mut ops,
+            &mut log
+        )
+        .unwrap());
+        assert!(ops.written.is_empty(), "a real import is already present");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

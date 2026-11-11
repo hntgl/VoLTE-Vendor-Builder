@@ -1,4 +1,4 @@
-# HD OPPO/Realme Qualcomm — ColorOS 6/7 (A11 trinket) + ColorOS 11 (oplus)
+# OPPO/Realme Qualcomm — ColorOS 6/7 (A11 trinket) + ColorOS 11 (oplus)
 # persist.* phai set lai sau khi persist mount (post-fs-data), khong chi early-init
 on early-init
     setprop persist.sys.oppo.radio.show_volte 1

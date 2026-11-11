@@ -1,18 +1,9 @@
-//! `debugfs` and `e2fsck` backends (decision 8.2/1: external tools, no static
-//! link to `libext2fs`).
+//! External `e2fsck` runner and the EXT4 backend traits.
 //!
-//! Port of `run_debugfs` (`hd_vendor_build.py:384`), `debugfs_exists`
-//! (`:407`), `run_e2fsck` (`:431`) and `read_vendor_flag_bit` (`:730`).
-//!
-//! The external tools are treated exactly as Python treats them:
-//! - every command batch becomes `workdir/hd_debugfs_cmds.txt`, UTF-8 with LF
-//!   and a trailing newline, replayed by `debugfs -w -f` with the working
-//!   directory set to `workdir`.
-//! - a non-EXT4 image is recognised by its *text* ("bad magic number" /
-//!   "not a valid ext"), because debugfs 1.44.5 exits 0 on that error.
-//! - `write src /abs/name` stores the leading slash in the entry name (e2fsck
-//!   then reports an illegal name), so callers use `cd` + bare names like
-//!   `overlay_cmds` does.
+//! After the Đợt 2.5 parity check the product has a single EXT4 engine: the
+//! in-process `rust-fs-ext4` backend (`crate::rustfs_ext4`). This module keeps
+//! the [`Ext4Ops`] contract the pipeline codes against and the external
+//! `e2fsck -fn` verdict ([`Fsck`], [`E2fsck`]).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -24,20 +15,15 @@ use crate::error::{Error, Result};
 use crate::flags::flag_bit_from_dumps;
 use crate::logging::{decode, Logger};
 
-const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
-const STAT_TIMEOUT: Duration = Duration::from_secs(600);
 const FSCK_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Command-file name written into the working directory before every batch
-/// (`hd_debugfs_cmds.txt`, `:388`).
-pub const CMD_FILE: &str = "hd_debugfs_cmds.txt";
-
-/// The two ext4 verbs the pipeline needs. Implemented by `DebugfsBackend`,
-/// mocked by callers that must not spawn a process.
+/// The two ext4 verbs the pipeline needs.
 pub trait Ext4Ops {
+    /// Runs one command batch. A command that fails is a build error, so a
+    /// mutation that did not happen is never reported as success.
     fn run(
         &mut self,
         image: &Path,
@@ -45,6 +31,20 @@ pub trait Ext4Ops {
         workdir: &Path,
         log: &mut Logger,
     ) -> Result<String>;
+
+    /// Runs a probe batch whose failures are expected and ignored: candidate
+    /// dumps, property files that may not exist, cleanup entries that may be
+    /// absent. Backends with a fail-fast `run` override this with a
+    /// per-command loop.
+    fn run_best_effort(
+        &mut self,
+        image: &Path,
+        commands: &[String],
+        workdir: &Path,
+        log: &mut Logger,
+    ) -> Result<String> {
+        self.run(image, commands, workdir, log)
+    }
 
     fn path_exists(&mut self, image: &Path, vpath: &str, workdir: &Path) -> Result<bool>;
 }
@@ -62,23 +62,27 @@ fn quiet(cmd: &mut Command) {
     }
 }
 
+/// Output of a bounded child process, shared by `e2fsck` and `avbtool.py`.
 #[derive(Debug)]
-struct Captured {
-    code: i32,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct Captured {
+    pub(crate) code: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 impl Captured {
     /// Python: `(_decode(stdout) + "\n" + _decode(stderr)).strip()`.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         format!("{}\n{}", decode(&self.stdout), decode(&self.stderr))
             .trim()
             .to_owned()
     }
 }
 
-fn capture(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
+/// Runs a child process with piped output and a hard deadline. A tool that
+/// overruns is killed and reported as an error, so a hung `e2fsck` or
+/// `avbtool.py` can never stall a build forever.
+pub(crate) fn capture(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -125,78 +129,8 @@ fn capture(cmd: &mut Command, timeout: Duration) -> Result<Captured> {
     })
 }
 
-fn reject_non_ext4(text: &str) -> Result<()> {
-    let low = text.to_lowercase();
-    if low.contains("bad magic number") || low.contains("not a valid ext") {
-        return Err(Error::bad_magic(
-            "not an EXT4 image (debugfs: bad magic number)",
-        ));
-    }
-    Ok(())
-}
-
-/// `debugfs.exe` lookup: the tool directory first, then the bare name on PATH
-/// (`:385-387`).
-pub struct DebugfsBackend {
-    exe: PathBuf,
-}
-
-impl DebugfsBackend {
-    pub fn new(tool_dir: &Path) -> Self {
-        let exe = tool_dir.join("debugfs.exe");
-        let exe = if exe.is_file() {
-            exe
-        } else {
-            PathBuf::from("debugfs.exe")
-        };
-        DebugfsBackend { exe }
-    }
-
-    pub fn exe(&self) -> &Path {
-        &self.exe
-    }
-}
-
-impl Ext4Ops for DebugfsBackend {
-    fn run(
-        &mut self,
-        image: &Path,
-        commands: &[String],
-        workdir: &Path,
-        log: &mut Logger,
-    ) -> Result<String> {
-        let cmdfile = workdir.join(CMD_FILE);
-        let body = format!("{}\n", commands.join("\n"));
-        std::fs::write(&cmdfile, body)?;
-        let mut cmd = Command::new(&self.exe);
-        cmd.arg("-w")
-            .arg("-f")
-            .arg(&cmdfile)
-            .arg(image)
-            .current_dir(workdir);
-        let out = capture(&mut cmd, RUN_TIMEOUT)?;
-        let text = out.text();
-        reject_non_ext4(&text)?;
-        if out.code != 0 {
-            log.log(format!("[WARN] debugfs rc={}", out.code));
-        }
-        Ok(text)
-    }
-
-    fn path_exists(&mut self, image: &Path, vpath: &str, workdir: &Path) -> Result<bool> {
-        let mut cmd = Command::new(&self.exe);
-        cmd.arg("-R")
-            .arg(format!("stat {vpath}"))
-            .arg(image)
-            .current_dir(workdir);
-        let out = capture(&mut cmd, STAT_TIMEOUT)?;
-        let text = out.text();
-        reject_non_ext4(&text)?;
-        Ok(!text.to_lowercase().contains("file not found"))
-    }
-}
-
-/// `e2fsck.exe` lookup, same fallback rule as debugfs (`:432-434`).
+/// `e2fsck.exe` lookup: the tool directory first, then the bare name on PATH
+/// (`:432-434`).
 pub struct E2fsck {
     exe: PathBuf,
 }
@@ -229,7 +163,12 @@ impl Fsck for E2fsck {
     fn check(&mut self, image: &Path, workdir: &Path) -> Result<String> {
         let mut cmd = Command::new(&self.exe);
         cmd.arg("-fn").arg(image).current_dir(workdir);
-        let out = capture(&mut cmd, FSCK_TIMEOUT)?;
+        let out = capture(&mut cmd, FSCK_TIMEOUT).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("e2fsck ({}): {}", self.exe.display(), e.message()),
+            )
+        })?;
         let text = out.text();
         if out.code != 0 && out.code != 1 {
             return Err(Error::build(format!(
@@ -247,11 +186,11 @@ impl Fsck for E2fsck {
 /// Python `try/except`.
 pub fn read_vendor_flag_bit(image: &Path, workdir: &Path, ops: &mut dyn Ext4Ops) -> u8 {
     let commands = vec![
-        "dump /default.prop hd_flg_def.prop".to_owned(),
-        "dump /build.prop hd_flg_build.prop".to_owned(),
+        "dump /default.prop flg_def.prop".to_owned(),
+        "dump /build.prop flg_build.prop".to_owned(),
     ];
     let mut sink = Logger::new();
-    let _ = ops.run(image, &commands, workdir, &mut sink);
+    let _ = ops.run_best_effort(image, &commands, workdir, &mut sink);
     flag_bit_from_dumps(workdir)
 }
 
@@ -259,6 +198,7 @@ pub fn read_vendor_flag_bit(image: &Path, workdir: &Path, ops: &mut dyn Ext4Ops)
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use crate::rustfs_ext4::RustFsExt4Backend;
 
     fn tmp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(name);
@@ -276,10 +216,12 @@ mod tests {
     fn tool_dir() -> PathBuf {
         let dir = match std::env::var("VOLTE_TOOL_DIR") {
             Ok(v) => PathBuf::from(v),
-            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("tool"),
+            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("tool"),
         };
         assert!(
-            dir.join("debugfs.exe").is_file(),
+            dir.join("mke2fs.exe").is_file(),
             "bundled e2fsprogs missing at {} (set VOLTE_TOOL_DIR)",
             dir.display()
         );
@@ -308,92 +250,21 @@ mod tests {
     }
 
     #[test]
-    fn exe_falls_back_to_the_bare_name() {
-        let backend = DebugfsBackend::new(Path::new(r"E:\no\such\tool"));
-        assert_eq!(backend.exe(), Path::new("debugfs.exe"));
+    fn e2fsck_falls_back_to_the_bare_name() {
         let fsck = E2fsck::new(Path::new(r"E:\no\such\tool"));
         assert_eq!(fsck.exe(), Path::new("e2fsck.exe"));
     }
 
     #[test]
-    fn command_file_is_lf_only_and_commands_reach_the_image() {
-        let dir = tmp("volte_ext4_run");
-        let img = make_ext4(&dir, "run.img");
-        std::fs::write(dir.join("host.txt"), b"hello\n").unwrap();
-        let mut ops = DebugfsBackend::new(&tool_dir());
-        let mut log = quiet_log();
-        let out = ops
-            .run(
-                &img,
-                &[
-                    "write host.txt hello.txt".to_owned(),
-                    "ls -l /".to_owned(),
-                ],
-                &dir,
-                &mut log,
-            )
-            .unwrap();
-        assert!(out.contains("Allocated inode"), "{out}");
-        assert!(out.contains("hello.txt"), "{out}");
-        let cmds = std::fs::read(dir.join(CMD_FILE)).unwrap();
-        assert_eq!(cmds, b"write host.txt hello.txt\nls -l /\n");
-        assert_eq!(std::fs::metadata(&img).unwrap().len(), 16384 * 4096);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn command_file_joins_an_empty_batch_to_a_single_newline() {
-        let dir = tmp("volte_ext4_empty_batch");
-        let img = make_ext4(&dir, "empty.img");
-        let mut ops = DebugfsBackend::new(&tool_dir());
-        let mut log = quiet_log();
-        ops.run(&img, &[], &dir, &mut log).unwrap();
-        assert_eq!(std::fs::read(dir.join(CMD_FILE)).unwrap(), b"\n");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn path_exists_matches_the_stat_probe() {
-        let dir = tmp("volte_ext4_exists");
-        let img = make_ext4(&dir, "exists.img");
-        std::fs::write(dir.join("host.txt"), b"x\n").unwrap();
-        let mut ops = DebugfsBackend::new(&tool_dir());
-        let mut log = quiet_log();
-        ops.run(
-            &img,
-            &["write host.txt hello.txt".to_owned()],
-            &dir,
-            &mut log,
-        )
-        .unwrap();
-        assert!(ops.path_exists(&img, "/hello.txt", &dir).unwrap());
-        assert!(ops.path_exists(&img, "/lost+found", &dir).unwrap());
-        assert!(!ops.path_exists(&img, "/nope.txt", &dir).unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn bad_magic_is_detected_by_text_not_exit_code() {
-        let dir = tmp("volte_ext4_badmagic");
-        let junk = dir.join("junk1m.img");
-        std::fs::write(&junk, vec![b'A'; 1024 * 1024]).unwrap();
-        let mut ops = DebugfsBackend::new(&tool_dir());
-        let mut log = quiet_log();
-        let err = ops
-            .run(&junk, &["ls -l /".to_owned()], &dir, &mut log)
-            .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::BadMagic);
-        let err = ops.path_exists(&junk, "/", &dir).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::BadMagic);
-
-        // A 1024-byte file only yields "short read"; debugfs exits 0 and the
-        // build is not refused, exactly like Python.
-        let short = dir.join("short.img");
-        std::fs::write(&short, vec![0u8; 1024]).unwrap();
-        let out = ops
-            .run(&short, &["ls -l /".to_owned()], &dir, &mut log)
-            .unwrap();
-        assert!(out.to_lowercase().contains("short read"), "{out}");
+    fn a_missing_e2fsck_executable_is_an_error() {
+        let dir = tmp("volte_ext4_fsck_missing");
+        let img = make_ext4(&dir, "clean.img");
+        let mut fsck = E2fsck {
+            exe: dir.join("no-such-e2fsck.exe"),
+        };
+        let err = fsck.check(&img, &dir).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert!(err.message().contains("e2fsck"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -406,18 +277,16 @@ mod tests {
         assert!(out.contains("Pass 5"), "{out}");
         assert!(out.contains("clean.img:"), "{out}");
 
-        // `write src /abs.txt` stores the leading slash in the name; e2fsck
-        // then reports an illegal name and exits 4 (measured).
-        std::fs::write(dir.join("host.txt"), b"x\n").unwrap();
-        let mut ops = DebugfsBackend::new(&tool_dir());
-        let mut log = quiet_log();
-        ops.run(&img, &["write host.txt /abs.txt".to_owned()], &dir, &mut log)
-            .unwrap();
+        // s_magic sits 56 bytes into the superblock at offset 1024; zeroing it
+        // makes e2fsck exit non-zero with the tail carrying the reason.
+        let mut bytes = std::fs::read(&img).unwrap();
+        bytes[1024 + 56..1024 + 58].fill(0);
+        std::fs::write(&img, &bytes).unwrap();
         let err = fsck.check(&img, &dir).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Build);
         assert!(err.message().starts_with("e2fsck rc="), "{}", err);
         assert!(
-            err.message().contains("WARNING: Filesystem still has errors"),
+            err.message().to_lowercase().contains("bad magic"),
             "{}",
             err
         );
@@ -428,10 +297,14 @@ mod tests {
     fn vendor_flag_bit_reads_the_dumped_build_prop() {
         let dir = tmp("volte_ext4_flagbit");
         let img = make_ext4(&dir, "flag.img");
-        let mut ops = DebugfsBackend::new(&tool_dir());
+        let mut ops = RustFsExt4Backend::new();
         assert_eq!(read_vendor_flag_bit(&img, &dir, &mut ops), 0);
 
-        std::fs::write(dir.join("build.prop"), b"ro.x=1\npersist.mtk.volte_support=1\n").unwrap();
+        std::fs::write(
+            dir.join("build.prop"),
+            b"ro.x=1\npersist.mtk.volte_support=1\n",
+        )
+        .unwrap();
         let mut log = quiet_log();
         ops.run(
             &img,

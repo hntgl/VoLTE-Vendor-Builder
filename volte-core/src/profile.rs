@@ -1,44 +1,36 @@
-//! Per-chip constants, ported verbatim from `hd_vendor_build.py:81-96`.
+//! Per-chip constants, ported from `hd_vendor_build.py:81-96`.
 //!
 //! The payload files themselves are never copied into this project; these are
 //! the names and search chains the CLI applies to the payload directories.
+//!
+//! Divergence of 2026-11-08: the primary `.rc` names (`config::RC_NAME_MTK`
+//! / `config::RC_NAME_QC`, and so the strings written to the vendor
+//! partition and the `import` lines below) dropped the `hd_` prefix
+//! Python used, becoming `oppo_mtk_volte.rc` / `oppo_qc_volte.rc`.
+//!
+//! Divergence of 2026-11-08 (follow-up): the `HD_`/`HA_`/`GAQ_` OEM fallback
+//! candidates (other teams' alternate names for the same payload files) were
+//! removed by request. `first_payload` now only ever finds the canonical
+//! name, so a payload file under one of those old OEM names alone will fail
+//! the build with "missing payload" instead of being auto-detected. The one
+//! fallback that remains, in `RC_QC_CANDIDATES` — `config::RC_NAME_MTK` — is
+//! not an OEM alias; it is this tool's own QC→MTK substitution for when only
+//! the MTK `.rc` is available, and was kept.
 
 use crate::config;
 
-pub const APK_MTK_CANDIDATES: [&str; 4] = [
-    config::APK_NAME,
-    "HD_OPPO_MTK_VoLTE_Overlay.apk",
-    "HA_OPPO_MTK_VoLTE_Overlay.apk",
-    "GAQ_OPPO_MTK_VoLTE_Overlay.apk",
-];
+pub const APK_MTK_CANDIDATES: [&str; 1] = [config::APK_NAME];
 
-pub const APK_QC_CANDIDATES: [&str; 6] = [
-    config::APK_NAME,
-    "HD_OPPO_QC_VoLTE_Overlay.apk",
-    "HA_OPPO_QC_VoLTE_Overlay.apk",
-    "HD_OPPO_MTK_VoLTE_Overlay.apk",
-    "HA_OPPO_MTK_VoLTE_Overlay.apk",
-    "GAQ_OPPO_MTK_VoLTE_Overlay.apk",
-];
+pub const APK_QC_CANDIDATES: [&str; 1] = [config::APK_NAME];
 
-pub const RC_MTK_CANDIDATES: [&str; 3] = [
-    config::RC_NAME_MTK,
-    "ha_oppo_mtk_volte.rc",
-    "gaq_oppo_mtk_volte.rc",
-];
+pub const RC_MTK_CANDIDATES: [&str; 1] = [config::RC_NAME_MTK];
 
-pub const RC_QC_CANDIDATES: [&str; 5] = [
-    config::RC_NAME_QC,
-    "ha_oppo_qc_volte.rc",
-    "gaq_oppo_qc_volte.rc",
-    config::RC_NAME_MTK,
-    "ha_oppo_mtk_volte.rc",
-];
+pub const RC_QC_CANDIDATES: [&str; 2] = [config::RC_NAME_QC, config::RC_NAME_MTK];
 
-pub const IMPORT_LINE: &str = "import /vendor/etc/init/hd_oppo_qc_volte.rc";
-pub const IMPORT_LINE_HW: &str = "import /vendor/etc/init/hw/hd_oppo_qc_volte.rc";
-pub const IMPORT_LINE_MTK: &str = "import /vendor/etc/init/hd_oppo_mtk_volte.rc";
-pub const IMPORT_LINE_MTK_HW: &str = "import /vendor/etc/init/hw/hd_oppo_mtk_volte.rc";
+pub const IMPORT_LINE: &str = "import /vendor/etc/init/oppo_qc_volte.rc";
+pub const IMPORT_LINE_HW: &str = "import /vendor/etc/init/hw/oppo_qc_volte.rc";
+pub const IMPORT_LINE_MTK: &str = "import /vendor/etc/init/oppo_mtk_volte.rc";
+pub const IMPORT_LINE_MTK_HW: &str = "import /vendor/etc/init/hw/oppo_mtk_volte.rc";
 
 /// `link_init_target` (`:965`): MTK first tries project/connectivity/sensor/
 /// SoC-specific files, then the shared tail.
@@ -116,35 +108,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn candidate_chains_match_python_order() {
+    fn candidate_chains_are_canonical_names_only() {
+        assert_eq!(APK_QC_CANDIDATES, ["OPPO_VoLTE_Overlay.apk"]);
+        assert_eq!(APK_MTK_CANDIDATES, ["OPPO_VoLTE_Overlay.apk"]);
+        assert_eq!(APK_MTK_CANDIDATES.len(), 1);
+        assert_eq!(RC_QC_CANDIDATES.len(), 2);
+        assert_eq!(RC_MTK_CANDIDATES.len(), 1);
+    }
+
+    #[test]
+    fn qc_rc_chain_falls_back_to_mtk_name() {
+        assert_eq!(RC_QC_CANDIDATES[0], config::RC_NAME_QC);
+        assert_eq!(RC_QC_CANDIDATES[1], config::RC_NAME_MTK);
+    }
+
+    #[test]
+    fn import_lines_match_the_renamed_rc_files() {
+        // Divergence of 2026-11-08: the shipped `.rc` names dropped the
+        // `hd_` prefix (`oppo_mtk_volte.rc` / `oppo_qc_volte.rc`), so these
+        // import lines no longer match the Python source verbatim.
+        assert_eq!(IMPORT_LINE, "import /vendor/etc/init/oppo_qc_volte.rc");
         assert_eq!(
-            APK_QC_CANDIDATES,
-            [
-                "OPPO_VoLTE_Overlay.apk",
-                "HD_OPPO_QC_VoLTE_Overlay.apk",
-                "HA_OPPO_QC_VoLTE_Overlay.apk",
-                "HD_OPPO_MTK_VoLTE_Overlay.apk",
-                "HA_OPPO_MTK_VoLTE_Overlay.apk",
-                "GAQ_OPPO_MTK_VoLTE_Overlay.apk",
-            ]
+            IMPORT_LINE_HW,
+            "import /vendor/etc/init/hw/oppo_qc_volte.rc"
         );
-        assert_eq!(APK_MTK_CANDIDATES.len(), 4);
-        assert_eq!(RC_QC_CANDIDATES.len(), 5);
-        assert_eq!(RC_MTK_CANDIDATES.len(), 3);
-    }
-
-    #[test]
-    fn qc_rc_chain_falls_back_to_mtk_names() {
-        assert_eq!(RC_QC_CANDIDATES[3], config::RC_NAME_MTK);
-        assert_eq!(RC_QC_CANDIDATES[4], "ha_oppo_mtk_volte.rc");
-    }
-
-    #[test]
-    fn import_lines_are_the_python_constants() {
-        assert_eq!(IMPORT_LINE, "import /vendor/etc/init/hd_oppo_qc_volte.rc");
-        assert_eq!(IMPORT_LINE_HW, "import /vendor/etc/init/hw/hd_oppo_qc_volte.rc");
-        assert_eq!(IMPORT_LINE_MTK, "import /vendor/etc/init/hd_oppo_mtk_volte.rc");
-        assert_eq!(IMPORT_LINE_MTK_HW, "import /vendor/etc/init/hw/hd_oppo_mtk_volte.rc");
+        assert_eq!(IMPORT_LINE_MTK, "import /vendor/etc/init/oppo_mtk_volte.rc");
+        assert_eq!(
+            IMPORT_LINE_MTK_HW,
+            "import /vendor/etc/init/hw/oppo_mtk_volte.rc"
+        );
     }
 
     #[test]
@@ -160,9 +152,9 @@ mod tests {
     fn selector_helpers_follow_the_branch() {
         assert_eq!(apk_name(true), "OPPO_VoLTE_Overlay.apk");
         assert_eq!(apk_name(false), "OPPO_VoLTE_Overlay.apk");
-        assert_eq!(rc_name(true), "hd_oppo_qc_volte.rc");
-        assert_eq!(rc_name(false), "hd_oppo_mtk_volte.rc");
-        assert_eq!(apk_candidates(true).len(), 6);
-        assert_eq!(rc_candidates(false).len(), 3);
+        assert_eq!(rc_name(true), "oppo_qc_volte.rc");
+        assert_eq!(rc_name(false), "oppo_mtk_volte.rc");
+        assert_eq!(apk_candidates(true).len(), 1);
+        assert_eq!(rc_candidates(false).len(), 1);
     }
 }
