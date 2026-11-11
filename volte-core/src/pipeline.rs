@@ -622,7 +622,14 @@ pub fn run(
         log.log("[STEP] Source image has no AVB footer - skipping AVB (no footer added).");
         "SKIP"
     } else {
-        log.log("[STATUS] Generating hashtree for the image (FEC disabled)...");
+        if avb_info.fec_roots > 0 {
+            log.log(format!(
+                "[STATUS] Generating hashtree and FEC parity for the image (roots={})...",
+                avb_info.fec_roots
+            ));
+        } else {
+            log.log("[STATUS] Generating hashtree for the image (FEC disabled)...");
+        }
         let avb_reason = match avb::rebuild_hashtree(&work, &avb_info, orig_sz, deps.avb, log) {
             Ok(Some(_)) => None,
             Ok(None) => Some("the rebuilt hashtree grew past the slot".to_string()),
@@ -2287,6 +2294,12 @@ mod tests {
         );
         assert_eq!(avb.calls, 1, "the FEC image must reach the AVB backend");
         assert_eq!(avb.roots, vec![2], "the rebuild must keep FEC roots");
+        let text = lines.borrow().join("\n");
+        assert!(
+            text.contains("[STATUS] Generating hashtree and FEC parity for the image (roots=2)..."),
+            "{text}"
+        );
+        assert!(!text.contains("FEC disabled"), "{text}");
         assert_eq!(fsck.calls, 1, "e2fsck still runs before the AVB step");
         assert_eq!(
             crate::sha256::file_hex_upper(&src).unwrap(),
