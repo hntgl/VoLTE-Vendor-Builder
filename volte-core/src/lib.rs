@@ -11,6 +11,7 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod ext4_tools;
+pub mod fec;
 pub mod flags;
 pub mod init_rc;
 pub mod logging;
