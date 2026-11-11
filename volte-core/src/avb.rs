@@ -61,6 +61,10 @@ pub struct AvbInfo {
     pub signature_algorithm: String,
     pub salt: String,
     pub fec_roots: u32,
+    /// `AvbHashtreeDescriptor.fec_offset` (absolute start of the parity).
+    pub fec_offset: u64,
+    /// `AvbHashtreeDescriptor.fec_size` (parity bytes, no standalone header).
+    pub fec_size: u64,
     /// `AvbVBMetaImageHeader.rollback_index` (offset 112).
     pub rollback_index: u64,
     /// `AvbVBMetaImageHeader.rollback_index_location` (offset 124).
@@ -105,6 +109,8 @@ impl AvbInfo {
             signature_algorithm: "NONE".to_string(),
             salt: String::new(),
             fec_roots: 0,
+            fec_offset: 0,
+            fec_size: 0,
             rollback_index: 0,
             rollback_index_location: 0,
             hashtree_flags: 0,
@@ -216,6 +222,12 @@ fn fill_from_vbmeta(path: &Path, footer: &AvbFooter) -> Result<AvbInfo> {
     if let Some(roots) = meta.fec_roots {
         info.fec_roots = roots;
     }
+    if let Some(offset) = meta.fec_offset {
+        info.fec_offset = offset;
+    }
+    if let Some(size) = meta.fec_size {
+        info.fec_size = size;
+    }
     info.rollback_index = meta.rollback_index;
     info.rollback_index_location = meta.rollback_index_location;
     if let Some(flags) = meta.hashtree_flags {
@@ -241,6 +253,18 @@ fn fill_from_vbmeta(path: &Path, footer: &AvbFooter) -> Result<AvbInfo> {
     info.unsupported_descriptor_tags = meta.unsupported_tags;
     info.has_chain_descriptor = meta.has_chain_descriptor;
     info.descriptor_kind = meta.descriptor_kind;
+    if info.fec_roots > 0 {
+        let end = info
+            .fec_offset
+            .checked_add(info.fec_size)
+            .ok_or_else(|| Error::build("AVB FEC region end overflows"))?;
+        if end > info.partition_size {
+            return Err(Error::build(format!(
+                "AVB FEC region [{}..{}) does not fit the {}-byte partition",
+                info.fec_offset, end, info.partition_size
+            )));
+        }
+    }
     Ok(info)
 }
 
@@ -270,6 +294,8 @@ struct VbmetaMeta {
     signature_algorithm: String,
     salt: Option<String>,
     fec_roots: Option<u32>,
+    fec_offset: Option<u64>,
+    fec_size: Option<u64>,
     rollback_index: u64,
     rollback_index_location: u32,
     hashtree_flags: Option<u32>,
@@ -451,6 +477,80 @@ fn parse_vbmeta(vb: &[u8]) -> std::result::Result<VbmetaMeta, String> {
     Ok(meta)
 }
 
+/// Fails closed on the FEC fields of the descriptor that names the image
+/// partition. AOSP never validates these relations, so a descriptor that
+/// passes libavb can still point dm-verity at the wrong bytes.
+#[allow(clippy::too_many_arguments)]
+fn check_fec_layout(
+    pos: usize,
+    image_size: u64,
+    tree_offset: u64,
+    tree_size: u64,
+    data_block_size: u32,
+    hash_block_size: u32,
+    fec_roots: u32,
+    fec_offset: u64,
+    fec_size: u64,
+) -> std::result::Result<(), String> {
+    if fec_roots == 0 {
+        if fec_offset != 0 || fec_size != 0 {
+            return Err(format!(
+                "hashtree descriptor at {pos} declares no FEC roots but fec_offset={fec_offset}, fec_size={fec_size}"
+            ));
+        }
+        return Ok(());
+    }
+    crate::fec::check_roots(fec_roots)
+        .map_err(|e| format!("hashtree descriptor at {pos}: {}", e.message()))?;
+    if fec_offset == 0 || fec_size == 0 {
+        return Err(format!(
+            "hashtree descriptor at {pos} declares FEC roots={fec_roots} but fec_offset={fec_offset}, fec_size={fec_size}"
+        ));
+    }
+    if tree_offset != image_size {
+        return Err(format!(
+            "hashtree descriptor at {pos} puts the tree at {tree_offset} but covers {image_size} bytes of data"
+        ));
+    }
+    if data_block_size != hash_block_size {
+        return Err(format!(
+            "hashtree descriptor at {pos} has different data/hash block sizes ({data_block_size} / {hash_block_size})"
+        ));
+    }
+    let block = u64::from(data_block_size);
+    if block != BLOCK {
+        return Err(format!(
+            "hashtree descriptor at {pos} uses {block}-byte blocks; FEC only supports {BLOCK}"
+        ));
+    }
+    if !fec_offset.is_multiple_of(block) {
+        return Err(format!(
+            "hashtree descriptor at {pos} has an unaligned FEC offset {fec_offset}"
+        ));
+    }
+    if !fec_size.is_multiple_of(block) {
+        return Err(format!(
+            "hashtree descriptor at {pos} has an unaligned FEC size {fec_size}"
+        ));
+    }
+    let tree_end = tree_offset
+        .checked_add(tree_size)
+        .ok_or_else(|| format!("hashtree descriptor at {pos} tree end overflows"))?;
+    if fec_offset != tree_end {
+        return Err(format!(
+            "hashtree descriptor at {pos} puts FEC at {fec_offset} instead of {tree_end} (right after the tree)"
+        ));
+    }
+    let expected = crate::fec::parity_size(fec_offset, fec_roots)
+        .map_err(|e| format!("hashtree descriptor at {pos}: {}", e.message()))?;
+    if fec_size != expected {
+        return Err(format!(
+            "hashtree descriptor at {pos} declares {fec_size} FEC bytes but {expected} are implied by the covered area and roots={fec_roots}"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_hashtree(
     body: &[u8],
     pos: usize,
@@ -469,6 +569,8 @@ fn parse_hashtree(
     let data_block_size = be_u32(&body[44..48]);
     let hash_block_size = be_u32(&body[48..52]);
     let fec_roots = be_u32(&body[52..56]);
+    let fec_offset = be_u64(&body[56..64]);
+    let fec_size = be_u64(&body[64..72]);
     let algorithm = fixed_string(&body[72..104], "hash algorithm")?;
     let name_len = be_u32(&body[104..108]) as usize;
     let salt_len = be_u32(&body[108..112]) as usize;
@@ -533,7 +635,20 @@ fn parse_hashtree(
     if select_image_partition(meta, name) {
         merge_hash_fields(meta, algorithm, hex_lower(salt));
         if meta.fec_roots.is_none() {
+            check_fec_layout(
+                pos,
+                image_size,
+                tree_offset,
+                tree_size,
+                data_block_size,
+                hash_block_size,
+                fec_roots,
+                fec_offset,
+                fec_size,
+            )?;
             meta.fec_roots = Some(fec_roots);
+            meta.fec_offset = Some(fec_offset);
+            meta.fec_size = Some(fec_size);
         }
         if meta.hashtree_flags.is_none() {
             meta.hashtree_flags = Some(flags);
@@ -775,6 +890,8 @@ pub struct HashtreeRequest {
     pub partition_name: String,
     pub hash_algorithm: String,
     pub salt: String,
+    /// `fec_num_roots` to rebuild with; `0` means no FEC.
+    pub fec_roots: u32,
     pub props: Vec<(String, String)>,
     pub rollback_index: u64,
     pub rollback_index_location: u32,
@@ -810,10 +927,15 @@ impl HashtreeRequest {
             self.rollback_index_location.to_string(),
             "--flags".to_string(),
             self.hashtree_flags.to_string(),
-            "--do_not_generate_fec".to_string(),
-            "--fec_num_roots".to_string(),
-            "2".to_string(),
         ];
+        if self.fec_roots == 0 {
+            args.push("--do_not_generate_fec".to_string());
+            args.push("--fec_num_roots".to_string());
+            args.push("2".to_string());
+        } else {
+            args.push("--fec_num_roots".to_string());
+            args.push(self.fec_roots.to_string());
+        }
         for (k, v) in &self.props {
             args.push("--prop".to_string());
             args.push(format!("{k}:{v}"));
@@ -1044,6 +1166,9 @@ fn encode_hashtree_descriptor(
     algorithm: &str,
     root: &[u8],
     flags: u32,
+    fec_roots: u32,
+    fec_offset: u64,
+    fec_size: u64,
 ) -> Vec<u8> {
     let name = partition_name.as_bytes();
     let total = round8(HASHTREE_DESCRIPTOR_LEN + name.len() + salt.len() + root.len());
@@ -1056,9 +1181,9 @@ fn encode_hashtree_descriptor(
     out.extend_from_slice(&tree_size.to_be_bytes());
     out.extend_from_slice(&(BLOCK as u32).to_be_bytes()); // data block size
     out.extend_from_slice(&(BLOCK as u32).to_be_bytes()); // hash block size
-    out.extend_from_slice(&0u32.to_be_bytes()); // fec_num_roots
-    out.extend_from_slice(&0u64.to_be_bytes()); // fec_offset
-    out.extend_from_slice(&0u64.to_be_bytes()); // fec_size
+    out.extend_from_slice(&fec_roots.to_be_bytes()); // fec_num_roots
+    out.extend_from_slice(&fec_offset.to_be_bytes()); // fec_offset
+    out.extend_from_slice(&fec_size.to_be_bytes()); // fec_size
     let mut algorithm_field = [0u8; 32];
     algorithm_field[..algorithm.len()].copy_from_slice(algorithm.as_bytes());
     out.extend_from_slice(&algorithm_field);
@@ -1171,8 +1296,20 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
         )));
     }
     let rounded = original.div_ceil(BLOCK) * BLOCK;
+    let fec_roots = req.fec_roots;
+    if fec_roots > 0 {
+        crate::fec::check_roots(fec_roots)?;
+    }
+    // avbtool reserves the worst-case FEC for the whole partition, not the
+    // parity the current image will actually use.
+    let max_fec_size = if fec_roots > 0 {
+        crate::fec::parity_size(partition_size, fec_roots)?
+    } else {
+        0
+    };
     let max_image_size = partition_size
         .checked_sub(tree_size(partition_size))
+        .and_then(|n| n.checked_sub(max_fec_size))
         .and_then(|n| n.checked_sub(MAX_VBMETA))
         .and_then(|n| n.checked_sub(FOOTER_BLOCK))
         .ok_or_else(|| {
@@ -1191,6 +1328,22 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
 
     let (root, tree) = build_merkle(&mut f, original, rounded, &salt, kind)?;
     let tree_len = tree.len() as u64;
+    if !tree_len.is_multiple_of(BLOCK) {
+        return Err(Error::build(format!(
+            "AVB hashtree is {tree_len} bytes, not a multiple of the {BLOCK}-byte block"
+        )));
+    }
+    let tree_end = rounded
+        .checked_add(tree_len)
+        .ok_or_else(|| Error::build("AVB FEC offset overflows"))?;
+    let (fec_offset, fec_size) = if fec_roots > 0 {
+        (
+            tree_end,
+            crate::fec::parity_size(tree_end, fec_roots)?,
+        )
+    } else {
+        (0, 0)
+    };
 
     let encoded_root: &[u8] = if req.persistent_digest { &[] } else { &root };
     let mut descriptors = encode_hashtree_descriptor(
@@ -1201,6 +1354,9 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
         kind.name(),
         encoded_root,
         req.hashtree_flags,
+        fec_roots,
+        fec_offset,
+        fec_size,
     );
     for (key, value) in &req.props {
         descriptors.extend_from_slice(&encode_property(key, value));
@@ -1216,8 +1372,8 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
             vbmeta.len()
         )));
     }
-    let vbmeta_offset = rounded
-        .checked_add(tree_len)
+    let vbmeta_offset = tree_end
+        .checked_add(fec_size)
         .ok_or_else(|| Error::build("AVB vbmeta offset overflows"))?;
     let vbmeta_padded = round_block(vbmeta.len() as u64);
     let end = vbmeta_offset
@@ -1234,6 +1390,11 @@ fn native_add_hashtree_footer(req: &HashtreeRequest) -> Result<()> {
     f.seek(SeekFrom::End(0))?;
     write_zeros(&mut f, rounded - original)?;
     f.write_all(&tree)?;
+    if fec_roots > 0 {
+        let parity = crate::fec::generate_parity_from(&mut f, fec_offset, fec_roots)?;
+        f.seek(SeekFrom::Start(fec_offset))?;
+        f.write_all(&parity)?;
+    }
     f.write_all(&vbmeta)?;
     write_zeros(&mut f, vbmeta_padded - vbmeta.len() as u64)?;
     write_zeros(&mut f, partition_size - end)?;
@@ -1309,6 +1470,7 @@ pub fn rebuild_hashtree(
             info.hash_algorithm.clone()
         },
         salt,
+        fec_roots: info.fec_roots,
         props: info.props.clone(),
         rollback_index: info.rollback_index,
         rollback_index_location: info.rollback_index_location,
@@ -1375,6 +1537,33 @@ pub fn rebuild_hashtree(
             ))
         }
         Err(e) => return Err(restore_tail_or_report(image, boundary, &tail_bytes, e)),
+    }
+    if after.fec_roots != req.fec_roots {
+        return Err(restore_tail_or_report(
+            image,
+            boundary,
+            &tail_bytes,
+            Error::build(format!(
+                "AVB backend rebuilt with fec_roots={} but the image declares fec_roots={}",
+                req.fec_roots, after.fec_roots
+            )),
+        ));
+    }
+    if after.fec_roots > 0 {
+        match crate::fec::verify_parity(image, after.fec_offset, after.fec_size, after.fec_roots) {
+            Ok(true) => log.log("[OK] AVB verifier: FEC parity matches the data and hashtree."),
+            Ok(false) => {
+                return Err(restore_tail_or_report(
+                    image,
+                    boundary,
+                    &tail_bytes,
+                    Error::build(
+                        "AVB verifier: the rebuilt FEC parity does not match the data and hashtree on disk",
+                    ),
+                ))
+            }
+            Err(e) => return Err(restore_tail_or_report(image, boundary, &tail_bytes, e)),
+        }
     }
     if lock > 0 && cur < lock {
         if let Err(e) = force_slot_size(image, lock, false, "AVB-PAD", log) {
@@ -1724,6 +1913,7 @@ mod tests {
             partition_name: "vendor".to_string(),
             hash_algorithm: "sha256".to_string(),
             salt: "aabb".to_string(),
+            fec_roots: 0,
             props: vec![("k".to_string(), "v".to_string())],
             rollback_index: 7,
             rollback_index_location: 3,
@@ -1800,6 +1990,9 @@ mod tests {
                 &salt,
                 "sha256",
                 &root,
+                0,
+                0,
+                0,
                 0,
             );
             descriptors
@@ -2091,9 +2284,17 @@ mod tests {
         d[0..8].copy_from_slice(&1u64.to_be_bytes());
         d[16..20].copy_from_slice(&1u32.to_be_bytes()); // dm_verity_version
         d[20..28].copy_from_slice(&image_size.to_be_bytes());
+        d[28..36].copy_from_slice(&image_size.to_be_bytes()); // tree_offset
+        d[36..44].copy_from_slice(&0u64.to_be_bytes()); // tree_size
         d[44..48].copy_from_slice(&4096u32.to_be_bytes()); // data_block_size
         d[48..52].copy_from_slice(&4096u32.to_be_bytes()); // hash_block_size
         d[52..56].copy_from_slice(&fec_roots.to_be_bytes());
+        if fec_roots > 0 {
+            d[56..64].copy_from_slice(&image_size.to_be_bytes()); // fec_offset
+            let fec_size =
+                crate::fec::parity_size(image_size, fec_roots).expect("fixture roots are tested");
+            d[64..72].copy_from_slice(&fec_size.to_be_bytes());
+        }
         let alg = algorithm.as_bytes();
         assert!(alg.len() < 32, "hash_algorithm must fit in char[32]");
         d[72..72 + alg.len()].copy_from_slice(alg);
@@ -2106,6 +2307,32 @@ mod tests {
         let nbf = a2_pad8(d.len() - 16);
         d[8..16].copy_from_slice(&(nbf as u64).to_be_bytes());
         d.resize(16 + nbf, 0);
+        d
+    }
+
+    /// A hashtree descriptor with explicit FEC fields, for the fail-closed
+    /// geometry tests.
+    fn a2_hashtree_with_fec(
+        image_size: u64,
+        tree_offset: u64,
+        tree_size: u64,
+        roots: u32,
+        fec_offset: u64,
+        fec_size: u64,
+    ) -> Vec<u8> {
+        let mut d = a2_hashtree_descriptor(
+            image_size,
+            "sha256",
+            "vendor",
+            &[0x11, 0x22, 0x33, 0x44],
+            &[0x55; 32],
+            0,
+        );
+        d[28..36].copy_from_slice(&tree_offset.to_be_bytes());
+        d[36..44].copy_from_slice(&tree_size.to_be_bytes());
+        d[52..56].copy_from_slice(&roots.to_be_bytes());
+        d[56..64].copy_from_slice(&fec_offset.to_be_bytes());
+        d[64..72].copy_from_slice(&fec_size.to_be_bytes());
         d
     }
 
@@ -2314,7 +2541,7 @@ mod tests {
                 "vendor",
                 &[0xde, 0xad, 0xbe, 0xef],
                 &[0x77; 32],
-                1,
+                2,
             ),
         ]);
         let p = a2_image_with_vbmeta(&dir, &vb);
@@ -2322,7 +2549,7 @@ mod tests {
         assert_eq!(info.partition_name, "vendor");
         assert_eq!(info.hash_algorithm, "sha256");
         assert_eq!(info.salt, "deadbeef");
-        assert_eq!(info.fec_roots, 1);
+        assert_eq!(info.fec_roots, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2383,7 +2610,7 @@ mod tests {
                 "vendor_dlkm",
                 &[0x11, 0x22, 0x33, 0x44],
                 &[0x55; 32],
-                4,
+                2,
             ),
         ]);
         let p = a2_image_with_vbmeta(&dir, &vb);
@@ -2393,6 +2620,216 @@ mod tests {
             info.fec_roots, 0,
             "FEC from another partition must be ignored"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_parse_keeps_fec_offset_and_size() {
+        let dir = tmp("volte_avb_a2_fec_fields");
+        let image_size = 1024 * 1024;
+        let tree_size = 4096;
+        let fec_offset = image_size + tree_size;
+        let fec_size = crate::fec::parity_size(fec_offset, 2).unwrap();
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            image_size,
+            image_size,
+            tree_size,
+            2,
+            fec_offset,
+            fec_size,
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let info = avb_info_fast(&p).unwrap();
+        assert_eq!(info.fec_roots, 2);
+        assert_eq!(info.fec_offset, fec_offset);
+        assert_eq!(info.fec_size, fec_size);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_without_offsets_is_rejected() {
+        let dir = tmp("volte_avb_a2_fec_zero");
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            1024 * 1024,
+            1024 * 1024,
+            0,
+            2,
+            0,
+            0,
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("fec_offset=0"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_zero_roots_with_fec_offsets_is_rejected() {
+        let dir = tmp("volte_avb_a2_fec_inconsistent");
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            1024 * 1024,
+            1024 * 1024,
+            0,
+            0,
+            1024 * 1024,
+            0,
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("declares no FEC roots"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_tree_offset_must_equal_image_size() {
+        let dir = tmp("volte_avb_a2_fec_gap");
+        let size = 1024 * 1024;
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            size,
+            size + 4096,
+            0,
+            2,
+            size + 4096,
+            crate::fec::parity_size(size + 4096, 2).unwrap(),
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("covers"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_must_follow_the_tree() {
+        let dir = tmp("volte_avb_a2_fec_adjacency");
+        let size = 1024 * 1024;
+        let tree_size = 4096;
+        let fec_offset = size + 8192; // skips one block after the tree
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            size,
+            size,
+            tree_size,
+            2,
+            fec_offset,
+            crate::fec::parity_size(fec_offset, 2).unwrap(),
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("right after the tree"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_size_must_match_the_implied_parity() {
+        let dir = tmp("volte_avb_a2_fec_size");
+        let size = 1024 * 1024;
+        let fec_offset = size + 4096;
+        let implied = crate::fec::parity_size(fec_offset, 2).unwrap();
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            size,
+            size,
+            4096,
+            2,
+            fec_offset,
+            implied + 4096,
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("are implied"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_rejects_mixed_block_sizes() {
+        let dir = tmp("volte_avb_a2_fec_blocks");
+        let mut d = a2_hashtree_with_fec(
+            1024 * 1024,
+            1024 * 1024,
+            0,
+            2,
+            1024 * 1024,
+            crate::fec::parity_size(1024 * 1024, 2).unwrap(),
+        );
+        d[48..52].copy_from_slice(&8192u32.to_be_bytes()); // hash_block_size
+        let vb = a2_vbmeta_with(&[d]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("different data/hash block sizes"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_rejects_non_4096_blocks() {
+        let dir = tmp("volte_avb_a2_fec_block_size");
+        let mut d = a2_hashtree_with_fec(
+            1024 * 1024,
+            1024 * 1024,
+            0,
+            2,
+            1024 * 1024,
+            crate::fec::parity_size(1024 * 1024, 2).unwrap(),
+        );
+        d[44..48].copy_from_slice(&8192u32.to_be_bytes());
+        d[48..52].copy_from_slice(&8192u32.to_be_bytes());
+        let vb = a2_vbmeta_with(&[d]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("FEC only supports 4096"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_rejects_untested_roots() {
+        let dir = tmp("volte_avb_a2_fec_roots");
+        let size = 1024 * 1024;
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            size,
+            size,
+            0,
+            4,
+            size,
+            size, // rejected on roots before the size relation is checked
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("roots=4"), "{err}");
+        assert!(err.message().contains("not supported"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_tree_end_overflow_is_rejected() {
+        let dir = tmp("volte_avb_a2_fec_overflow");
+        let image_size = u64::MAX - 4095; // multiple of the 4096-byte block
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            image_size,
+            image_size,
+            8192,
+            2,
+            4096,
+            4096,
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("overflows"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a2_fec_must_fit_the_partition_slot() {
+        let dir = tmp("volte_avb_a2_fec_slot");
+        let size = 2 * 1024 * 1024; // the whole 2 MiB fixture file
+        let fec_offset = size + 4096;
+        let vb = a2_vbmeta_with(&[a2_hashtree_with_fec(
+            size,
+            size,
+            4096,
+            2,
+            fec_offset,
+            crate::fec::parity_size(fec_offset, 2).unwrap(),
+        )]);
+        let p = a2_image_with_vbmeta(&dir, &vb);
+        let err = avb_info_fast(&p).unwrap_err();
+        assert!(err.message().contains("does not fit"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2466,7 +2903,9 @@ mod tests {
 
     #[test]
     fn encode_vbmeta_round_trips_the_rollback_fields() {
-        let d = encode_hashtree_descriptor(4096, 0, "vendor", &[0x11], "sha256", &[0x22; 32], 0);
+        let d = encode_hashtree_descriptor(
+            4096, 0, "vendor", &[0x11], "sha256", &[0x22; 32], 0, 0, 0, 0,
+        );
         let vb = encode_vbmeta(&d, 42, 7);
         let meta = parse_vbmeta(&vb).unwrap();
         assert_eq!(meta.rollback_index, 42);
@@ -2608,6 +3047,7 @@ mod tests {
             partition_name: "vendor".to_string(),
             hash_algorithm: "sha256".to_string(),
             salt: NATIVE_SALT.to_string(),
+            fec_roots: 0,
             props: Vec::new(),
             rollback_index: 0,
             rollback_index_location: 0,
@@ -2647,7 +3087,18 @@ mod tests {
         let root = decode_salt("ed31474c9a630faa3981531d8b443d325734e82b7e4a360ac60d1b4b416ad0ca")
             .unwrap();
         let mut descriptors =
-            encode_hashtree_descriptor(1024 * 1024, 12288, "vendor", &salt, "sha256", &root, 0);
+            encode_hashtree_descriptor(
+                1024 * 1024,
+                12288,
+                "vendor",
+                &salt,
+                "sha256",
+                &root,
+                0,
+                0,
+                0,
+                0,
+            );
         descriptors.extend_from_slice(&encode_property("com.android.build.vendor", "v2"));
         descriptors.extend_from_slice(&encode_property("com.android.build.vendor.extra", "hello"));
         let vbmeta = encode_vbmeta(&descriptors, 0, 0);
@@ -2740,6 +3191,102 @@ mod tests {
         drop(f);
 
         assert!(!verify_hashtree_integrity(&p, &info).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_fec_layout_round_trips_and_survives_a_rebuild() {
+        let dir = tmp("volte_avb_native_fec");
+        let p = pattern_image(&dir, "vendor.img", 4 * 1024 * 1024);
+        let mut req = native_request(&p, 8 * 1024 * 1024);
+        req.fec_roots = 2;
+        let mut backend = NativeAvb;
+        backend.add_hashtree_footer(&req).unwrap();
+
+        let info = native_footer(&p);
+        // 4 MiB of data has 36864 bytes of tree; 1033 blocks then need
+        // ceil(1033 / 253) = 5 rounds and 5 * 2 * 4096 parity bytes.
+        assert_eq!(info.fec_roots, 2);
+        assert_eq!(info.fec_offset, 4 * 1024 * 1024 + 36864);
+        assert_eq!(info.fec_size, 40960);
+        assert!(verify_hashtree_integrity(&p, &info).unwrap());
+        assert!(
+            crate::fec::verify_parity(&p, info.fec_offset, info.fec_size, 2).unwrap(),
+            "the native parity must describe the written data and tree"
+        );
+
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let after = rebuild_hashtree(&p, &info, 0, &mut backend, &mut log)
+            .unwrap()
+            .expect("a rebuild with FEC must keep the footer");
+        assert_eq!(after.fec_roots, 2);
+        assert_eq!(after.fec_offset, info.fec_offset);
+        assert_eq!(after.fec_size, info.fec_size);
+        assert!(crate::fec::verify_parity(&p, after.fec_offset, after.fec_size, 2).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_fec_rejects_untested_roots_before_writing() {
+        let dir = tmp("volte_avb_native_fec_roots");
+        let p = pattern_image(&dir, "vendor.img", 1024 * 1024);
+        let before = std::fs::read(&p).unwrap();
+        let mut req = native_request(&p, 2 * 1024 * 1024);
+        req.fec_roots = 4;
+        let err = NativeAvb.add_hashtree_footer(&req).unwrap_err();
+        assert!(err.message().contains("roots=4"), "{err}");
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_fec_layout_must_fit_the_partition() {
+        let dir = tmp("volte_avb_native_fec_slot");
+        let p = pattern_image(&dir, "vendor.img", 4 * 1024 * 1024);
+        let mut req = native_request(&p, 4 * 1024 * 1024);
+        req.fec_roots = 2;
+        let err = NativeAvb.add_hashtree_footer(&req).unwrap_err();
+        assert!(err.message().contains("exceeds maximum image size"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct FecTamperingBackend;
+
+    impl Avb for FecTamperingBackend {
+        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+            NativeAvb.add_hashtree_footer(req)?;
+            let info = avb_info_fast(&req.image)?;
+            let mut f = OpenOptions::new().read(true).write(true).open(&req.image)?;
+            f.seek(SeekFrom::Start(info.fec_offset))?;
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte)?;
+            f.seek(SeekFrom::Start(info.fec_offset))?;
+            f.write_all(&[byte[0] ^ 0x01])?;
+            f.sync_all()?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_mismatched_fec_parity_aborts_the_rebuild() {
+        let dir = tmp("volte_avb_verifier_fec_tamper");
+        let p = plain_image(&dir, 1024 * 1024);
+        let mut req = native_request(&p, 2 * 1024 * 1024);
+        req.fec_roots = 2;
+        let mut native = NativeAvb;
+        native.add_hashtree_footer(&req).unwrap();
+        let info = native_footer(&p);
+        let before = std::fs::read(&p).unwrap();
+
+        let mut backend = FecTamperingBackend;
+        let mut log = Logger::new().with_sink(Vec::<String>::new());
+        let err = rebuild_hashtree(&p, &info, 0, &mut backend, &mut log).unwrap_err();
+        assert!(err.message().contains("FEC parity"), "{err}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            before,
+            "a parity mismatch must restore the original tail"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3167,6 +3714,7 @@ mod tests {
             partition_name: info.partition_name.clone(),
             hash_algorithm: info.hash_algorithm.clone(),
             salt: info.salt.clone(),
+            fec_roots: info.fec_roots,
             props: info.props.clone(),
             rollback_index: info.rollback_index,
             rollback_index_location: info.rollback_index_location,

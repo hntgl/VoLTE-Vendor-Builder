@@ -426,14 +426,6 @@ pub fn run(
              produce a hashtree descriptor (Tag 1), so the format would change - refusing to rebuild",
         ));
     }
-    if avb_info.fec_roots > 0 {
-        return Err(Error::build(format!(
-            "input image has FEC (fec_roots={}) but the rebuild always runs with \
-             --do_not_generate_fec; dropping FEC would change the verified-boot metadata - \
-             refusing to rebuild",
-            avb_info.fec_roots
-        )));
-    }
     if avb_info.has_footer
         && (avb_info.data_block_size != config::BLOCK as u32
             || avb_info.hash_block_size != config::BLOCK as u32)
@@ -813,9 +805,15 @@ mod tests {
         d[0..8].copy_from_slice(&1u64.to_be_bytes());
         d[16..20].copy_from_slice(&1u32.to_be_bytes());
         d[20..28].copy_from_slice(&4096u64.to_be_bytes());
+        d[28..36].copy_from_slice(&4096u64.to_be_bytes()); // tree_offset
         d[44..48].copy_from_slice(&4096u32.to_be_bytes());
         d[48..52].copy_from_slice(&4096u32.to_be_bytes());
         d[52..56].copy_from_slice(&fec_roots.to_be_bytes());
+        if fec_roots > 0 {
+            d[56..64].copy_from_slice(&4096u64.to_be_bytes()); // fec_offset
+            let fec_size = crate::fec::parity_size(4096, fec_roots).unwrap();
+            d[64..72].copy_from_slice(&fec_size.to_be_bytes());
+        }
         d[72..78].copy_from_slice(b"sha256");
         d[104..108].copy_from_slice(&(name.len() as u32).to_be_bytes());
         d[108..112].copy_from_slice(&(salt.len() as u32).to_be_bytes());
@@ -840,9 +838,15 @@ mod tests {
         d[0..8].copy_from_slice(&1u64.to_be_bytes());
         d[16..20].copy_from_slice(&1u32.to_be_bytes());
         d[20..28].copy_from_slice(&image_size.to_be_bytes());
+        d[28..36].copy_from_slice(&image_size.to_be_bytes()); // tree_offset
         d[44..48].copy_from_slice(&4096u32.to_be_bytes());
         d[48..52].copy_from_slice(&4096u32.to_be_bytes());
         d[52..56].copy_from_slice(&fec_roots.to_be_bytes());
+        if fec_roots > 0 {
+            d[56..64].copy_from_slice(&image_size.to_be_bytes()); // fec_offset
+            let fec_size = crate::fec::parity_size(image_size, fec_roots).unwrap();
+            d[64..72].copy_from_slice(&fec_size.to_be_bytes());
+        }
         d[72..78].copy_from_slice(b"sha256");
         d[104..108].copy_from_slice(&(name.len() as u32).to_be_bytes());
         d[108..112].copy_from_slice(&(salt.len() as u32).to_be_bytes());
@@ -1002,6 +1006,19 @@ mod tests {
                 );
             }
             write_avb_tail(&req.image, req.partition_size, &req.partition_name, 0)
+        }
+    }
+
+    struct RecordingAvb {
+        calls: usize,
+        roots: Vec<u32>,
+    }
+
+    impl avb::Avb for RecordingAvb {
+        fn add_hashtree_footer(&mut self, req: &HashtreeRequest) -> Result<()> {
+            self.calls += 1;
+            self.roots.push(req.fec_roots);
+            Err(Error::build("simulated stop after recording the request"))
         }
     }
 
@@ -2231,16 +2248,20 @@ mod tests {
     }
 
     #[test]
-    fn an_image_with_fec_is_refused() {
+    fn an_image_with_fec_reaches_the_backend_with_its_roots() {
         let dir = tmp("volte_pipeline_fec");
         let src = make_ext4_with_slack(&dir, "vendor.img");
         attach_avb_footer(&src, &[hashtree_descriptor("vendor", 2)]);
+        let src_sha = crate::sha256::file_hex_upper(&src).unwrap();
         seed_payloads(&dir);
         let logs = dir.join("Logs");
 
         let mut ops = RustFsExt4Backend::new();
         let mut fsck = PassingFsck { calls: 0 };
-        let mut avb = FooterAvb { calls: 0 };
+        let mut avb = RecordingAvb {
+            calls: 0,
+            roots: Vec::new(),
+        };
         let mut deps = Deps {
             ops: &mut ops,
             fsck: &mut fsck,
@@ -2260,9 +2281,18 @@ mod tests {
 
         assert_eq!(avb::avb_info_fast(&src).unwrap().fec_roots, 2);
         let err = run(&opts, &mut deps, &mut log, &mut progress).unwrap_err();
-        assert!(err.message().contains("fec_roots=2"), "{err}");
-        assert_eq!(avb.calls, 0, "the AVB backend must not be reached");
-        assert_eq!(fsck.calls, 0, "the build must stop before e2fsck");
+        assert!(
+            err.message().contains("simulated stop after recording"),
+            "{err}"
+        );
+        assert_eq!(avb.calls, 1, "the FEC image must reach the AVB backend");
+        assert_eq!(avb.roots, vec![2], "the rebuild must keep FEC roots");
+        assert_eq!(fsck.calls, 1, "e2fsck still runs before the AVB step");
+        assert_eq!(
+            crate::sha256::file_hex_upper(&src).unwrap(),
+            src_sha,
+            "source untouched"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
